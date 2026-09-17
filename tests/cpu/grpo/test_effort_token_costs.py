@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer
+from tests.common.grpo_metrics import attach_world_metrics, flushed_metrics
 
 
 def _rollout(price: float | None, tokens: int):
@@ -23,11 +24,11 @@ def _rollout(price: float | None, tokens: int):
 
 
 def _apply(rollouts):
-    trainer = object.__new__(DistributedAsyncEnvironmentalGRPOTrainer)
+    trainer = attach_world_metrics(object.__new__(DistributedAsyncEnvironmentalGRPOTrainer))
     trainer._metrics = {"train": defaultdict(list)}
     rewards = torch.zeros(len(rollouts))
-    trainer._apply_effort_token_costs(rewards, rollouts, "train")
-    return rewards, trainer._metrics["train"]
+    trainer._apply_effort_token_costs(rewards, rollouts)
+    return rewards, flushed_metrics(trainer)
 
 
 def test_cost_charges_per_generated_token():
@@ -38,10 +39,13 @@ def test_cost_charges_per_generated_token():
     assert metrics["reward/token_cost"] == [pytest.approx(-0.1 / 3)]
 
 
-def test_all_free_episodes_log_nothing():
+def test_all_free_episodes_log_a_zero_cost_over_the_whole_batch():
+    """The key is recorded on every rank whatever it charged: ``WorldMetrics`` folds the union of what
+    the ranks recorded, so a rank that skipped the record would drop out of the world denominator and
+    the logged mean would be an average over the ranks that charged something, not over the batch."""
     rewards, metrics = _apply([_rollout(None, 3000), _rollout(0.0, 3000)])
     assert rewards.sum().item() == 0.0
-    assert "reward/token_cost" not in metrics
+    assert metrics["reward/token_cost"] == [pytest.approx(0.0)]
 
 
 def test_missing_trajectory_is_free():

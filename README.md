@@ -11,7 +11,7 @@
   <a href="https://whitecircle.com/research/halo"><strong>Blog post</strong></a> ·
   <a href="human-docs/README.md"><strong>Docs</strong></a> ·
   <a href="examples/"><strong>Examples</strong></a> ·
-  <a href="agent-docs/optimization/throughput-benchmarks.md"><strong>Benchmarks</strong></a>
+  <a href="human-docs/performance.md"><strong>Benchmarks</strong></a>
 </p>
 
 <br/>
@@ -43,7 +43,7 @@ On 8× B300, Halo delivers up to ~2.8× the training throughput of stock TRL whi
 
 - **Performance optimizations are integrated.** Halo includes DeepEP V2, FlashAttention 4, Liger, Grouped GEMM, padding-free packing, and AdamWBF16, with implementations and fallbacks for Blackwell, Hopper, and older GPUs.
 
-- **RL is asynchronous, with a clean Transformers ↔ vLLM/SGLang split.** Multi-turn environment rollouts run as Ray actors against a vLLM or SGLang server and overlap training through a prefetch queue; the trainer pushes updated weights to the server over native NCCL. There is no Megatron backend and no veRL dependency — the training side stays plain Transformers, with the same parallelism and checkpointing stack. See [Environmental GRPO](agent-docs/training-methods/grpo/environmental-grpo.md).
+- **RL is asynchronous, with a clean Transformers ↔ vLLM/SGLang split.** Multi-turn environment rollouts run as Ray actors against a vLLM or SGLang server and overlap training through a prefetch queue; the trainer pushes updated weights to the server over native NCCL. There is no Megatron backend and no veRL dependency — the training side stays plain Transformers, with the same parallelism and checkpointing stack. See [Async GRPO with Environments](human-docs/training-methods/async-grpo-environments.md).
 
 </br>
 
@@ -103,12 +103,12 @@ halo launch sft examples/sft/qwen3/qwen3-4b-ultrachat.yaml \
 halo launch --list
 ```
 
-`halo` selects `python`, `torchrun`, or `accelerate launch` based on the arguments. Options after `--`
-are passed to the trainer and override the YAML config:
+`halo` selects `python`, `torchrun`, or `accelerate launch` based on the arguments. Options after the
+config that are not the launcher's own are passed to the trainer and override the YAML config:
 
 ```bash
 halo launch sft examples/sft/qwen3_5/qwen3.5-35b-a3b-ultrachat-ep.yaml \
-    -n 8 -- \
+    -n 8 \
     --expert_parallel_size=8 \
     --learning_rate=1e-5 \
     --max_length=32000
@@ -126,8 +126,8 @@ halo launch sft config.yaml --dry-run
 Checkpoint, inference, data, and environment utilities use halo run:
 
 ```bash
-halo run merge-ep-shards -- --input_dir <ep-checkpoint-dir> --output_dir <merged-dir>
-halo run quantize-to-lowp -- --input_dir <bf16-model-dir> --output_dir <nvfp4-out-dir> --format nvfp4
+halo run merge-ep-shards --input_dir <ep-checkpoint-dir> --output_dir <merged-dir>
+halo run quantize-to-lowp --input_dir <bf16-model-dir> --output_dir <nvfp4-out-dir> --format nvfp4
 
 # all tools (merge-*, quantize-to-lowp, rm-scoring, run-env, …)
 halo run --list             
@@ -168,31 +168,24 @@ The full reference is also perfectly readable if you're human and want the detai
 **The human guide:**
 [Installation](human-docs/installation.md) ·
 [Quickstart](human-docs/quickstart.md) ·
-[The halo CLI](human-docs/cli.md) ·
 [Choosing a Method](human-docs/choosing-a-method.md) ·
-[Configuration](human-docs/configuration.md) ·
+[The halo CLI](human-docs/cli.md) ·
+[Writing a Config](human-docs/configuration.md) ·
 [Datasets](human-docs/data.md) ·
+[Training Methods](human-docs/training-methods/README.md) ·
+[Rollout Servers](human-docs/rollout-servers.md) ·
 [Parallelism](human-docs/parallelism.md) ·
 [Clusters & Multi-Node](human-docs/clusters.md) ·
-[Supported Models](human-docs/supported-matrix.md) ·
+[Performance](human-docs/performance.md) ·
+[Supported Matrix](human-docs/supported-matrix.md) ·
+[Supported Models](human-docs/models.md) ·
+[Model Integration Cost](human-docs/model-integration-cost.md) ·
 [Checkpoints & Export](human-docs/checkpoints.md) ·
 [Monitoring](human-docs/monitoring.md) ·
 [Troubleshooting](human-docs/troubleshooting.md) ·
 [Environment Variables](human-docs/environment-variables.md) ·
 [AI Tooling](human-docs/ai-tooling.md) ·
-[Model-Integration Cost](human-docs/model-integration-cost.md) ·
 [Contributing](human-docs/contributing.md)
-
-**Go deeper in the reference (`agent-docs/`):**
-[Installation](agent-docs/getting-started/installation.md) ·
-[Models](agent-docs/models/README.md) · [Adding a Model](agent-docs/models/adding-a-model.md) ·
-[Parallelism (EP/CP/TP/ETP)](agent-docs/parallelism/README.md) ·
-[Multi-Node](agent-docs/parallelism/multi-node.md) ·
-[Pre-training](agent-docs/training-methods/pretraining.md) ·
-[Optimization & Benchmarks](agent-docs/optimization/throughput-benchmarks.md) ·
-[Docker](agent-docs/infrastructure/docker.md) ·
-[Scale & Limitations](agent-docs/reference/scale-and-limitations.md) ·
-[Why This Framework](agent-docs/reference/why-this-framework.md)
 
 </br>
 
@@ -233,9 +226,7 @@ Liger kernels, and grouped GEMM.
 | **2.12× Grouped GEMM** | Qwen3-30B-A3B, EP2; 3.43× at batch 1. |
 | **2.1–3.7× FA4 kernel throughput** | FA4 vs FA2; up to 2.3× end-to-end on dense long-context training. |
 
-Full results and methodology:
-[Throughput Benchmarks](agent-docs/optimization/throughput-benchmarks.md) ·
-[Halo vs stock TRL](agent-docs/optimization/halo-vs-stock-trl.md)
+Full results and methodology: [Performance](human-docs/performance.md)
 
 </br>
 
@@ -260,15 +251,15 @@ EP, CP, TP, and ETP are configured independently:
 | EP+TP | MoE + weight sharding                     |
 | EP+ETP | MoE + sharded experts                     |
 
-Pass them directly to `torchrun`, or after `--` with `halo launch`:
+Pass them directly to `torchrun`, or after the config with `halo launch`:
 
 ```bash
-halo launch sft config.yaml -n 8 -- --expert_parallel_size=8
+halo launch sft config.yaml -n 8 --expert_parallel_size=8
 ```
 
 Multi-node runs support shared (NFS/Lustre) and node-local filesystems.
-See [Parallelism](human-docs/parallelism.md) to pick a mode, [Supported Models](human-docs/supported-matrix.md)
-for the per-model matrix, and the [reference](agent-docs/parallelism/README.md) for implementation details.
+See [Parallelism](human-docs/parallelism.md) to pick a mode, [Supported Matrix](human-docs/supported-matrix.md)
+for the per-model matrix, and [Clusters & Multi-Node](human-docs/clusters.md) for the multi-node recipes.
 
 </br>
 
@@ -292,8 +283,7 @@ Enabled by default where supported:
 
 - **Data** — offline tokenization, packing, and sharding, plus native `s3://` dataset streaming.
 
-→ [Optimization docs](agent-docs/optimization/README.md) ·
-[GPU Training Theory](agent-docs/reference/gpu-training-theory.md) — the bottlenecks these levers attack
+→ [Performance](human-docs/performance.md) — what each lever buys, and the bottlenecks they attack
 
 </br>
 
