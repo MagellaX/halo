@@ -83,9 +83,12 @@ def render_summary(env_type: str, trajectory: Trajectory | None, elapsed: float,
         f"**Tokens generated:** {stats.get('completion_tokens', 0)}",
         f"**Latency:** {elapsed:.1f}s",
     ]
-    # A turn the engine cut off at its token cap is a common cause of a zero-scoring episode.
+    # A turn the engine cut off at its token cap, or one the model ended on nothing, is a common
+    # cause of a zero-scoring episode.
     if stats.get("length_capped"):
         parts.append(f"**Length-capped turns:** {trajectory.info.get('length_cutoff_turns', 0)}")
+    if trajectory.info.get("empty_turns"):
+        parts.append(f"**Empty turns:** {trajectory.info['empty_turns']}")
     if trajectory.info.get("final_answer"):
         parts.append(f"**Final answer:** {trajectory.info['final_answer']}")
     if trajectory.info.get("total_tool_calls"):
@@ -111,8 +114,8 @@ def run_playground_episode(
     """Run one episode through the shared eval driver and render it for the UI.
 
     The shared driver rather than a local copy of the loop: it stamps ``finish_reason`` (so a
-    length-cut turn is recovered here as in training rather than graded as a final answer), binds the
-    episode's reasoning-effort level and token budget, and finalizes a truncated episode.
+    length-cut or empty turn is recovered here as in training rather than graded as a final answer),
+    binds the episode's reasoning-effort level and token budget, and finalizes a truncated episode.
     """
     env = resolve_environment(env_type, {"max_turns": int(max_turns)})
     # A hand-edited "localhost:8000/v1" is not a URL the SDK can route. The field is prefilled with a

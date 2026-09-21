@@ -81,7 +81,9 @@ records the last language as its `language` slice, which the trainer slices metr
 
 Grading goes through `grade_solution` (`src/environments/envs/tasks/coding/grading.py`), shared with
 the offline re-grader, so a checkpoint scores identically online and offline. The verdict lists
-non-passing tests only, capped at five. One sandbox session serves the whole grade, so a compiled
+non-passing tests only, one entry per distinct verdict with the tests that failed the same way folded
+into it, capped at five; a runtime error shows the tail of stderr, where a traceback names the
+exception. One sandbox session serves the whole grade, so a compiled
 submission builds once, reset after every test. A compile failure is graded once against the whole
 pool.
 
@@ -110,7 +112,7 @@ resubmission penalty and the tool shaping still apply.
 | `reward/resubmission` | `improved_resubmission_refund` | `0` | the share of that price a resubmission earns back by beating every earlier pass fraction |
 | `reward/tool_shaping` | `multi_turn_reward` | `0` | >1 tool call and a real submission |
 | `reward/tool_shaping` | `no_tool_use_penalty` / `turn_overflow_penalty` | `0` | zero tool calls / burning `max_turns` |
-| `reward/tool_shaping` | `length_cutoff_penalty` | `0` | per engine-cut turn the episode recovers from |
+| `reward/tool_shaping` | `length_cutoff_penalty` | `0` | per engine-cut or empty turn the episode recovers from |
 | `reward/turn_shaping` | `tool_success_reward` / `tool_error_penalty` | `0` / `0` | per executed call; this env zeroes the protocol's 0.05 / 0.1 |
 
 The shaping rungs bootstrap a weak base that never submits, and self-neutralize within a group once
