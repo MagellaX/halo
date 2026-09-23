@@ -265,7 +265,7 @@ separately (`_validate_tp`).
 
 | Knob | Under TP | Gate |
 |---|---|---|
-| `use_peft` / LoRA (incl. EP+TP) | rejected — PEFT adapters are plain tensors outside the TP graph, so the replicated half diverges and the sharded half is corrupted by the replicated-grad sync. Use LoRA with FSDP/DP, CP, or pure ETP | `_validate_lora_tp_compatibility` |
+| `use_peft` / LoRA (incl. EP+TP) | rejected. `apply_tp_to_lora` can place vanilla linear factors over one-dimensional HF-native colwise/rowwise TP, but no trainer calls that compatibility bridge yet; resume, save/merge, and trainer coverage must land before the gate opens. Use LoRA with FSDP/DP, CP, or pure ETP | `_validate_lora_tp_compatibility` |
 | native EP expert LoRA | rejected — the grouped expert adapters ride the EP-distributed expert weights, which both TP gates skip by param identity, so no adapter shape under EP+TP is gradient- or save/merge-covered. Train expert LoRA under EP without TP | same |
 | QLoRA / `load_in_4bit` | rejected — the TP loaders materialize plain de-quantized weights | `model_loading.py` |
 | `fsdp_reshard_after_forward` | rejected at `data_parallel_size > 1` — a plain all-gather on TP-sharded DTensor params has no registered sharding strategy | `_validate_fsdp_settings` |
