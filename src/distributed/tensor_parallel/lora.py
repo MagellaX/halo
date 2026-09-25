@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from peft import LoraConfig
 from peft.tuners.lora.layer import LoraLayer
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
@@ -17,6 +18,7 @@ from src.distributed.mesh import MeshDim, mesh_dim_names
 
 _SUPPORTED_STYLES = {"colwise": 0, "rowwise": 1}
 _SUPPORTED_INITIALIZATIONS = {True, False, "gaussian", "orthogonal"}
+_BRIDGE_MARKER = "_halo_tp_lora_bridge_factor_ids"
 
 
 @dataclass(frozen=True)
@@ -41,28 +43,30 @@ def apply_tp_to_lora(model: nn.Module) -> int:
     base weight's global metadata, then installs only the style's forward transforms. Replicated
     factors remain plain parameters so Halo's TP gradient synchronization counts them once.
 
-    Returns the number of LoRA target modules bridged. A zero return means PEFT already supplied
-    compatible DTensor factors for every target. The function validates the whole model before
-    changing any parameter, and rejects mixed native/bridge layouts.
+    Returns the number of LoRA target modules bridged. A zero return means this bridge already
+    converted every target. The function validates the whole model before changing any parameter,
+    and rejects DTensor factors it did not create.
     """
     tp_model = _base_model(model)
     adapter_name, config = _validate_config(model)
     targets = _collect_targets(tp_model, adapter_name)
     _reject_embedding_and_head_targets(tp_model, targets)
 
-    native_count = sum(isinstance(target.sharded_factor.weight, DTensor) for target in targets)
-    if native_count:
-        if native_count != len(targets):
-            raise ValueError(
-                "LoRA TP targets mix PEFT-native DTensor factors with plain local factors. Halo cannot "
-                "safely decide which targets still need the compatibility bridge."
-            )
-        for target in targets:
-            _validate_native_target(target)
+    markers = [getattr(target.layer, _BRIDGE_MARKER, None) for target in targets]
+    if any(marker is not None for marker in markers):
+        if not all(marker is not None for marker in markers):
+            raise ValueError("LoRA TP targets mix bridge-converted and unconverted layers.")
+        for target, marker in zip(targets, markers, strict=True):
+            factor_ids = (id(target.sharded_factor.weight), id(target.replicated_factor.weight))
+            if marker != factor_ids:
+                raise ValueError(f"LoRA TP target {target.name!r} changed factors after bridging.")
+            _validate_bridged_target(target)
         return 0
-
-    for target in targets:
-        _validate_bridge_target(target)
+    if any(isinstance(target.sharded_factor.weight, DTensor) for target in targets):
+        raise ValueError(
+            "LoRA TP found DTensor factors not created by this bridge. Their initialization and "
+            "replicated-factor synchronization have not been validated."
+        )
 
     devices = sorted(
         {
@@ -74,6 +78,11 @@ def apply_tp_to_lora(model: nn.Module) -> int:
     with torch.random.fork_rng(devices=devices):
         for target in targets:
             _bridge_target(target, config.init_lora_weights)
+            setattr(
+                target.layer,
+                _BRIDGE_MARKER,
+                (id(target.sharded_factor.weight), id(target.replicated_factor.weight)),
+            )
     return len(targets)
 
 
@@ -82,7 +91,7 @@ def _base_model(model: nn.Module) -> nn.Module:
     return getter() if callable(getter) else model
 
 
-def _validate_config(model: nn.Module):
+def _validate_config(model: nn.Module) -> tuple[str, LoraConfig]:
     configs = getattr(model, "peft_config", None)
     if not isinstance(configs, dict) or not configs:
         raise ValueError("LoRA TP bridging requires a PEFT model with exactly one configured adapter.")
@@ -213,10 +222,10 @@ def _collect_targets(tp_model: nn.Module, adapter_name: str) -> list[_LoraTPTarg
 def _validate_base_placement(name: str, weight: DTensor, shard_dim: int) -> DeviceMesh:
     mesh = weight.device_mesh
     names = mesh_dim_names(mesh)
-    if mesh.ndim != 1 or (names and names != (MeshDim.TP,)):
+    if mesh.ndim != 1 or names != (MeshDim.TP,):
         raise ValueError(
-            f"LoRA target {name!r} uses base-weight mesh dims {names or ('unnamed',)}; the initial bridge "
-            "supports a one-dimensional TP mesh only."
+            f"LoRA target {name!r} uses base-weight mesh dims {names or ('unnamed',)}; the bridge "
+            "requires a named one-dimensional TP mesh."
         )
     placements = weight.placements
     actual = placements[0] if len(placements) == 1 else None
@@ -251,30 +260,19 @@ def _reject_embedding_and_head_targets(tp_model: nn.Module, targets: list[_LoraT
         )
 
 
-def _validate_native_target(target: _LoraTPTarget) -> None:
+def _validate_bridged_target(target: _LoraTPTarget) -> None:
     weight = target.sharded_factor.weight
     if weight.device_mesh != target.tp_mesh or weight.shape != target.global_shape:
         raise ValueError(
-            f"PEFT-native TP factor for {target.name!r} has mesh/shape {weight.device_mesh}/{tuple(weight.shape)}, "
+            f"Bridged TP factor for {target.name!r} has mesh/shape {weight.device_mesh}/{tuple(weight.shape)}, "
             f"expected {target.tp_mesh}/{tuple(target.global_shape)}."
         )
     placements = weight.placements
     actual = placements[0] if len(placements) == 1 else None
     if not isinstance(actual, Shard) or actual.dim % weight.ndim != target.shard_dim:
         raise ValueError(
-            f"PEFT-native TP factor for {target.name!r} has placements {placements}, expected "
-            f"Shard({target.shard_dim})."
+            f"Bridged TP factor for {target.name!r} has placements {placements}, expected Shard({target.shard_dim})."
         )
-
-
-def _validate_bridge_target(target: _LoraTPTarget) -> None:
-    style = ALL_PARALLEL_STYLES[target.style_name]
-    style.validate_param(
-        target.sharded_factor,
-        "weight",
-        target.tp_mesh,
-        parameter_name=f"{target.name}.lora_{'B' if target.style_name == 'colwise' else 'A'}.weight",
-    )
 
 
 def _bridge_target(target: _LoraTPTarget, initialization: bool | str) -> None:

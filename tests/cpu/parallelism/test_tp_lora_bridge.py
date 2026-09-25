@@ -27,6 +27,7 @@ from src.distributed.tensor_parallel.lora import apply_tp_to_lora
 from src.optimizers.adamw_bf16 import AdamWBF16
 from tests.common.ports import free_port
 from tests.common.tp_lora_bridge import (
+    BASE_SEED,
     HIDDEN_FEATURES,
     IN_FEATURES,
     INPUT_SEED,
@@ -45,9 +46,6 @@ from tests.common.tp_lora_bridge import (
     full as _full,
 )
 from tests.common.tp_lora_bridge import (
-    full_grad as _full_grad,
-)
-from tests.common.tp_lora_bridge import (
     lora_config as _lora_config,
 )
 from tests.common.tp_lora_bridge import (
@@ -57,7 +55,10 @@ from tests.common.tp_lora_bridge import (
     reference as _reference,
 )
 from tests.common.tp_lora_bridge import (
-    sync_plain_replicated_grads as _sync_plain_replicated_grads,
+    reference_grad_norm as _reference_grad_norm,
+)
+from tests.common.tp_lora_bridge import (
+    tp_clip_trainer as _tp_clip_trainer,
 )
 from tests.common.tp_lora_bridge import (
     tp_peft as _tp_peft,
@@ -106,7 +107,7 @@ def _assert_forward_and_grads_match(tp_model: nn.Module, reference: nn.Module) -
             tp_grad = getattr(tp_layer, factor_name)["default"].weight.grad
             ref_grad = getattr(ref_layer, factor_name)["default"].weight.grad
             assert tp_grad is not None and ref_grad is not None
-            torch.testing.assert_close(_full_grad(tp_grad), ref_grad, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(_full(tp_grad), ref_grad, rtol=1e-5, atol=1e-6)
 
     tp_model.eval()
     reference.eval()
@@ -117,52 +118,42 @@ def _assert_forward_and_grads_match(tp_model: nn.Module, reference: nn.Module) -
     assert tp_eval.grad_fn is None
 
 
-def _global_grad_norm(model: nn.Module) -> torch.Tensor:
-    total = torch.zeros((), dtype=torch.float32)
-    for param in model.parameters():
-        if param.grad is None:
-            continue
-        grad = _full_grad(param.grad).float()
-        total.add_(grad.square().sum())
-    return total.sqrt()
-
-
-def _scale_grads(model: nn.Module, coefficient: torch.Tensor) -> None:
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.grad is None:
-                continue
-            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-            grad.mul_(coefficient)
-
-
 def _equivalence_worker(rank: int, world_size: int, port: int) -> None:
     _init_process_group(rank, world_size, port)
     try:
         for checkpointing in (False, True):
-            tp_model = _tp_peft(world_size, checkpointing=checkpointing)
-            reference = _reference(checkpointing=checkpointing)
-            _align_reference_from_bridge(tp_model, reference)
-            _assert_forward_and_grads_match(tp_model, reference)
-
-            tp_norm = _global_grad_norm(tp_model)
-            ref_norm = _global_grad_norm(reference)
-            torch.testing.assert_close(tp_norm, ref_norm, rtol=1e-5, atol=1e-6)
-
             for max_grad_norm in (0.0, 0.15):
-                if max_grad_norm > 0:
-                    tp_scale = (max_grad_norm / tp_norm).clamp(max=1.0)
-                    ref_scale = (max_grad_norm / ref_norm).clamp(max=1.0)
-                    _scale_grads(tp_model, tp_scale)
-                    _scale_grads(reference, ref_scale)
-                scaled_tp_norm = _global_grad_norm(tp_model)
-                scaled_ref_norm = _global_grad_norm(reference)
-                torch.testing.assert_close(scaled_tp_norm, scaled_ref_norm, rtol=1e-5, atol=1e-6)
-                if max_grad_norm > 0:
-                    assert scaled_tp_norm <= max_grad_norm + 1e-6
+                tp_model = _tp_peft(world_size, checkpointing=checkpointing)
+                reference = _reference(checkpointing=checkpointing)
+                _align_reference_from_bridge(tp_model, reference)
+                _assert_forward_and_grads_match(tp_model, reference)
 
-        # A second application must feature-detect the compatible DTensor layout and step aside.
-        assert apply_tp_to_lora(tp_model) == 0
+                trainer = _tp_clip_trainer(tp_model)
+                ref_norm = _reference_grad_norm(reference)
+                tp_norm = trainer.accelerator.clip_grad_norm_(tp_model.parameters(), max_grad_norm)
+                torch.testing.assert_close(tp_norm, ref_norm, rtol=1e-5, atol=1e-6)
+                if max_grad_norm > 0:
+                    assert ref_norm > max_grad_norm, "the clipping test must exercise scaling"
+                    clipped_ref_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), max_grad_norm)
+                    torch.testing.assert_close(clipped_ref_norm, ref_norm, rtol=1e-5, atol=1e-6)
+
+                ref_layers = _lora_layers(reference)
+                for name, tp_layer in _lora_layers(tp_model).items():
+                    for factor_name in ("lora_A", "lora_B"):
+                        tp_grad = getattr(tp_layer, factor_name)["default"].weight.grad
+                        ref_grad = getattr(ref_layers[name], factor_name)["default"].weight.grad
+                        assert tp_grad is not None and ref_grad is not None
+                        torch.testing.assert_close(_full(tp_grad), ref_grad, rtol=1e-5, atol=1e-6)
+
+                factor_ids = {
+                    name: (id(layer.lora_A["default"].weight), id(layer.lora_B["default"].weight))
+                    for name, layer in _lora_layers(tp_model).items()
+                }
+                assert apply_tp_to_lora(tp_model) == 0
+                assert factor_ids == {
+                    name: (id(layer.lora_A["default"].weight), id(layer.lora_B["default"].weight))
+                    for name, layer in _lora_layers(tp_model).items()
+                }
     finally:
         dist.destroy_process_group()
 
@@ -182,7 +173,13 @@ def _initialization_worker(rank: int, world_size: int, port: int) -> None:
     _init_process_group(rank, world_size, port)
     try:
         for initialization in (True, False, "gaussian", "orthogonal"):
-            model = _tp_peft(world_size, initialization=initialization)
+            model = _tp_peft(world_size, initialization=initialization, bridge=False)
+            rng_before = torch.get_rng_state()
+            assert apply_tp_to_lora(model) == 2
+            assert torch.equal(torch.get_rng_state(), rng_before), "the bridge changed this rank's RNG state"
+            rng_peers = [torch.empty_like(rng_before) for _ in range(world_size)]
+            dist.all_gather(rng_peers, torch.get_rng_state())
+            assert all(torch.equal(peer, rng_peers[0]) for peer in rng_peers[1:]), "TP ranks' RNG states drifted"
             layers = _lora_layers(model)
             q_a = layers["q_proj"].lora_A["default"].weight
             q_b = layers["q_proj"].lora_B["default"].weight
@@ -210,6 +207,28 @@ def _initialization_worker(rank: int, world_size: int, port: int) -> None:
             )
             if initialization is True:
                 assert full_o_a.abs().max() <= 1 / math.sqrt(HIDDEN_FEATURES) + 1e-7
+            if initialization in (False, "orthogonal"):
+                q_shards = [torch.empty_like(q_b.to_local()) for _ in range(world_size)]
+                dist.all_gather(q_shards, q_b.to_local())
+                assert any(not torch.equal(shard, q_shards[0]) for shard in q_shards[1:]), (
+                    "colwise B was initialized as repeated local tiles instead of one global tensor"
+                )
+            if initialization == "gaussian":
+                assert 0.5 / LORA_RANK <= full_o_a.std().item() <= 2 / LORA_RANK
+            if initialization == "orthogonal":
+                assert 0.02 <= full_o_a.std().item() <= 0.2
+                assert 0.02 <= full_q_b.std().item() <= 0.2
+
+        rank_seeded = _tp_peft(world_size, bridge=False, adapter_seed=BASE_SEED + rank)
+        for name, layer in _lora_layers(rank_seeded).items():
+            factor = layer.lora_A["default"] if name == "q_proj" else layer.lora_B["default"]
+            peers = [torch.empty_like(factor.weight) for _ in range(world_size)]
+            dist.all_gather(peers, factor.weight)
+            assert any(not torch.equal(peer, peers[0]) for peer in peers[1:]), (
+                f"{name} replicas unexpectedly share the same pre-bridge initialization"
+            )
+        assert apply_tp_to_lora(rank_seeded) == 2
+        _assert_replicated_factors_equal(rank_seeded, world_size)
     finally:
         dist.destroy_process_group()
 
@@ -228,8 +247,21 @@ def test_global_shape_initialization_and_factor_placements():
 def _optimizer_worker(rank: int, world_size: int, port: int) -> None:
     _init_process_group(rank, world_size, port)
     try:
-        for checkpointing, max_grad_norm in ((False, 0.0), (True, 0.2)):
-            model = _tp_peft(world_size, dtype=torch.bfloat16, checkpointing=checkpointing)
+        for autocast_adapter_dtype, checkpointing, max_grad_norm in (
+            (True, False, 0.0),
+            (True, True, 0.2),
+            (False, False, 0.0),
+            (False, True, 0.2),
+        ):
+            model = _tp_peft(
+                world_size,
+                dtype=torch.bfloat16,
+                checkpointing=checkpointing,
+                autocast_adapter_dtype=autocast_adapter_dtype,
+            )
+            expected_dtype = torch.float32 if autocast_adapter_dtype else torch.bfloat16
+            assert all(param.dtype == expected_dtype for param in model.parameters() if param.requires_grad)
+            trainer = _tp_clip_trainer(model)
             optimizer = AdamWBF16(
                 [param for param in model.parameters() if param.requires_grad],
                 lr=2e-2,
@@ -243,14 +275,12 @@ def _optimizer_worker(rank: int, world_size: int, port: int) -> None:
             }
             generator = torch.Generator().manual_seed(INPUT_SEED)
             batches = [torch.randn((4, IN_FEATURES), generator=generator, dtype=torch.bfloat16) for _ in range(3)]
-            for batch in batches:
+            for step, batch in enumerate(batches):
+                trainer.state.global_step = step
                 optimizer.zero_grad(set_to_none=True)
                 loss = model(batch).float().square().mean()
                 loss.backward()
-                _sync_plain_replicated_grads(model)
-                if max_grad_norm > 0:
-                    norm = _global_grad_norm(model)
-                    _scale_grads(model, (max_grad_norm / norm).clamp(max=1.0))
+                trainer.accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 _assert_replicated_factors_equal(model, world_size)
 
@@ -358,6 +388,30 @@ def _target_rejection_worker(rank: int, world_size: int, port: int) -> None:
         mismatched.get_base_model()._tp_plan["q_proj"] = "rowwise"
         with pytest.raises(ValueError, match=r"requires Shard\(1\)"):
             apply_tp_to_lora(mismatched)
+
+        unnamed = _tp_peft(world_size, bridge=False, named_mesh=False)
+        with pytest.raises(ValueError, match="named one-dimensional TP mesh"):
+            apply_tp_to_lora(unnamed)
+
+        native = _tp_peft(world_size, bridge=False)
+        native_layers = _lora_layers(native)
+        mesh = native.get_base_model()._device_mesh
+        for factor, shape, shard_dim in (
+            (native_layers["q_proj"].lora_B["default"], (HIDDEN_FEATURES, LORA_RANK), 0),
+            (native_layers["o_proj"].lora_A["default"], (LORA_RANK, HIDDEN_FEATURES), 1),
+        ):
+            local = factor.weight
+            distributed = DTensor.from_local(
+                local,
+                mesh,
+                [Shard(shard_dim)],
+                run_check=False,
+                shape=torch.Size(shape),
+                stride=torch.empty(shape, device="meta").stride(),
+            )
+            factor._parameters["weight"] = nn.Parameter(distributed, requires_grad=local.requires_grad)
+        with pytest.raises(ValueError, match="DTensor factors not created by this bridge"):
+            apply_tp_to_lora(native)
 
         endpoint = _tp_peft(world_size, bridge=False)
         endpoint_base = endpoint.get_base_model()

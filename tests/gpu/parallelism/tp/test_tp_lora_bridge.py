@@ -23,10 +23,11 @@ from tests.common.tp_lora_bridge import (
     INPUT_SEED,
     align_reference_from_bridge,
     assert_replicated_factors_equal,
-    full_grad,
+    full,
     lora_layers,
     reference,
-    sync_plain_replicated_grads,
+    reference_grad_norm,
+    tp_clip_trainer,
     tp_peft,
 )
 
@@ -35,24 +36,6 @@ FORWARD_ATOL = 3e-3
 GRAD_RTOL = 5e-2
 GRAD_ATOL = 5e-3
 STEPS = 3
-
-
-def _global_grad_norm(model: torch.nn.Module) -> torch.Tensor:
-    total = torch.zeros((), device=torch.cuda.current_device(), dtype=torch.float32)
-    for param in model.parameters():
-        if param.grad is None:
-            continue
-        total.add_(full_grad(param.grad).float().square().sum())
-    return total.sqrt()
-
-
-def _scale_grads(model: torch.nn.Module, coefficient: torch.Tensor) -> None:
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.grad is None:
-                continue
-            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-            grad.mul_(coefficient)
 
 
 def _snapshot_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -87,18 +70,11 @@ def _assert_first_step_matches_reference(
             reference_grad = getattr(reference_layer, factor_name)["default"].weight.grad
             assert grad is not None and reference_grad is not None
             torch.testing.assert_close(
-                full_grad(grad).float(),
+                full(grad).float(),
                 reference_grad.float(),
                 rtol=GRAD_RTOL,
                 atol=GRAD_ATOL,
             )
-
-    torch.testing.assert_close(
-        _global_grad_norm(model),
-        _global_grad_norm(unsharded),
-        rtol=GRAD_RTOL,
-        atol=GRAD_ATOL,
-    )
 
 
 def _run_mode(ctx, *, checkpointing: bool, max_grad_norm: float) -> tuple[bool, bool, float]:
@@ -107,9 +83,17 @@ def _run_mode(ctx, *, checkpointing: bool, max_grad_norm: float) -> tuple[bool, 
         device=ctx.device,
         dtype=torch.bfloat16,
         checkpointing=checkpointing,
+        autocast_adapter_dtype=False,
     )
-    unsharded = reference(device=ctx.device, dtype=torch.bfloat16, checkpointing=checkpointing)
+    unsharded = reference(
+        device=ctx.device,
+        dtype=torch.bfloat16,
+        checkpointing=checkpointing,
+        autocast_adapter_dtype=False,
+    )
+    assert all(param.dtype == torch.bfloat16 for param in model.parameters() if param.requires_grad)
     align_reference_from_bridge(model, unsharded)
+    trainer = tp_clip_trainer(model)
     before = _snapshot_trainable(model)
     optimizer = AdamWBF16(
         [param for param in model.parameters() if param.requires_grad],
@@ -126,24 +110,37 @@ def _run_mode(ctx, *, checkpointing: bool, max_grad_norm: float) -> tuple[bool, 
     model.train()
     unsharded.train()
     clipping_ok = True
+    clip_limit = max_grad_norm * (1 + torch.finfo(torch.bfloat16).eps)
     optimizer.zero_grad(set_to_none=True)
     _assert_first_step_matches_reference(model, unsharded, batches[0])
-    sync_plain_replicated_grads(model)
+    ref_norm = reference_grad_norm(unsharded)
+    norm = trainer.accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+    torch.testing.assert_close(norm, ref_norm, rtol=GRAD_RTOL, atol=GRAD_ATOL)
     if max_grad_norm > 0:
-        norm = _global_grad_norm(model)
-        _scale_grads(model, (max_grad_norm / norm).clamp(max=1.0))
-        clipping_ok &= bool((_global_grad_norm(model) <= max_grad_norm + 1e-6).item())
+        assert ref_norm > max_grad_norm, "the clipping test must exercise scaling"
+        clipped_ref_norm = torch.nn.utils.clip_grad_norm_(unsharded.parameters(), max_grad_norm)
+        torch.testing.assert_close(clipped_ref_norm.float(), ref_norm, rtol=GRAD_RTOL, atol=GRAD_ATOL)
+        clipped_norm = trainer._compute_tp_grad_norm([p for p in model.parameters() if p.grad is not None])
+        torch.testing.assert_close(clipped_norm, reference_grad_norm(unsharded), rtol=GRAD_RTOL, atol=GRAD_ATOL)
+        clipping_ok &= bool((clipped_norm <= clip_limit).item())
+    reference_layers = lora_layers(unsharded)
+    for name, layer in lora_layers(model).items():
+        for factor_name in ("lora_A", "lora_B"):
+            grad = getattr(layer, factor_name)["default"].weight.grad
+            reference_grad = getattr(reference_layers[name], factor_name)["default"].weight.grad
+            assert grad is not None and reference_grad is not None
+            torch.testing.assert_close(full(grad).float(), reference_grad.float(), rtol=GRAD_RTOL, atol=GRAD_ATOL)
     optimizer.step()
     assert_replicated_factors_equal(model, ctx.world_size)
 
-    for batch in batches[1:]:
+    for step, batch in enumerate(batches[1:], start=1):
+        trainer.state.global_step = step
         optimizer.zero_grad(set_to_none=True)
         model(batch).float().square().mean().backward()
-        sync_plain_replicated_grads(model)
+        trainer.accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
         if max_grad_norm > 0:
-            norm = _global_grad_norm(model)
-            _scale_grads(model, (max_grad_norm / norm).clamp(max=1.0))
-            clipping_ok &= bool((_global_grad_norm(model) <= max_grad_norm + 1e-6).item())
+            clipped_norm = trainer._compute_tp_grad_norm([p for p in model.parameters() if p.grad is not None])
+            clipping_ok &= bool((clipped_norm <= clip_limit).item())
         optimizer.step()
         assert_replicated_factors_equal(model, ctx.world_size)
 
@@ -169,7 +166,7 @@ def _run_mode(ctx, *, checkpointing: bool, max_grad_norm: float) -> tuple[bool, 
 def run(ctx):
     checks: dict[str, bool] = {}
     metrics: dict[str, float] = {}
-    for checkpointing, max_grad_norm in ((False, 0.0), (True, 0.2)):
+    for checkpointing, max_grad_norm in ((False, 0.0), (True, 0.05)):
         label = "checkpointed_clipped" if checkpointing else "plain_unclipped"
         changed, clipping_ok, rank_spread = _run_mode(
             ctx,
