@@ -22,7 +22,7 @@ image-feeding run is refused by the pipeline gate.
 
 Usage:
     torchrun --nproc_per_node=8 scripts/training/preference/rewards.py \\
-        examples/reward/qwen3_5/rm-qwen3.5-9b-skywork-pref80k.yaml --expert_parallel_size=8
+        examples/reward/gptoss/rm-gptoss-20b-skywork-pref80k-ep.yaml
 """
 
 from transformers import AutoModelForSequenceClassification
@@ -81,7 +81,6 @@ def main():
         dist_args,
         script_prefix="reward",
         trainer_cls=DistributedRewardTrainer,
-        supports_cp=False,
         sync_tokens=("eos_token", "pad_token"),
     )
     parallelism_config = runtime.parallelism_config
@@ -127,7 +126,7 @@ def main():
     # side TRL's text collator pads on and the one the pooled head's rightmost-non-pad rule expects.
     processing_class = tokenizer
     if is_vlm:
-        processing_class = install_resolved_tokenizer(load_vlm_processor(model_config), tokenizer, True)
+        processing_class = install_resolved_tokenizer(load_vlm_processor(model_config), tokenizer)
 
     # No pre-tokenization pass here on either branch: TRL's RewardTrainer chat-templates and tokenizes
     # the raw chosen/rejected columns itself (natively supporting implicit-prompt datasets and

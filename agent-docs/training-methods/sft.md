@@ -50,7 +50,7 @@ Refused at startup:
 
 - `packing` together with `padding_free`, and `packing` without an explicit `max_length` (the pack size bounds memory).
 - `padding_free` on a non-varlen attention implementation, under CP, or under PP — the flattened width changes every step while the P2P buffers freeze on the first. Use `packing`, except under CP, which refuses both.
-- TRL's `completion_only_loss` / `assistant_only_loss`: they act inside the dataset prep and collator this script replaces.
+- TRL's `completion_only_loss` / `assistant_only_loss`, and a non-default `dataset_text_field` / `dataset_kwargs`: they act inside the dataset prep and collator this script replaces. The script renders `conversation_field` itself; tokenize a raw-text column offline with `prepare_dataset.py --mode text`.
 
 Per-family configs live under `examples/sft/`; full field list in [Configuration Reference](../reference/configuration-reference.md#sftscriptarguments). The parser turns `use_liger_kernel` and `bf16` on and `logging_nan_inf_filter` off; `attn_implementation` auto-selects FA4 on Blackwell, FA3 on Hopper, else FA2 ([Flash Attention](../optimization/flash-attention.md)).
 
@@ -68,7 +68,7 @@ halo launch sft examples/sft/qwen3/qwen3-4b-ultrachat.yaml --nproc 8
 python scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat-lora.yaml
 ```
 
-Any YAML field overrides on the command line (`--learning_rate=1e-5`); `accelerate launch` with `accelerate/fsdp2_gradop_config.yaml` stays supported for plain data-parallel. Saves are gathered HF-standard checkpoints by default; per-rank `save_sharded_ep` ones need `scripts/after_training/merge_ep_shards.py` before resume or serving, and that merge drops optimizer state ([Checkpoints](../reference/checkpoints.md)).
+Any YAML field overrides on the command line (`--learning_rate=1e-5`); `accelerate launch` with `launcher-configs/accelerate/fsdp2_gradop_config.yaml` stays supported for plain data-parallel. Saves are gathered HF-standard checkpoints by default; per-rank `save_sharded_ep` ones need `scripts/after_training/merge_ep_shards.py` before resume or serving, and that merge drops optimizer state ([Checkpoints](../reference/checkpoints.md)).
 
 ## Learning rate and global batch size
 
@@ -90,9 +90,11 @@ Pair with `lr_scheduler_type: cosine` and a warmup of ~3–5% of the run. There 
 
 ## Vision-language models
 
-Two verdicts decide a vision-language run. The **model class follows the checkpoint**: a multimodal config loads through `AutoModelForImageTextToText` + processor, still via `load_distributed_model`, so a MoE VLM gets the same EP/TP/CP wrapping. `text_only_model: true` overrides that — the checkpoint loads through its text-only CausalLM sibling, the vision tower is dropped, and image columns are refused.
+Two verdicts decide a vision-language run. The **model class follows the checkpoint**: a multimodal config loads through `AutoModelForImageTextToText`, still via `load_distributed_model`, so a MoE VLM gets the same EP/TP/CP wrapping. `text_only_model: true` overrides that — the checkpoint loads through its text-only CausalLM sibling, the vision tower is dropped, and image columns are refused.
 
 The **data path follows the run** (`is_vlm_run`, `src/data/vlm.py`): the VLM path only when the checkpoint is multimodal **and** the run declares image data. A natively-multimodal checkpoint (Gemma 4, Qwen3.5/3.6, Inkling) on text-only rows is a text run, so packing, padding-free and `train_on_last_assistant_only` stay available.
+
+The processing class is the checkpoint's processor wherever it ships a processor config (`processor_config.json` / `preprocessor_config.json`), text runs included: the export saves it, and vLLM builds the multimodal class's processor from it at startup. A multimodal checkpoint shipping none ([Step-3.7 Flash](../models/step3p7.md#model-loading)) trains text runs through its tokenizer and refuses an image run at the processor load (`src/distributed/loading/vlm_setup.py`).
 
 Images ride embedded in message content, or in a column named by `images_field`, pairing with any image placeholders, else the first user turn — so hub datasets that keep images outside the conversation (FineVision, the_cauldron, Docmatix) need only field mappings. Either shape declares the run VLM, as does an `images` / `image` / `pixel_values` column ([rules](../data/dataset-formats.md#sft-vlm)):
 
@@ -137,10 +139,10 @@ Smoke the config first: cut `max_length`, set `max_steps: 5`, launch on 2 GPUs. 
 
 ```bash
 pytest tests/cpu/config tests/cpu/data -m cpu    # config gates, collators, render knobs
-torchrun --nproc_per_node=2 tests/gpu/trainers/sft/test_sft_ep.py
+torchrun --nproc_per_node=2 tests/gpu/trainers/sft/test_sft_gptoss_modes.py --mode ep
 ```
 
-`tests/gpu/trainers/sft/` holds suites per mode (dense, EP, EP+CP, EP+TP, FSDP2 resume, VLM, sinks) and per model.
+`tests/gpu/trainers/sft/` holds suites per model with one `--mode` per parallel shape (dense, EP, EP+CP, EP+TP, ETP), plus FSDP2 resume, VLM and sinks; the MoE and dense mode suites share one body, `tests/common/sft_modes.py`.
 
 ## Related pages
 

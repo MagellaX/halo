@@ -9,11 +9,14 @@ data formats and are not handled here.
 Usage:
     python scripts/before_training/prepare_dataset.py \\
         --input "s3://bucket/raw/my_dataset" --output "s3://bucket/preprocessed/my_dataset" \\
-        --model-name "Qwen/Qwen3-8B" --max-length 8192 [--pack-sequences] [--num-shards 64] [--vlm]
+        --model-name "Qwen/Qwen3-8B" --max-length 8192 \\
+        --assistant-message-template $'<|im_start|>assistant\\n' \\
+        [--pack-sequences | --vlm] [--test-size 0.01] [--num-shards 64]
 """
 
 import argparse
 import contextlib
+import dataclasses
 import os
 import shutil
 import sys
@@ -28,12 +31,12 @@ from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizer
 
 from scripts._common import add_trust_remote_code_arg
 from src.checkpoint.tool_io import DISPLACED_SUFFIX, clear_staging_path
-from src.data.pipeline.preprocessed_metadata import PreprocessingConfig
+from src.data.pipeline.preprocessed_metadata import PACKING_STRATEGIES, PREPROCESSING_MODES, PreprocessingConfig
 from src.data.pipeline.preprocessing import preprocess_dataset
 from src.data.pipeline.processing import resolve_map_num_proc
 from src.data.pipeline.tokenizer_backend import TOKENIZER_BACKENDS
 from src.data.sources.loading import load_dataset_from_source
-from src.data.sources.paths import METADATA_FILE, parse_dataset_destination, parse_s3_uri
+from src.data.sources.paths import EVAL_SPLIT_NAMES, METADATA_FILE, parse_dataset_destination, parse_s3_uri
 from src.data.sources.s3_client import S3Client
 from src.log import configure_cli_logging
 from src.models.loading.tokenizer_setup import load_chat_template
@@ -46,6 +49,9 @@ logger = get_logger(__name__, log_level="INFO")
 # Fixed so --test-size cuts the same split on every re-run: the assignment is baked into the
 # published artifact, and a re-preparation that reshuffled it would no longer match.
 _SPLIT_SEED = 42
+
+# A flag recorded one-to-one into a PreprocessingConfig field takes a set default from the field.
+_CONFIG_DEFAULTS = {field.name: field.default for field in dataclasses.fields(PreprocessingConfig)}
 
 
 def parse_args():
@@ -72,32 +78,33 @@ def parse_args():
         "--model-name",
         "-m",
         required=True,
-        help="Model name or path for tokenizer",
+        help="Model checkpoint (name or path): its tokenizer, and its config.json for the "
+        "completion-only mask's turn terminators",
     )
     parser.add_argument(
         "--max-length",
         type=int,
-        default=8192,
+        default=_CONFIG_DEFAULTS["max_length"],
         help="Maximum tokenized sequence length; over-length conversations are dropped, not "
-        "truncated (default: 8192). Stamped into the dataset metadata and re-checked against the "
-        "training config's max_length at load. No model is loaded here, so it cannot resolve to a "
+        "truncated (default: %(default)s). Stamped into the dataset metadata and re-checked against "
+        "the training config's max_length at load. No model is loaded here, so it cannot resolve to a "
         "context window — pass it explicitly.",
     )
     add_trust_remote_code_arg(parser)
 
     parser.add_argument(
         "--mode",
-        default="chat",
-        choices=["chat", "text"],
+        default=_CONFIG_DEFAULTS["mode"],
+        choices=PREPROCESSING_MODES,
         help="Tokenization mode: 'chat' (apply chat template to the conversation "
         "field, for SFT) or 'text' (raw-text causal-LM for (continued) "
         "pretraining — tokenize --text-field directly, append EOS per document). "
-        "Default: chat.",
+        "Default: %(default)s.",
     )
     parser.add_argument(
         "--text-field",
-        default="text",
-        help="(mode=text) dataset column holding the raw text (default: text).",
+        default=_CONFIG_DEFAULTS["text_field"],
+        help="(mode=text) dataset column holding the raw text (default: %(default)s).",
     )
     parser.add_argument(
         "--no-append-eos",
@@ -107,9 +114,9 @@ def parse_args():
     )
     parser.add_argument(
         "--conversation-field",
-        default="prompt",
-        help="Name of conversation field in dataset (default: prompt — the documented SFT shape and "
-        "the training-side default; a value disagreeing with the training config is rejected at "
+        default=_CONFIG_DEFAULTS["conversation_field"],
+        help="Name of conversation field in dataset (default: %(default)s — the documented SFT shape "
+        "and the training-side default; a value disagreeing with the training config is rejected at "
         "training startup)",
     )
     parser.add_argument(
@@ -159,12 +166,12 @@ def parse_args():
     )
     parser.add_argument(
         "--packing-strategy",
-        default="bfd",
-        choices=["bfd", "bfd_split", "wrapped"],
+        default=_CONFIG_DEFAULTS["packing_strategy"],
+        choices=PACKING_STRATEGIES,
         help="TRL packing strategy: 'bfd' (best-fit-decreasing, keeps document boundaries but "
         "DISCARDS the overflow past --max-length), 'bfd_split' (same packing, overflow split into "
         "later examples — the lossless choice for pre-training), or 'wrapped' (concatenate-and-chunk "
-        "across boundaries). Default: bfd.",
+        "across boundaries). Default: %(default)s.",
     )
 
     parser.add_argument(
@@ -197,8 +204,10 @@ def parse_args():
     parser.add_argument(
         "--num-shards",
         type=int,
-        default=1,
-        help="Number of shards to create (default: 1 = no sharding)",
+        default=_CONFIG_DEFAULTS["num_shards"],
+        help="Number of shards to create (default: %(default)s = unsharded: every rank loads the dataset whole "
+        "and the DataLoader splits it, at any data-parallel size). Above 1 each rank loads only its own "
+        "shards, which needs >= data_parallel_size shards and a test split",
     )
 
     parser.add_argument(
@@ -209,10 +218,10 @@ def parse_args():
     )
     parser.add_argument(
         "--tokenizer-backend",
-        default="hf",
+        default=_CONFIG_DEFAULTS["tokenizer_backend"],
         choices=list(TOKENIZER_BACKENDS),
-        help="Text→ids backend: 'hf' (default) or 'gigatoken' (optional extra; "
-        "token IDs verified identical at startup).",
+        help="Text→ids backend: 'hf' or 'gigatoken' (optional extra; token IDs verified identical at "
+        "startup). Default: %(default)s.",
     )
     parser.add_argument(
         "--test-size",
@@ -254,7 +263,8 @@ def parse_args():
     parser.add_argument(
         "--hf-token",
         default=None,
-        help="HuggingFace token for private repos",
+        help="HuggingFace token for the hf:// upload (default: the ambient login). The input and "
+        "tokenizer loads always use the ambient credentials (HF_TOKEN / huggingface-cli login)",
     )
 
     parser.add_argument(
@@ -315,7 +325,7 @@ def apply_tokenizer_overrides(tokenizer, args) -> None:
 
     Shared by the plain-tokenizer and VLM-processor paths so a tokenized dataset carries the same
     special tokens either way; a pad/eos mismatch changes what the collator masks. The same overrides
-    are recorded in the config (:func:`build_preprocessing_config`), which lets training verify the
+    are recorded in the ``PreprocessingConfig`` that ``main`` builds, which lets training verify the
     run's tokenizer matches the one that baked the rows.
     """
     if args.pad_token:
@@ -385,17 +395,22 @@ def load_input_dataset(args) -> DatasetDict:
         else:
             logger.info("No test split, using entire dataset as train")
             dataset = DatasetDict({"train": dataset})
+    elif "train" not in dataset:
+        # Only the train and test splits are baked, so a split set without train would publish an
+        # artifact holding no rows.
+        raise ValueError(
+            f"{args.input} has no 'train' split ({sorted(dataset)}). Point --input at the split to "
+            "prepare: an '@<split>' suffix on a Hub ID, or the split's own directory of a saved DatasetDict."
+        )
     elif args.test_size:
         # A local file, a save_to_disk dir or a split-less Hub id loads as a DatasetDict, the most
         # common input form. Splitting only the bare-Dataset case would drop --test-size.
-        if set(dataset) & {"test", "validation"}:
+        held_out = [name for name in EVAL_SPLIT_NAMES if name in dataset]
+        if held_out:
             raise ValueError(
-                f"--test-size was given but {args.input} already carries an eval split "
-                f"({sorted(set(dataset) & {'test', 'validation'})}). Drop the flag, or point --input "
-                "at the train split alone."
+                f"--test-size was given but {args.input} already carries an eval split ({held_out}). "
+                "Drop the flag, or point --input at the train split alone."
             )
-        if "train" not in dataset:
-            raise ValueError(f"--test-size needs a 'train' split to cut; {args.input} has {sorted(dataset)}.")
         logger.info(f"Creating train/test split with test_size={args.test_size}")
         dataset = DatasetDict({**dataset, **dataset["train"].train_test_split(args.test_size, seed=_SPLIT_SEED)})
 
@@ -577,6 +592,7 @@ def main():
         num_shards=args.num_shards,
         num_proc=resolve_map_num_proc(args.num_proc),
         tokenizer_backend=args.tokenizer_backend,
+        trust_remote_code=args.trust_remote_code,
         is_vlm=args.vlm,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,

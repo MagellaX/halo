@@ -3,8 +3,8 @@
 
 A LoRA run's output directory carries only ``adapter_model.safetensors`` + ``adapter_config.json``;
 this loads the base model, applies the adapter and saves a standard HuggingFace checkpoint. Covers
-causal-LM and sequence-classification (``--task classification``) adapters; VLM bases and
-``trust_remote_code`` families are auto-detected from the base model path. ``--output_dir`` is
+causal-LM and sequence-classification (``--task classification``) adapters; a VLM base is detected
+from its config, and remote-code families load under ``--trust_remote_code`` (default on). ``--output_dir`` is
 written fresh: every ``model*.safetensors`` or index the completed save did not produce is removed
 afterwards.
 
@@ -26,7 +26,7 @@ from accelerate import PartialState
 from transformers import AutoModelForSequenceClassification
 
 import src.distributed.expert_parallel.layers.roster  # noqa: F401 — registers the EP export roster the config finalizer requires
-from scripts._common import add_max_shard_size_arg, add_trust_remote_code_arg
+from scripts._common import add_device_map_arg, add_dtype_arg, add_max_shard_size_arg, add_trust_remote_code_arg
 from src.checkpoint.adapters import merge_adapter_into_base
 from src.checkpoint.format import DEFAULT_MAX_SHARD_SIZE
 from src.log import configure_cli_logging
@@ -188,18 +188,8 @@ Examples:
         default="causal_lm",
         help="Model task type (default: causal_lm)",
     )
-    parser.add_argument(
-        "--dtype",
-        choices=list(DTYPE_BY_NAME),
-        default="bf16",
-        help="Model dtype (default: bf16)",
-    )
-    parser.add_argument(
-        "--device_map",
-        type=str,
-        default=None,
-        help="Device map for loading large models (e.g., 'auto', 'cpu')",
-    )
+    add_dtype_arg(parser)
+    add_device_map_arg(parser)
     parser.add_argument(
         "--num_labels",
         type=int,

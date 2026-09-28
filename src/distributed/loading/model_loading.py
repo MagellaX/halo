@@ -8,7 +8,6 @@ from __future__ import annotations
 import gc
 import os
 import time
-from typing import TYPE_CHECKING
 
 import torch
 from accelerate.logging import get_logger
@@ -30,6 +29,7 @@ from src.distributed.expert_parallel.lazy_loader import (
     load_ep_model_lazy,
 )
 from src.distributed.expert_parallel.loading import (
+    cast_loaded_parameters,
     decide_lazy_loadable,
     load_ep_model,
     reject_ep_sharded_checkpoint,
@@ -39,7 +39,7 @@ from src.distributed.expert_parallel.patching import create_ep_buffers, patch_mo
 from src.distributed.filesystem import fs_aware_main_first, sequential_load_within_node
 from src.distributed.loading.warmup import warm_attention_kernels
 from src.distributed.mesh import create_dp_tp_mesh, get_tp_submesh
-from src.distributed.parallelism_config import accelerate_launch_rejection
+from src.distributed.parallelism_config import ParallelismConfig, accelerate_launch_rejection
 from src.distributed.pipeline_parallel.lazy_loader import load_pp_stage_model
 from src.distributed.runtime import (
     fs_aware_load_rank,
@@ -63,7 +63,11 @@ from src.kernels.liger.orchestrator import apply_liger_kernel
 from src.kernels.lowp.mixed_precision import apply_mixed_precision_compute
 from src.models.loading.checkpoint_coverage import from_pretrained_verified
 from src.models.loading.config_levels import configs_declaring, set_config_field_run_scoped
-from src.models.loading.dtype import configure_float32_matmul_precision, resolve_model_dtype
+from src.models.loading.dtype import (
+    cast_parameters_to_run_dtype,
+    configure_float32_matmul_precision,
+    resolve_model_dtype,
+)
 from src.models.loading.model_preparation import (
     apply_family_attention_patches,
     auto_load_model,
@@ -80,9 +84,6 @@ from src.models.patches.attention import (
 from src.models.patches.buffer_fixes import finalize_loaded_model
 from src.models.patches.gpt_oss_sinks import SinksPolicy
 from src.models.patches.remote_code_compat import apply_remote_code_compat_shims
-
-if TYPE_CHECKING:
-    from src.distributed.parallelism_config import ParallelismConfig
 
 logger = get_logger(__name__)
 
@@ -123,9 +124,9 @@ def _validate_fp32_non_ep_params(pc: ParallelismConfig, model_config) -> None:
         if not layer_cls._supports_fp32_non_ep_params:
             family = "/".join(layer_cls.HF_MODEL_TYPES)
             raise ValueError(
-                f"fp32_non_ep_params=True is not supported for {family} under "
-                f"Expert Parallelism (ep_size={pc.ep_size}): the combination is unvalidated for this "
-                f"family and documented to fail at the first dispatch (see its model page). Train it "
+                f"fp32_non_ep_params=True is not supported for {family} under Expert Parallelism "
+                f"(expert_parallel_size={pc.ep_size}): the combination is unvalidated for this family "
+                f"and documented to fail at the first dispatch (see its model page). Train it "
                 f"experts-distributed in plain bf16 — AdamWBF16's stochastic rounding is the supported "
                 f"precision floor there."
             )
@@ -154,7 +155,7 @@ def _validate_gmm_launch_method(pc: ParallelismConfig, model_config) -> None:
         "           scripts/training/sft.py <config>\n"
         "\n"
         "  2. Train this MoE under 'accelerate launch' without grouped GEMM:\n"
-        "       set `use_grouped_gemm: false` in the YAML (or pass --use_grouped_gemm false)\n"
+        "       set `use_grouped_gemm: false` in the YAML (or pass --use_grouped_gemm=false)\n"
         "\n"
         "See agent-docs/optimization/grouped-gemm.md (Standalone grouped GEMM mode)."
     )
@@ -251,12 +252,12 @@ def load_distributed_model(
     # ep_size rather than is_ep_mode: pure ETP folds into is_ep_mode but never reaches the transport.
     if dtype == torch.float32 and parallelism_config.ep_size > 1:
         raise ValueError(
-            f"fp32 training is not supported under Expert Parallelism (ep_size="
-            f"{parallelism_config.ep_size}): DeepEP's dispatch buffer is sized for 2-byte tokens and "
-            f"asserts on 4-byte ones. Train in bf16 (the toolkit default) — for fp32 master weights "
-            f"without fp32 compute use fp32_non_ep_params / fp32_experts, which keep the "
-            f"dispatched activations bf16 (except Gemma 4, whose norms re-emit fp32 activations "
-            f"into the dispatch — it is refused separately)."
+            f"fp32 training is not supported under Expert Parallelism "
+            f"(expert_parallel_size={parallelism_config.ep_size}): DeepEP's dispatch buffer is sized "
+            f"for 2-byte tokens and asserts on 4-byte ones. Train in bf16 (the toolkit default) — "
+            f"for fp32 master weights without fp32 compute use fp32_non_ep_params / fp32_experts, "
+            f"which keep the dispatched activations bf16 (except Gemma 4, whose norms re-emit fp32 "
+            f"activations into the dispatch — it is refused separately)."
         )
 
     # Full fp32 matmul precision before any forward: the image's TF32 default degrades long-context RoPE.
@@ -373,8 +374,9 @@ def load_distributed_model(
                 "Quantized loading (QLoRA / bitsandbytes) is not supported with EP / TP / PP "
                 "or grouped-GEMM MoE loaders: they materialize plain de-quantized weights, so "
                 "bitsandbytes Params4bit are lost and PEFT's 4-bit adapter dispatch fails (PP "
-                "rejects PEFT outright). Use QLoRA with standard DDP/FSDP (accelerate launch), "
-                "plain LoRA (no quantization) for EP/TP, or QLoRA + CP (which preserves "
+                "rejects PEFT outright). For QLoRA use plain data parallelism (on a MoE model with "
+                "`use_grouped_gemm: false`, under torchrun and accelerate launch alike) or CP on a "
+                "dense model, which preserves quantization. Under EP/TP use plain LoRA (no "
                 "quantization)."
             )
         common_kwargs["quantization_config"] = quantization_config
@@ -493,9 +495,14 @@ def _sequential_load_to_cuda(
     local_rank: int,
     max_concurrent: int,
     common_kwargs: dict,
+    *,
+    keep_fp32: bool,
+    ep_wrapped: bool,
 ) -> PreTrainedModel:
     """Load to CPU one rank at a time (low CPU peak), move to this rank's GPU, then
-    free CPU memory. Shared by the EP+TP sequential fallback and the TP-MoE loader."""
+    free CPU memory. Shared by the EP+TP sequential fallback and the TP-MoE loader.
+
+    ``keep_fp32`` and ``ep_wrapped`` are :func:`cast_loaded_parameters`'."""
     with sequential_load_within_node(max_concurrent=max_concurrent):
         model = from_pretrained_verified(
             model_class,
@@ -503,6 +510,7 @@ def _sequential_load_to_cuda(
             device_map="cpu",
             **common_kwargs,
         )
+        cast_loaded_parameters(model, common_kwargs.get("dtype"), keep_fp32=keep_fp32, ep_wrapped=ep_wrapped)
         model = model.to(f"cuda:{local_rank}")
         gc.collect()
         torch.cuda.empty_cache()
@@ -516,10 +524,14 @@ def _from_pretrained_on_local_gpu(
     local_rank: int,
     max_concurrent: int,
     common_kwargs: dict,
+    *,
+    keep_fp32: bool,
+    ep_wrapped: bool,
 ) -> PreTrainedModel:
     """``from_pretrained`` straight onto this rank's GPU, one rank at a time per node.
 
     With ``_init_from_scratch`` in ``common_kwargs``, builds from config with random weights instead.
+    ``keep_fp32`` and ``ep_wrapped`` are :func:`cast_loaded_parameters`'.
     """
     if common_kwargs.pop("_init_from_scratch", False):
         config = common_kwargs.get("config")
@@ -536,6 +548,8 @@ def _from_pretrained_on_local_gpu(
         with sequential_load_within_node(max_concurrent=max_concurrent):
             ddp_kwargs = {"device_map": {"": local_rank}, **common_kwargs}
             model = from_pretrained_verified(model_class, model_name_or_path, **ddp_kwargs)
+    # Both branches: a remote-code class can declare parameters fp32 in __init__ (Ling 3.0's KDA state).
+    cast_loaded_parameters(model, common_kwargs.get("dtype"), keep_fp32=keep_fp32, ep_wrapped=ep_wrapped)
     finalize_loaded_model(model)
     return model
 
@@ -594,11 +608,12 @@ def _load_pp_stage_model(
         raise ValueError(
             f"Pipeline parallelism needs a safetensors checkpoint the stage-aware loader can read, "
             f"but {model_name_or_path!r} has none. Falling back to a whole-model load would make "
-            f"every rank hold all pp_size={pc.pp_size} stages — the ceiling PP exists to remove. "
-            f"Either the checkpoint is not safetensors (convert it), or this family's EP layer "
-            f"declares _supports_lazy_loading=False / nests its expert index under an extra module "
-            f"(pre-5.14 Zaya checkpoints), in which case the model cannot use PP at all (see "
-            f"src/distributed/expert_parallel/layers/ and agent-docs/parallelism/pipeline-parallelism.md)."
+            f"every rank hold all pipeline_parallel_size={pc.pp_size} stages — the ceiling PP "
+            f"exists to remove. Either the checkpoint is not safetensors (convert it), or this "
+            f"family's EP layer declares _supports_lazy_loading=False / nests its expert index "
+            f"under an extra module (pre-5.14 Zaya checkpoints), in which case the model cannot "
+            f"use PP at all (see src/distributed/expert_parallel/layers/ and "
+            f"agent-docs/parallelism/pipeline-parallelism.md)."
         )
     if local_dir is None:
         raise RuntimeError(
@@ -618,6 +633,7 @@ def _load_pp_stage_model(
         dtype=common_kwargs.get("dtype"),
         trust_remote_code=common_kwargs.get("trust_remote_code", True),
         model_class=model_class,
+        keep_fp32_params=pc.fp32_non_ep_params,
         **_lazy_loader_passthrough(common_kwargs),
     )
 
@@ -680,6 +696,7 @@ def _load_ep_tp_model(
             dtype=common_kwargs.get("dtype"),
             trust_remote_code=common_kwargs.get("trust_remote_code", True),
             model_class=model_class,
+            keep_fp32_params=pc.fp32_non_ep_params,
             **_lazy_loader_passthrough(common_kwargs),
         )
         _apply_attention_only_tp(model, rank, pc.tp_size, pc.data_parallel_size)
@@ -693,6 +710,8 @@ def _load_ep_tp_model(
             local_rank,
             pc.max_concurrent_loading,
             common_kwargs,
+            keep_fp32=pc.fp32_non_ep_params,
+            ep_wrapped=True,
         )
         _apply_attention_only_tp(model, rank, pc.tp_size, pc.data_parallel_size)
         model = _apply_ep_wrappers(model, ep_config)
@@ -793,6 +812,8 @@ def _load_tp_moe_model(
         local_rank,
         pc.max_concurrent_loading,
         common_kwargs,
+        keep_fp32=pc.fp32_non_ep_params,
+        ep_wrapped=pc.needs_ep_wrappers,
     )
     _apply_attention_only_tp(model, rank, tp_size, dp_size)
 
@@ -818,6 +839,7 @@ def _load_ep_cp_model(
         model_class=model_class,
         max_concurrent_loading=pc.max_concurrent_loading,
         lazy=pc.ep_lazy_loading,
+        keep_fp32_params=pc.fp32_non_ep_params,
         **common_kwargs,
     )
     logger.info(f"Model loaded with EP+CP (ep={pc.ep_size}, cp={pc.cp_size})")
@@ -837,6 +859,7 @@ def _load_ep_model(
         model_class=model_class,
         max_concurrent_loading=pc.max_concurrent_loading,
         lazy=pc.ep_lazy_loading,
+        keep_fp32_params=pc.fp32_non_ep_params,
         **common_kwargs,
     )
     scope_str = "node-local" if pc.is_node_local_ep else "cross-node"
@@ -860,6 +883,7 @@ def _load_cp_model(
         model_class=model_class,
         max_concurrent_loading=pc.max_concurrent_loading,
         ep_config=pc.create_ep_config() if needs_wrappers else None,
+        keep_fp32_params=pc.fp32_non_ep_params,
         **common_kwargs,
     )
     logger.info(f"Model loaded with CP (cp_size={pc.cp_size}, grouped_gemm_experts={needs_wrappers})")
@@ -887,6 +911,8 @@ def _load_undistributed_model(
         local_rank,
         pc.max_concurrent_loading,
         common_kwargs,
+        keep_fp32=pc.fp32_non_ep_params,
+        ep_wrapped=ep_wrappers,
     )
     if ep_wrappers:
         model = _apply_ep_wrappers(model, pc.create_ep_config())
@@ -899,11 +925,14 @@ def load_model_from_pretrained(
     model,
     args=None,
     model_cls=None,
+    *,
+    keep_fp32: bool,
 ):
     """Load a model from a pretrained path string, resolving its dtype; returns ``(model, model_id)``.
 
     An already-instantiated model must have ``model_init_kwargs`` unset. ``model_cls`` None → resolved
-    via `resolve_auto_model_class()`.
+    via `resolve_auto_model_class()`. ``keep_fp32`` (the run keeps fp32 masters, ``fp32_non_ep_params``)
+    keeps the stored fp32 parameters for the trainer's fp32 upcast; no EP wrapper follows this load.
     """
     if isinstance(model, str):
         model_id = model
@@ -920,6 +949,14 @@ def load_model_from_pretrained(
         )
 
         model = auto_load_model(model, model_class=model_cls, **model_init_kwargs)
+        # An unset or "auto" dtype loads at the checkpoint's own dtype (recorded on the config), pins
+        # aside; the cast unifies the pins to it.
+        requested = model_init_kwargs.get("dtype")
+        cast_parameters_to_run_dtype(
+            model,
+            requested if isinstance(requested, torch.dtype) else model.config.dtype,
+            keep_fp32=keep_fp32,
+        )
         finalize_loaded_model(model)
         if run_scoped_cache_off:
             set_config_field_run_scoped(model.config, "use_cache", False)

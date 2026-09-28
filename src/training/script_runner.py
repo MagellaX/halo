@@ -2,8 +2,9 @@
 
 The backbone (``init_training_script`` → ``load_script_datasets`` → ``load_script_model`` →
 ``apply_distributed_trainer_config`` → ``run_trainer``) plus the helpers that must behave identically
-at every call site: window pins, tokenizer/attention resolution, callback assembly, and the
-``reject_*`` guards. Parsing tuples, collators, and trainer construction stay in the scripts.
+at every call site: window pins, tokenizer/attention resolution, the run's modality verdict, callback
+assembly, and the ``reject_*`` guards. Parsing tuples, collators, and trainer construction stay in the
+scripts.
 """
 
 from collections.abc import Callable, Sequence
@@ -13,7 +14,7 @@ from typing import Any, NamedTuple
 import torch
 from accelerate import PartialState
 from accelerate.logging import get_logger
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerBase
 
 from src.callbacks.generate_examples import GenerateExamplesCallback
 from src.callbacks.parameter_stats import ParameterStatsCallback
@@ -21,6 +22,7 @@ from src.callbacks.wiring import build_perf_callbacks, reorder_integration_callb
 from src.data.pipeline.preferences import prepare_generative_dataset, prepare_preference_datasets
 from src.data.pipeline.processing import log_dataset_examples, resolve_map_num_proc
 from src.data.sources.loading import is_presharded_dataset_load, load_datasets, reject_image_columns
+from src.data.vlm import dataset_declares_images, is_vlm_run
 from src.distributed.expert_parallel.dispatcher import verify_rank_uniform_env
 from src.distributed.filesystem import verify_output_filesystem_sharing
 from src.distributed.loading.peft_setup import split_expert_lora_targets
@@ -51,6 +53,11 @@ class ScriptRuntime(NamedTuple):
     resume_checkpoint: str | None
     model_source: str
 
+    @property
+    def policy_from_checkpoint(self) -> bool:
+        """Whether the policy loads its weights from the resume checkpoint (a Path-B resume)."""
+        return self.resume_checkpoint is not None and self.model_source == self.resume_checkpoint
+
 
 def init_training_script(
     args,
@@ -59,8 +66,7 @@ def init_training_script(
     dist_args,
     *,
     script_prefix: str,
-    supports_cp: bool = True,
-    supports_pp: bool = True,
+    trainer_cls,
     sync_tokens: Sequence[str] = (),
     split_expert_lora: bool = True,
     **parallelism_kwargs,
@@ -78,9 +84,9 @@ def init_training_script(
         model_config: parsed TRL ``ModelConfig``.
         dist_args: parsed ``DistributedArguments``.
         script_prefix: run-name prefix (e.g. ``"sft"``); the parallelism mode suffix is appended.
-        supports_cp: forwarded to :func:`parallelism_config_from_args` (``False`` rejects CP).
-        supports_pp: forwarded to :func:`parallelism_config_from_args` (``False`` rejects PP at
-            config time, before the model — or a teacher/reference/vLLM probe — loads).
+        trainer_cls: the trainer class the script builds, forwarded to
+            :func:`parallelism_config_from_args`, whose CP/PP gates it supplies: a mode the trainer
+            refuses is rejected before the model — or a teacher/reference/vLLM probe — loads.
         sync_tokens: token field names to mirror between ``args`` and ``training_config``
             (configs that re-declare ``eos_token``/``pad_token`` under the resolve-conflict parser).
         split_expert_lora: peel MoE expert targets out of ``model_config.lora_target_modules`` into
@@ -110,8 +116,7 @@ def init_training_script(
     parallelism_config = parallelism_config_from_args(
         dist_args,
         training_config=training_config,
-        supports_cp=supports_cp,
-        supports_pp=supports_pp,
+        trainer_cls=trainer_cls,
         expert_lora=split_expert_lora_targets(model_config) if split_expert_lora else None,
         **parallelism_kwargs,
     )
@@ -160,12 +165,13 @@ def sync_token_field(args, training_config, field_name: str) -> None:
         setattr(training_config, field_name, value)
 
 
-def reject_images_under_text_only_model(args, datasets, *, text_only_model: bool) -> None:
+def _reject_images_under_text_only_model(args, datasets, *, text_only_model: bool) -> None:
     """Reject image data on a run that loaded a multimodal checkpoint through its text-only class.
 
-    Under ``text_only_model`` the loaded config is the text sub-config, so ``is_vlm_run`` cannot
-    route to a VLM data path: an image column would be pruned and the run would train on the rows'
-    text alone. Called once the dataset is in hand, before the modality dispatch.
+    ``is_vlm_run`` reads the checkpoint's config, which still says multimodal, so each image
+    declaration it counts (``images_field``, an image column, parts embedded in
+    ``conversation_field``) would route the run to a VLM data path with no vision model behind it.
+    Called once the dataset is in hand, before that verdict.
     """
     if not text_only_model:
         return
@@ -177,6 +183,36 @@ def reject_images_under_text_only_model(args, datasets, *, text_only_model: bool
             f"multimodal wrapper, or drop images_field for a text-only run."
         )
     reject_image_columns(datasets, "text_only_model=True (text-only CausalLM load)")
+    conversation_field = getattr(args, "conversation_field", None)
+    if conversation_field and dataset_declares_images(datasets, conversation_field):
+        raise ValueError(
+            f"The {conversation_field!r} column embeds image content parts, but text_only_model=True "
+            f"loads the text-only CausalLM class, which has no vision path. Drop text_only_model to "
+            f"train the multimodal wrapper, or drop the image parts for a text-only run."
+        )
+
+
+def resolve_vlm_run(
+    args, model_config, datasets, *, text_only_model: bool, vlm_checkpoint: bool | None = None
+) -> bool:
+    """Whether the run takes the VLM data path (:func:`~src.data.vlm.is_vlm_run`), after refusing
+    image data a text-only load cannot take (:func:`_reject_images_under_text_only_model`).
+
+    Called once the dataset is in hand and before the model load, which requires the checkpoint's
+    processor for an image run. The probe reads ``model_config``'s checkpoint at its
+    ``model_revision`` under its ``trust_remote_code``, as the load does, since hub ``main`` can name
+    a different modality than the pinned commit; ``vlm_checkpoint`` is a verdict the script already
+    probed, so the checkpoint config is not read twice.
+    """
+    _reject_images_under_text_only_model(args, datasets, text_only_model=text_only_model)
+    return is_vlm_run(
+        args,
+        model_config.model_name_or_path,
+        datasets,
+        revision=model_config.model_revision,
+        trust_remote_code=model_config.trust_remote_code,
+        vlm_checkpoint=vlm_checkpoint,
+    )
 
 
 def load_script_datasets(
@@ -319,16 +355,18 @@ def apply_max_length(
     )
 
 
-def install_resolved_tokenizer(processing_class, tokenizer: PreTrainedTokenizer, is_vlm: bool):
+def install_resolved_tokenizer(processing_class, tokenizer: PreTrainedTokenizer):
     """Return the trainer's ``processing_class`` carrying the resolved tokenizer.
 
     ``apply_max_length`` may hand back a different object than the one loaded (the
-    ``tokenizer_backend`` proxy), and a VLM processor still holds the raw inner tokenizer.
+    ``tokenizer_backend`` proxy), and a processor still holds the raw inner tokenizer. Read off the
+    loaded object rather than the checkpoint's modality: a multimodal checkpoint that ships no
+    processor loads a tokenizer for a run without image data.
     """
-    if is_vlm:
-        processing_class.tokenizer = tokenizer
-        return processing_class
-    return tokenizer
+    if isinstance(processing_class, PreTrainedTokenizerBase):
+        return tokenizer
+    processing_class.tokenizer = tokenizer
+    return processing_class
 
 
 def enforce_text_path_padding_side(tokenizer: PreTrainedTokenizer, vlm_run: bool) -> None:
@@ -400,6 +438,31 @@ def reject_unsupported_args(context: str, **unsupported) -> None:
     field is not a request.
     """
     _reject_ignored_fields(context, sorted(name for name, value in unsupported.items() if value))
+
+
+def reject_trl_dataset_prep_args(
+    context: str, sft_config, *unread_fields: str, render_remedy: str | None = None
+) -> None:
+    """Refuse the ``SFTConfig`` knobs only TRL's own dataset prep and default collator read.
+
+    A script that renders and masks its rows itself replaces both (:func:`disable_trl_dataset_prep`
+    overwrites ``dataset_kwargs``), so each knob would parse and do nothing. ``unread_fields`` names
+    further defaulted fields the caller's path leaves unread; ``render_remedy`` is what the script
+    offers instead of TRL's rendering knobs.
+    """
+    reject_unsupported_args(
+        f"{context} (it masks completions through train_on_completions_only + assistant_message_template)",
+        # Tri-state: an explicit False ("train on the full sequence") is ignored the same as True.
+        completion_only_loss=sft_config.completion_only_loss is not None,
+        assistant_only_loss=sft_config.assistant_only_loss,
+    )
+    reject_non_default_args(
+        f"{context} ({render_remedy})" if render_remedy else context,
+        sft_config,
+        "dataset_text_field",
+        "dataset_kwargs",
+        *unread_fields,
+    )
 
 
 def reject_non_default_args(context: str, args, *field_names: str) -> None:

@@ -81,11 +81,11 @@ doing when log-probs collapse.
 
 **The reference model is where the memory goes.** DPO needs the frozen reference's log-probs. With
 `use_peft: true` no second model is loaded at all: the reference is the base model with the adapter
-switched off (native EP expert-LoRA also needs `precompute_ref_log_probs: true`, since grouped
-expert adapters cannot be toggled). Otherwise a second full model is loaded and stays resident for
+switched off (expert-only EP LoRA has no adapter wrapper to switch off, so it needs
+`precompute_ref_log_probs: true`). Otherwise a second full model is loaded and stays resident for
 the whole run — except under expert or tensor parallelism, where that copy is refused outright and
 `precompute_ref_log_probs: true`, which takes the log-probs once from the untrained policy before
-step 1, is the way through. SMPO and KTO differ here: SMPO never loads one, KTO follows DPO's rules.
+step 1 and keeps them in the checkpoints for a resume, is the way through. SMPO and KTO differ here: SMPO never loads one, KTO follows DPO's rules.
 
 ## KTO
 
@@ -134,9 +134,10 @@ On DPO and SMPO, `rewards/accuracies` is the share of pairs scored in the right 
 chance, and it should climb early — and `rewards/margins` is the separation being bought. KTO has no
 pairs, so it logs no accuracy and reports margins only from batches holding both labels. The failure to watch for is
 `logps/chosen` and `logps/rejected` falling together: the model is making both answers less likely,
-which degrades generation. Lower the learning rate, raise `beta`, or add an SFT term (`chosen_sft_ratio`
-on SMPO, `[sigmoid, sft]` on DPO). On SMPO, a loss that goes NaN usually means the log-prob clips
-were disabled — keep `min_log_prob` and `lower_clip_percentile` at their defaults.
+which degrades generation. Lower the learning rate, or anchor harder: on SMPO raise `chosen_sft_ratio`
+or lower `beta` (it scales the margin term); on DPO add `[sigmoid, sft]` or raise `beta`. On SMPO, a
+loss that goes NaN usually means the log-prob clips were disabled — keep `min_log_prob` and
+`lower_clip_percentile` at their defaults.
 
 ## Go deeper
 

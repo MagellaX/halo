@@ -18,7 +18,11 @@ from PIL.Image import DecompressionBombError
 from transformers import AutoConfig, PreTrainedTokenizer
 
 from src.data.pipeline.conversation import maybe_parse_json
-from src.data.pipeline.preprocessed_metadata import PreprocessedDatasetMetadata, PreprocessingConfig
+from src.data.pipeline.preprocessed_metadata import (
+    PACKING_STRATEGIES,
+    PreprocessedDatasetMetadata,
+    PreprocessingConfig,
+)
 from src.data.pipeline.processing import (
     coordinated_filter,
     coordinated_map,
@@ -34,14 +38,13 @@ from src.data.pipeline.row_processors import (
 )
 from src.data.pipeline.tokenizer_backend import resolve_processor_backend, resolve_tokenizer_backend
 from src.data.shard_index import SHARD_INDEX_FILE, ShardIndex, ShardInfo
-from src.data.sources.paths import METADATA_FILE
+from src.data.sources.paths import METADATA_FILE, eval_split_name
 from src.data.spans import (
     COLLATOR_SPAN_POLICY,
     LABEL_IGNORE_INDEX,
     PACKED_SPAN_POLICY,
     build_completion_only_labels,
     mask_batch_to_completion_spans,
-    require_response_marker,
     resolve_eos_token_ids,
     tokenize_response_template,
 )
@@ -79,8 +82,8 @@ def _completion_only_labels(
     tokenizer: PreTrainedTokenizer,
     assistant_template: str,
     response_token_ids: list[int],
+    eos_token_ids: frozenset[int],
     extra_ignore_token_ids: tuple[int, ...] = (),
-    eos_token_ids: frozenset[int] | None = None,
     span_policy: dict[str, bool] | None = None,
 ) -> list[int]:
     """Completion-only loss labels for one tokenized example, baked with a named span policy.
@@ -97,7 +100,7 @@ def _completion_only_labels(
     batch = mask_batch_to_completion_spans(
         batch,
         response_token_ids,
-        eos_token_ids if eos_token_ids is not None else resolve_eos_token_ids(tokenizer),
+        eos_token_ids,
         ignore_index=LABEL_IGNORE_INDEX,
         train_on_last_assistant_only=False,
         response_prompt_template=assistant_template,
@@ -109,15 +112,12 @@ def _completion_only_labels(
 
 
 def _resolve_config_eos_token_ids(config: PreprocessingConfig, tokenizer: PreTrainedTokenizer) -> frozenset[int]:
-    """Assistant-turn terminator ids for preprocessing — load the model's HF config (for its
-    ``eos_token_id`` list) and fold in the tokenizer's eos/pad. Falls back to tokenizer-only on a
-    config-load failure so preprocessing never hard-fails on a metadata read.
+    """Assistant-turn terminator ids for the label bake: the model config's ``eos_token_id`` list
+    folded with the tokenizer's eos, the same set the runtime collator masks with. An unreadable
+    config raises: a tokenizer-only set would bake masks that differ from the runtime ones for
+    templates whose turn terminators only the config lists (GLM-4).
     """
-    try:
-        hf_config = AutoConfig.from_pretrained(config.model_name_or_path, trust_remote_code=True)
-    except Exception as exc:  # config read is best-effort; tokenizer eos/pad still apply
-        logger.warning(f"Could not load model config for eos_token_id resolution ({exc}); using tokenizer eos/pad.")
-        hf_config = None
+    hf_config = AutoConfig.from_pretrained(config.model_name_or_path, trust_remote_code=config.trust_remote_code)
     return resolve_eos_token_ids(tokenizer, hf_config)
 
 
@@ -184,9 +184,17 @@ def tokenize_dataset(
     tokenizer: PreTrainedTokenizer,
     config: PreprocessingConfig,
     split_name: str = "train",
+    *,
+    eos_token_ids: frozenset[int] | None = None,
 ) -> Dataset:
-    """Tokenize a dataset (raw-text or chat mode), returning input_ids/attention_mask/labels."""
+    """Tokenize a dataset (raw-text or chat mode), returning input_ids/attention_mask/labels.
+
+    ``eos_token_ids`` is the completion mask's terminator set, resolved once per corpus by
+    :func:`preprocess_dataset`; unset, it is resolved here, before the tokenization pass.
+    """
     tokenizer = resolve_tokenizer_backend(tokenizer, config.tokenizer_backend)
+    if config.train_on_completions_only and eos_token_ids is None:
+        eos_token_ids = _resolve_config_eos_token_ids(config, tokenizer)
 
     if config.mode == "text":
         # No truncation when packing: the packing strategy decides what happens past max_length.
@@ -240,7 +248,6 @@ def tokenize_dataset(
     # Labels are baked here; the preprocessed dataset's collators only pad, never re-mask.
     if config.train_on_completions_only:
         marker = config.assistant_message_template
-        eos_token_ids = _resolve_config_eos_token_ids(config, tokenizer)
         response_token_ids = tokenize_response_template(marker, tokenizer)
         # The policy follows the artifact, matching the collator that would have masked these rows
         # at runtime: a packed artifact is collated by the packing collator, which ends a
@@ -294,11 +301,13 @@ def tokenize_vlm_dataset(
     processor: Any,
     config: PreprocessingConfig,
     split_name: str = "train",
+    *,
+    eos_token_ids: frozenset[int] | None = None,
 ) -> Dataset:
     """Full VLM tokenization, including vision tokens.
 
     Produces input_ids (vision placeholders expanded), attention_mask, labels, pixel_values (float16
-    bytes), and image_grid_thw (Qwen-VL specific).
+    bytes), and image_grid_thw (Qwen-VL specific). ``eos_token_ids`` as in :func:`tokenize_dataset`.
     """
     if config.tools_field or config.interleaved_thinking:
         raise NotImplementedError(
@@ -311,11 +320,8 @@ def tokenize_vlm_dataset(
     processor = resolve_processor_backend(processor, config.tokenizer_backend)
     tokenizer = resolve_tokenizer(processor)
 
-    require_response_marker(
-        config.assistant_message_template, config.train_on_completions_only, "VLM offline preprocessing"
-    )
-
-    eos_token_ids = _resolve_config_eos_token_ids(config, tokenizer) if config.train_on_completions_only else None
+    if config.train_on_completions_only and eos_token_ids is None:
+        eos_token_ids = _resolve_config_eos_token_ids(config, tokenizer)
     response_token_ids = (
         tokenize_response_template(config.assistant_message_template, tokenizer)
         if config.train_on_completions_only
@@ -579,6 +585,24 @@ def _reject_unconsumed_image_columns(dataset: Dataset | DatasetDict, config: Pre
     )
 
 
+def _resolve_baked_splits(dataset: Dataset | DatasetDict) -> tuple[Dataset | None, Dataset | None]:
+    """The input's ``(train, test)`` pair, naming in a warning any split the artifact leaves out.
+
+    The artifact holds only ``train`` and ``test``. An input with no ``test`` split has its
+    ``validation`` split baked as ``test``, rather than lost to the placeholder training cuts from
+    train; any other split (``validation`` next to ``test``, an ``unsupervised`` split) is not baked.
+    """
+    if isinstance(dataset, Dataset):
+        return dataset, None
+    test_source = eval_split_name(dataset)
+    unbaked = sorted(set(dataset) - {"train", test_source})
+    if unbaked:
+        logger.warning(f"The input's split(s) {unbaked} are not baked: the prepared dataset holds train and test only")
+    if test_source not in (None, "test"):
+        logger.info(f"Baking the input's {test_source!r} split as the prepared dataset's 'test' split")
+    return dataset.get("train"), dataset[test_source] if test_source else None
+
+
 def preprocess_dataset(
     dataset: Dataset | DatasetDict,
     tokenizer_or_processor: Any,
@@ -587,8 +611,10 @@ def preprocess_dataset(
 ) -> dict[str, Any]:
     """Preprocess a dataset: tokenize, optionally pack, and optionally shard/save.
 
-    For VLM, pass the processor instead of a tokenizer and set config.is_vlm=True. Returns a dict with
-    "train"/"test" datasets, "metadata", and (if output_dir given) "shard_indices".
+    For VLM, pass the processor instead of a tokenizer and set config.is_vlm=True. A DatasetDict input
+    bakes its "train" and "test" splits (a lone "validation" split as "test") and warns of any other.
+    Returns a dict with "train"/"test" datasets, "metadata", and (if output_dir is given and
+    num_shards > 1) "shard_indices". At num_shards <= 1 the splits are saved unsharded (``save_to_disk``).
     """
     result = {}
 
@@ -596,20 +622,24 @@ def preprocess_dataset(
         raise ValueError("Packing is not supported for VLM datasets. Set pack_sequences=False when using is_vlm=True.")
 
     # Reject an invalid packing strategy here rather than failing deep inside trl.pack_dataset.
-    if config.pack_sequences and config.packing_strategy not in {"bfd", "bfd_split", "wrapped"}:
+    if config.pack_sequences and config.packing_strategy not in PACKING_STRATEGIES:
         raise ValueError(
             f"Invalid packing_strategy '{config.packing_strategy}'. "
-            "TRL pack_dataset only accepts 'bfd', 'bfd_split' or 'wrapped'."
+            f"TRL pack_dataset only accepts {list(PACKING_STRATEGIES)}."
         )
 
     _reject_unconsumed_image_columns(dataset, config)
 
-    if isinstance(dataset, DatasetDict):
-        train_data = dataset.get("train")
-        test_data = dataset.get("test")
-    else:
-        train_data = dataset
-        test_data = None
+    train_data, test_data = _resolve_baked_splits(dataset)
+
+    # Refused before the tokenization pass: training rejects a sharded dataset without a test split,
+    # while an unsharded one is handed a placeholder test split at load.
+    if output_dir is not None and config.num_shards > 1 and test_data is None:
+        raise ValueError(
+            f"num_shards={config.num_shards} writes a sharded dataset, which training refuses without a "
+            f"'test' split, and this input has none. Cut one with --test-size, or keep --num-shards at 1 "
+            f"for an unsharded dataset, which trains with a placeholder test split taken from train."
+        )
 
     if config.is_vlm:
         tokenize_fn = tokenize_vlm_dataset
@@ -619,11 +649,15 @@ def preprocess_dataset(
         tokenize_fn = tokenize_dataset
         tokenizer = tokenizer_or_processor
 
+    # Once per corpus and before any tokenization pass: the set reads the model config, and an
+    # unreadable one would otherwise surface only after the whole train split was tokenized.
+    eos_token_ids = _resolve_config_eos_token_ids(config, tokenizer) if config.train_on_completions_only else None
+
     for split, split_data in (("train", train_data), ("test", test_data)):
         if split_data is None:
             continue
 
-        tokenized = tokenize_fn(split_data, tokenizer_or_processor, config, split)
+        tokenized = tokenize_fn(split_data, tokenizer_or_processor, config, split, eos_token_ids=eos_token_ids)
 
         if config.pack_sequences:
             tokenized = pack_dataset_coordinated(
@@ -670,26 +704,23 @@ def preprocess_dataset(
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
+        splits = {split: result[split] for split in ("train", "test") if split in result}
 
-        shard_indices = {}
-
-        # Test is sharded the same way as train: a split whose shards do not reach every DP rank
-        # leaves those ranks with an empty eval set, mismatching gather_for_metrics counts and
-        # hanging the eval.
-        for split in ("train", "test"):
-            if split not in result:
-                continue
-            index = shard_dataset(
-                result[split],
-                config.num_shards,
-                output_dir,
-                split,
-            )
-            shard_indices[split] = index
-            index.save(os.path.join(output_dir, split, SHARD_INDEX_FILE))
-
-        result["shard_indices"] = shard_indices
-        _warn_on_shard_count_ceiling(shard_indices, config.num_shards)
+        if config.num_shards > 1:
+            shard_indices = {}
+            # Test is sharded the same way as train: a split whose shards do not reach every DP rank
+            # leaves those ranks with an empty eval set, mismatching gather_for_metrics counts and
+            # hanging the eval.
+            for split, split_data in splits.items():
+                index = shard_dataset(split_data, config.num_shards, output_dir, split)
+                shard_indices[split] = index
+                index.save(os.path.join(output_dir, split, SHARD_INDEX_FILE))
+            result["shard_indices"] = shard_indices
+            _warn_on_shard_count_ceiling(shard_indices, config.num_shards)
+        else:
+            # No shard index: training then loads the whole dataset on every rank and its DataLoader
+            # splits the rows by data-parallel rank, so the artifact trains at any DP size.
+            DatasetDict(splits).save_to_disk(output_dir)
 
         metadata.save(os.path.join(output_dir, METADATA_FILE))
         logger.info(f"Saved metadata to {os.path.join(output_dir, METADATA_FILE)}")

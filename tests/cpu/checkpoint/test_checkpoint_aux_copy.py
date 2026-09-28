@@ -3,13 +3,14 @@ directories ride whole.
 
 A merged directory is the mandated resume source for sharded EP/TP checkpoints
 (resolve_resume_weights_source), so the copy must keep ``scheduler.pt``,
-``router_balancing_biases.pt`` and every ``rng_state_<rank>.pth`` — dropping them silently
-re-warms the LR schedule from step 0, zeroes the router balancing biases, and re-draws every
-shuffle and dropout mask on resume — while still refusing to carry weight files that would
-shadow the freshly written safetensors. The refusal covers foreign-framework exports
-(``consolidated.*.pth``, ``.gguf``, ``.h5``, ``rust_model.ot``, ``*.tflite``) a hub source ships
-beside them: those are weights too, and copying them bloats every converted checkpoint. That
-``.pth`` sits on both sides is exactly why the sidecar exemption is by name, not by suffix.
+``router_balancing_biases.pt``, ``reference_logps.pt`` and every ``rng_state_<rank>.pth`` —
+dropping them re-warms the LR schedule from step 0, zeroes the router balancing biases, leaves a
+precompute run no untrained reference to restore, and re-draws every shuffle and dropout mask —
+while still refusing to carry weight files that would shadow the freshly written safetensors. The
+refusal covers foreign-framework exports (``consolidated.*.pth``, ``.gguf``, ``.h5``,
+``rust_model.ot``, ``*.tflite``) a hub source ships beside them: those are weights too, and
+copying them bloats every converted checkpoint. That ``.pth`` sits on both sides is exactly why the
+sidecar exemption is by name, not by suffix.
 
 Subdirectories are part of the artifact and copy whole, their own weights included: a
 SentenceTransformer module directory (``1_Pooling/``, ``2_Dense/``) or
@@ -24,13 +25,21 @@ training run (an N-way model merge).
     python tests/cpu/checkpoint/test_checkpoint_aux_copy.py
 """
 
-import sys
-
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from transformers.trainer import SCHEDULER_NAME
 
-from src.checkpoint.format import WEIGHT_FILE_IGNORE_PATTERNS, copy_checkpoint_aux_files
+from src.checkpoint.format import (
+    ADAPTER_SAFETENSORS_FILE,
+    REFERENCE_LOGPS_FILE,
+    RESUME_ADAPTER_DIR,
+    RESUME_ADAPTER_MARKER_FILE,
+    ROUTER_BALANCING_BIASES_FILE,
+    WEIGHT_FILE_IGNORE_PATTERNS,
+    copy_checkpoint_aux_files,
+    write_resume_adapter_marker,
+)
 from src.checkpoint.model_card import CARD_STAGING_PREFIX, CARD_STAGING_SUFFIX
 
 SKIPPED = (
@@ -62,8 +71,9 @@ KEPT = (
 )
 SIDECARS = (
     "rng_state_0.pth",
-    "scheduler.pt",
-    "router_balancing_biases.pt",
+    SCHEDULER_NAME,
+    ROUTER_BALANCING_BIASES_FILE,
+    REFERENCE_LOGPS_FILE,
 )
 # The SentenceTransformer module layout an embedding EP save produces: modules.json names these
 # directories, and 2_Dense carries its OWN weights that no merge rewrites.
@@ -96,6 +106,9 @@ def checkpoint_dir(tmp_path):
     # A Llama/Mistral-style vendor weight dump: the raw format beside the transformers one.
     (src / "original").mkdir()
     save_file({"tok_embeddings.weight": torch.ones(2, 2)}, str(src / "original" / "consolidated.safetensors"))
+    # gpt-oss's Metal-runtime dump of the same weights.
+    (src / "metal").mkdir()
+    (src / "metal" / "model.bin").write_bytes(b"x")
     return src
 
 
@@ -114,8 +127,9 @@ def test_resume_sidecars_survive_merge_copy(checkpoint_dir, tmp_path):
     out = tmp_path / "merged"
     out.mkdir()
     copy_checkpoint_aux_files(str(checkpoint_dir), str(out))
-    assert (out / "scheduler.pt").exists(), "LR schedule must survive into the merged resume source"
-    assert (out / "router_balancing_biases.pt").exists(), "router biases must survive into the merged resume source"
+    assert (out / SCHEDULER_NAME).exists(), "LR schedule must survive into the merged resume source"
+    assert (out / ROUTER_BALANCING_BIASES_FILE).exists(), "router biases must survive into the merged resume source"
+    assert (out / REFERENCE_LOGPS_FILE).exists(), "a precompute run's reference log-probs must survive the merge"
     # Same suffix as the foreign exports below, opposite verdict: a per-rank RNG state is what a
     # bit-reproducible resume replays from.
     assert (out / "rng_state_0.pth").exists(), "per-rank RNG state must survive into the resume source"
@@ -133,6 +147,29 @@ def test_resume_sidecars_can_be_excluded(checkpoint_dir, tmp_path):
         assert not (out / name).exists(), f"{name} describes one run's state and must not ship in a merge"
     for name in KEPT:
         assert (out / name).exists(), f"{name} must still be carried"
+
+
+@pytest.mark.parametrize("include_resume_sidecars", [True, False], ids=["resume-source", "n-way-merge"])
+def test_a_merged_checkpoint_resume_adapter_travels_with_the_sidecars(tmp_path, include_resume_sidecars):
+    """A merge-on-save checkpoint resumes from ``resume_adapter/``, which its marker names. Both are
+    resume state like ``scheduler.pt``: a tool writing a resume source keeps them, and an N-way merge
+    drops them — carried into a merge of several runs, the marker would resume one run's adapters
+    over the base and ignore the merged weights."""
+    src = tmp_path / "checkpoint"
+    (src / RESUME_ADAPTER_DIR).mkdir(parents=True)
+    save_file(
+        {"a.experts.down_proj.lora_A": torch.ones(2, 2)}, str(src / RESUME_ADAPTER_DIR / ADAPTER_SAFETENSORS_FILE)
+    )
+    write_resume_adapter_marker(str(src))
+    (src / "config.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    copy_checkpoint_aux_files(str(src), str(out), include_resume_sidecars=include_resume_sidecars)
+
+    assert (out / "config.json").exists()
+    assert (out / RESUME_ADAPTER_MARKER_FILE).exists() is include_resume_sidecars
+    assert (out / RESUME_ADAPTER_DIR / ADAPTER_SAFETENSORS_FILE).exists() is include_resume_sidecars
 
 
 def test_module_directories_copy_whole_with_their_weights(checkpoint_dir, tmp_path):
@@ -174,8 +211,9 @@ def test_a_vendor_weight_dump_directory_stays_behind(checkpoint_dir, tmp_path):
     out = tmp_path / "merged"
     out.mkdir()
     copy_checkpoint_aux_files(str(checkpoint_dir), str(out))
-    assert not (out / "original").exists(), "a vendor weight dump is weights, not aux data"
-    assert "original/*" in WEIGHT_FILE_IGNORE_PATTERNS, "the hub download must drop what the local copy drops"
+    for dump in ("original", "metal"):
+        assert not (out / dump).exists(), f"the {dump}/ vendor weight dump is weights, not aux data"
+        assert f"{dump}/*" in WEIGHT_FILE_IGNORE_PATTERNS, "the hub download must drop what the local copy drops"
     # Not a prefix match: original_adapter_config/ IS aux data (asserted copied above).
     assert (out / "original_adapter_config").exists()
 
@@ -241,4 +279,4 @@ def test_a_sibling_output_directory_is_allowed(checkpoint_dir, tmp_path):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -60,7 +60,7 @@ python scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat.yaml \
 - **Unwrapped MoE experts** — `swiglu` off, even when requested, where Halo does not wrap the routed experts (`ep_size: 1` with `use_grouped_gemm: false`, or a family with no EP layer class) and upstream liger-kernel holds the flag, which its MoE appliers use to install `LigerExperts` (input gradient wrong on Blackwell in the pinned release). The flag goes whole, so upstream's dense, shared-expert and vision SwiGLU on such a model run eager too ([Routed experts](../optimization/liger-kernels.md#routed-experts)).
 
 - **TP** (`tp_size > 1`) — `cross_entropy` and `fused_linear_cross_entropy` off; the `lm_head` logits are DTensor-sharded across the vocab dim, so a fused softmax would see a partial vocab.
-- **CP or PP** (`cp_size > 1` or `pp_size > 1`) — same two off: the CP wrapper (and, when PP lands, the last pipeline stage) computes the loss outside the model's forward, so the fused path never fires and its memory saving does not exist.
+- **CP or PP** (`cp_size > 1` or `pp_size > 1`; PP is [not yet available in this release](../parallelism/pipeline-parallelism.md)) — same two off: the CP wrapper or the last pipeline stage computes the loss outside the model's forward, so the fused path never fires and its memory saving does not exist.
 
 `fused_linear_cross_entropy` is otherwise opt-in, defaulting on only for DeepSeek-V4, GLM-4 MoE Lite, and Zaya. Override individual kernels with `liger_kernel_config`:
 
@@ -75,7 +75,7 @@ liger_kernel_config:
 ## Launcher selection
 
 `halo launch <method> <config>` (`src/cli.py`) resolves the method to a script under
-`scripts/training/` and picks the launcher: `accelerate launch` whenever `-a accelerate/<config>.yaml`
+`scripts/training/` and picks the launcher: `accelerate launch` whenever `-a launcher-configs/accelerate/<config>.yaml`
 is given (there `-n N` becomes `--num_processes`), else `torchrun` when `-n N` sets more than one
 process (required for EP/CP/TP/ETP), else plain Python. A plain-Python run trains on the one GPU it binds however many are visible: `init_training_script` pins `n_gpu` to 1, so HF never wraps the model in `nn.DataParallel` (whose loss and gradients scale with the GPU count). Every flag the launcher does not own reaches the trainer, so overrides follow the config directly (`halo launch sft cfg.yaml -n 8 --learning_rate=1e-5`); a standalone `--` is needed only before a flag that collides with the launcher's own (`--help`, `--port`, `--dry-run`, ...).
 `--list` prints the method names, `--dry-run` prints the command, `-p <port>` sets the rendezvous port
@@ -104,16 +104,18 @@ EP/CP/TP/ETP/PP under `accelerate launch` **raise** at startup for any `distribu
 | EP+CP / EP+TP | add both flags |
 | Multi-node | add `--nnodes`, `--node_rank`, `--master_addr`, `--master_port` |
 
-EP+ETP (`ep_size>1` and `expert_tensor_parallel_size>1`) is supported but experimental: the expert-TP reduction runs in token space so the coupled DeepEP dispatch groups don't deadlock the combine barrier under FSDP2. It must stay node-local and cannot combine with attention TP. See [Parallelism](../parallelism/README.md).
+EP+ETP (`ep_size>1` and `expert_tensor_parallel_size>1`) is supported but experimental: the expert-TP reduction runs in token space so the coupled DeepEP dispatch groups don't deadlock the combine barrier under FSDP2. Its expert-TP groups stay NVLink-local — across domains it runs as one EP group with exactly one ETP group per domain — and it cannot combine with attention TP. See [ETP validation rules](../parallelism/expert-tensor-parallelism.md#validation-rules).
 
 FSDP2 (`fully_shard`) is applied automatically for all `torchrun` modes: gradients and optimizer states stay sharded across DP ranks, so memory scales ~`dp_size` smaller than DDP. EP/CP exclude the EP modules via `ignored_params` — except at `ep_group_size == 1`, where `fsdp_shard_ep1_experts` (default `true`) hands the experts to FSDP2 as well and its reduce-scatter becomes their only gradient sync. TP with DP>1 uses a 2D mesh for DTensor-compatible grad sync.
 
 Two resharding knobs, both `torchrun`-only:
 
 - `fsdp_reshard_after_forward` (default `false` = SHARD_GRAD_OP: parameters stay unsharded between forward and backward). `true` is FULL_SHARD/ZeRO-3 and is rejected wherever an expert-distribution group exists (`ep_group_size > 1`, pure ETP included — the backward all-gather races the DeepEP combine), under TP with `data_parallel_size > 1`, and under PP.
-- `fsdp_reshard_after_backward` (default `true`). `false` keeps parameters unsharded across a gradient-accumulation window's microsteps (its last backward still reshards) at the cost of one unsharded bf16 param copy per GPU for the run.
+- `fsdp_reshard_after_backward` (default `true`). `false` keeps parameters unsharded across a gradient-accumulation window's microsteps (its last backward still reshards) at the cost of one unsharded bf16 param copy per GPU for the run (under ZeRO-2 the forward/backward peak already holds it, so the measured peak is unchanged).
 
-    The saving is the per-microstep re-gather: negligible over NVLink, large when the trainer's NCCL runs over TCP sockets. Rejected with `fsdp_reshard_after_forward: true`, TP, or PP.
+    The saving is the per-microstep re-gather: about 4–10% throughput over NVLink, far more when the trainer's NCCL runs over TCP sockets. Rejected with `fsdp_reshard_after_forward: true`, TP, or PP.
+
+`fsdp_defer_grad_sync` (default `false`, `torchrun`-only) is the gradient-side counterpart: `true` reduce-scatters once per optimizer step instead of once per microstep, holding one unsharded gradient copy per GPU across the window. See [Deferred gradient reduce](../parallelism/data-parallelism.md#deferred-gradient-reduce-fsdp_defer_grad_sync) for the measured trade-off.
 
 ## Example SFT config
 
@@ -170,11 +172,11 @@ Method-specific fields (`beta`, `loss_type`, `advantage_method`, `environment_ty
 
 ## Config file locations
 
-Configs live under `examples/<method>/<model-family>/`: `sft/`, `preference/`, `grpo/{offline,online,environmental}/`, `reward/`, `classification/`, `embedding/`, `distillation/`. SFT families are `cohere2_moe, deepseek_v4, gemma4, glm4, glm5_next, gptoss, inkling, laguna, ling_mini_2, mistral4, qwen3, qwen3_5, step3p7, zaya`.
+Configs live under `examples/<method>/<model-family>/`: `sft/`, `preference/`, `grpo/{offline,online,environmental}/`, `reward/`, `classification/`, `embedding/`, `distillation/`. SFT families are `cohere2_moe, deepseek_v4, gemma4, glm4, glm5_next, gptoss, inkling, laguna, lfm2, ling_mini_2, mistral4, qwen3, qwen3_5, step3p7, zaya`.
 
 Async GRPO with Environments adds a rollout-backend level below the family — `environmental/<family>/{vllm,sglang}/`, with `sglang` files for gpt-oss, Qwen3.5/3.6 and Gemma 4. The GRPO templates (`examples/grpo/online/rlvr-online-grpo-template.yaml`, `examples/grpo/environmental/environmental-grpo-template.yaml`) sit at the top of their method folder.
 
-A family directory is the snake_case hub family (`qwen3_5`, `deepseek_v4`, `ling_mini_2`), and file names lead with the same family token (`gptoss-20b-…`, `gemma4-26b-a4b-…`). One deviation: `qwen3_5/` also holds the `qwen3.6-*` configs, since Qwen3.6 ships under the Qwen3.5 model types.
+A family directory is a snake_case family token (`qwen3_5`, `deepseek_v4`, `ling_mini_2`). File names start with the model's name (`gptoss-20b-…`, `glm-4.7-flash-…`), behind a method prefix outside `sft/` and the Async GRPO recipes (`dpo-gemma4-26b-a4b-…`, `offline-grpo-qwen3.6-…`). `qwen3_5/` also holds the `qwen3.6-*` configs, since Qwen3.6 ships under the Qwen3.5 model types.
 
 ## Accelerate configs
 
@@ -190,12 +192,12 @@ Start with the gradop config; if OOM, try the full one. A hand-written accelerat
 
 | `optim` | Optimizer | Memory/param | Best for |
 |---|---|---|---|
-| `adamw_torch_fused` | PyTorch fused AdamW | 12 B (FP32 master) | Default, most stable |
+| `adamw_torch_fused` | PyTorch fused AdamW | 12 B over fp32 params (`bf16: false`) | Default, most stable |
 | (auto with `bf16: true`) | AdamWBF16 (stochastic rounding) | 6 B | Memory-constrained |
 | `muon` | Muon (Newton-Schulz) | ~4 B on 2D params | Faster convergence on matrix params |
 | `flash_adamw` | FlashAdamW (quantized states) | ~5 B | Maximum memory savings, drop-in AdamW |
 
-AdamWBF16 replaces `adamw_torch_fused`/`adamw_torch` automatically when `bf16: true`, except under accelerate-managed DDP. `bf16_optimizer` (default `null` = that auto rule) overrides it either way: `true` is the opt-in under DDP, `false` forces full fp32 masters. `true` alongside `optim: muon` or `flash_adamw` raises — both name an optimizer, and one would silently win. FlashAdamW needs `uv pip install "halo[flash-optimizers]"`. See [BF16 Optimizer](../optimization/bf16-optimizer.md#compatibility), [Muon](../optimization/muon-optimizer.md), [FlashAdamW](../optimization/flash-adamw.md).
+AdamWBF16 replaces `adamw_torch_fused`/`adamw_torch` automatically when `bf16: true`, except under accelerate-managed DDP. `bf16_optimizer` (default `null` = that auto rule) overrides it either way: `true` is the opt-in under DDP, `false` runs the stock AdamW over the params as loaded (bf16 masters with round-to-nearest under `bf16: true`, not fp32 — fp32 masters come from `fp32_non_ep_params` or `bf16: false`). `true` alongside `optim: muon` or `flash_adamw` raises — both name an optimizer, and one would silently win. FlashAdamW needs `uv pip install "halo[flash-optimizers]"`. See [BF16 Optimizer](../optimization/bf16-optimizer.md#compatibility), [Muon](../optimization/muon-optimizer.md), [FlashAdamW](../optimization/flash-adamw.md).
 
 ## Low-precision compute
 
@@ -234,4 +236,4 @@ EP is orthogonal to data parallelism; only TP, CP, and ETP reduce it — `data_p
 | `HALO_DATA_ROOT` | `~/.cache/halo` | Toolkit scratch root (S3 dataset cache, profiler artifacts) |
 | `TMPDIR` | `/tmp` | Temp files |
 
-Point the cache/scratch/temp vars at a **verified** large mounted volume (`df -h` / `findmnt` — a `/mnt` path is not always a big array). Secrets (`WANDB_API_KEY` / `HF_TOKEN` / `AWS_*`) come from `.env` and are never auto-loaded. Full catalogue: [Configuration Reference](../reference/configuration-reference.md#environment-variables).
+Point the cache/scratch/temp vars at a **verified** large mounted volume (`df -h` / `findmnt` — a `/mnt` path is not always a big array). Secrets (`WANDB_API_KEY` / `HF_TOKEN` / `AWS_*`) come from `.env` and are never auto-loaded. Full catalog: [Configuration Reference](../reference/configuration-reference.md#environment-variables).

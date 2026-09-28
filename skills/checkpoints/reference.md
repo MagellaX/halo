@@ -25,18 +25,26 @@ additionally needs `ep_size` in the index metadata, not just the marker.
 
 ## Resume — three paths
 
-- **Path A — reload from checkpoint** (TP-only, dense FSDP2/DDP): weights come from the checkpoint.
-  TP (`_load_tp`) streams the checkpoint one tensor at a time per rank and `distribute_tensor`s each
-  into the live DTensor's placements before `copy_` (hand-sharded non-DTensor params — GptOss sinks —
-  are sliced by `tp_rank`); FSDP2 (`_load_fsdp2`) reshards first, then reads the whole dict on rank 0 via
-  `load_full_state_dict()` and hands it to `set_model_state_dict(broadcast_from_rank0)` — skipped
-  outright when the model was already constructed from that checkpoint (re-reading a 100B+ state
-  dict is waste), except for `load_best_model_at_end`. Both gate on
-  key coverage across ranks and restore weights + trainer state.
-- **Path B — skip reload** (EP, ETP, EP+TP, EP+CP, CP): model rebuilt by `load_distributed_model()` at
-  `__init__`, so **weights are not reloaded**. **Set `model_name_or_path` to the gathered checkpoint
-  dir** — a checkpoint that ships base weights the live model was not built from makes the loader
-  raise (rank-0 verdict, broadcast), as does `load_best_model_at_end` under EP/CP full fine-tuning.
+- **Path A — reload from checkpoint** (only a `use_grouped_gemm: false` run with no EP/ETP/CP/TP):
+  `model_name_or_path` stays the weights source. Under FSDP2 `_load_fsdp2` reshards, reads the whole
+  dict on rank 0 via `load_full_state_dict()` and hands it to `set_model_state_dict(broadcast_from_rank0)`,
+  gated on key coverage; DDP falls through to the base Trainer's loader.
+- **Path B — load at construction** (EP, ETP, EP+TP, EP+CP, CP, TP, and at the default
+  `use_grouped_gemm: true` every other run, dense included): `resolve_resume_weights_source`
+  (`src/training/environment.py`) repoints the policy's weights source at the checkpoint dir (an
+  adapter-only one keeps the base, and so does a merged one — `merge_expert_lora_on_save` or
+  embedding LoRA — whose `resume_adapter.json` marker sends the resume to its `resume_adapter/`), so
+  `load_distributed_model()` builds the model from the trained
+  weights. `model_config` is not mutated — the DPO/KTO/SDPG reference and the dataset-compat check
+  keep the base, so **leave `model_name_or_path` at the base**. An unmerged per-rank save raises
+  here, before construction. The loader then skips the re-read: EP/CP always, `_load_tp` / `_load_fsdp2` when the model was
+  constructed from that checkpoint. A model built from anything else makes the loader raise
+  (rank-0 verdict, broadcast) under EP/CP when the checkpoint ships base weights (a marked
+  merge-on-save checkpoint inverts this: it refuses a model built from itself), and under TP+DP,
+  whose strided dp-over-tp placement `distribute_tensor` does not invert; pure TP instead streams the
+  checkpoint one tensor at a time per rank and `distribute_tensor`s each into the live placements
+  (GptOss sinks sliced by `tp_rank`). `load_best_model_at_end` raises under EP/CP full fine-tuning
+  and TP+DP; FSDP2 and pure TP re-read for it.
 - **Path C — PP** (`_load_pp_stage`, dispatched first): stage-local restore. Unreachable while PP is
   unavailable in this release.
 
@@ -63,8 +71,8 @@ Merge a `save_sharded_ep` checkpoint (per-rank `.shard_N` expert keys) into HF f
 EP-internal layouts back to each family's HF layout. Flags: `--input_dir`, `--output_dir`, `--quiet`,
 `--max_shard_size` (`5GB`), `--delete_input_shards`. The merge casts nothing: the sharded writer
 already applied `save_dtype_caster` (`src/checkpoint/format.py` — BF16 except the
-module-tree keep-sets: norms, balancing tensors, the family's fp32 pins), so the stored dtype is the
-export dtype. The index metadata is HF's own — there is no `merged_from_*` marker.
+module-tree keep-sets: norms, balancing tensors, the family's fp32 pins; a training checkpoint keeps
+every tensor at its live dtype), so the stored dtype is what the merge writes. The index metadata is HF's own — there is no `merged_from_*` marker.
 - **Family support is class-owned, not a table.** `resolve_ep_merge_layer_class` /
   `supported_ep_merge_model_types` (`expert_weights.py`, which also owns `expert_weight_roots` and
   `to_hub_layer_key`) map a checkpoint's `model_type` to the EP layer class via each class's
@@ -82,7 +90,7 @@ export dtype. The index metadata is HF's own — there is no `merged_from_*` mar
 ### `merge_peft_adapters.py`
 Load base + adapter, `merge_and_unload()`, save standalone HF checkpoint (base path read from
 `adapter_config.json`). Flags: `--adapter_dir`, `--output_dir`,
-`--task {causal_lm,classification}`, `--dtype {bf16,fp16,fp32}`, `--device_map` (`auto`/`cpu` for big
+`--task {causal_lm,classification}`, `--dtype` (`bfloat16`), `--device_map` (`auto`/`cpu` for big
 models), `--num_labels`, `--max_shard_size` (`5GB`), `--attn_implementation`, plus the shared
 `--trust_remote_code` / `--quiet`. Uses
 `resolve_auto_model_class`, so **VLM bases load as the full `*ForImageTextToText` wrapper** (avoids
@@ -102,8 +110,13 @@ Re-save a model in BF16, optionally merging a PEFT adapter in the same pass. Fla
 `--no-trust_remote_code` (default **True** — a local checkpoint source; Bailing/Ling need remote code.
 `patch_vocab.py`, `convert_deepseek_v4_bf16.py`, `reattach_vision_tower.py` and `reset_sinks.py`
 read a Hub-capable `--model_id`, so those default **off**).
-**Forces `LayerNorm` / any `*norm*` module back to fp32** (BF16 body + fp32 norms), matching both
-merge scripts. Applies `apply_training_sidecars` to the loaded model (see below).
+**Forces every normalization leaf (torch norm bases, or a class named `*Norm*`) back to fp32** (BF16
+body + fp32 norms) — the only tool that does: `merge_peft_adapters.py` leaves norms at the `--dtype`
+it loads the base at, except modules a family pins through transformers'
+`_keep_in_fp32_modules_strict` (e.g. DeepSeek-V4's norms and HC modules), which load fp32 under a
+bf16 or fp16 `--dtype`. GPT-OSS declares its norms in the non-strict `_keep_in_fp32_modules`, which
+transformers keeps fp32 only under `--dtype float16`. `merge_ep_shards.py` keeps norms at their
+trained dtype. Applies `apply_training_sidecars` to the loaded model (see below).
 
 ### `quantize_to_lowp.py`
 Post-training quantize bf16/fp32 → block-scaled **mxfp8 / mxfp4 / nvfp4** (compressed-tensors triples +
@@ -114,8 +127,8 @@ ignores the flag, and an unresolvable family raises rather than guessing), `--in
 (regex), `--verify`, and the four training-scope flags the checkpoint does not carry:
 `--lowp_apply_dense_mlp` / `--lowp_apply_moe_experts` (both default on) and
 `--lowp_keep_first_blocks` / `--lowp_keep_last_blocks` (both `0`) — same names and defaults as the
-`ParallelismConfig` knobs, so a training config transfers verbatim. Quantizes any `*.weight` matrix
-**and** the fused 3-D MoE expert tensors (`...experts.gate_up_proj` / `down_proj`, no `.weight`
+`ParallelismConfig` knobs, so a training config transfers verbatim. Quantizes the dense MLP projections
+**and** the declared expert weights, fused 3-D banks included (`...experts.gate_up_proj` / `down_proj`, no `.weight`
 suffix — the largest tensors in gpt-oss/Qwen3.5/GLM4/LFM2) that match include∧¬exclude. For a sharded input it rebuilds `model.safetensors.index.json` and copies every
 non-weight file (config, tokenizer, `chat_template.jinja`, remote-code `.py`). An **export tool, not a
 speedup** — bf16 stays optimal at these shapes.
@@ -123,7 +136,7 @@ speedup** — bf16 stays optimal at these shapes.
 ### `reset_sinks.py`
 Set every `*.sinks` param to dtype-min (neutralize the attention sink), matching the GptOss FA2-finetune
 behavior. Flags: `--model_id` (required; local dir or HF repo id, no `--revision`), `--output_dir`
-(required unless `--in_place`), `--in_place` (rewrites the `--model_id` directory, no undo — never
+(required unless `--in_place` or `--dry_run`), `--in_place` (rewrites the `--model_id` directory, no undo — never
 valid for a repo id), `--dry_run`, plus the shared `--max_shard_size` / `--trust_remote_code`
 (default **off** — a Hub-capable source). Direct safetensors edit when `model.safetensors`
 exists, else `from_pretrained` + `save_pretrained` for sharded checkpoints.
@@ -149,7 +162,7 @@ default base or first model, a Hub id is downloaded weights-excluded), `--max_sh
 `--quiet`, `--allow_missing_tokenizer`, `--trust_remote_code`. Streams one tensor at a time across the inputs, so peak host memory scales with the largest
 tensor, not N models (knob ranges and per-method working set: `agent-docs/reference/model-merging.md`).
 Deliberately copies **no** resume sidecars (`rng_state*`, `scheduler.pt`,
-`router_balancing_biases.pt`) — they describe one run, not the merge.
+`router_balancing_biases.pt`, `reference_logps.pt`) — they describe one run, not the merge.
 
 ### `reattach_vision_tower.py`
 Rebuild the multimodal wrapper layout around a `text_only_model` export: text weights re-prefixed to
@@ -186,14 +199,12 @@ and `convert_to_bf16.py` call it and print the returned actions; `copy_training_
   reshard first.
 - **GptOss EP-save biases** — `EPGptOssMoELayer.gather_expert_state_dict`
   (`src/distributed/expert_parallel/layers/gpt_oss.py`) carries the 2-D `gate_up_proj_bias` /
-  `down_proj_bias` alongside the 3-D expert weights, so the gathered checkpoint reloads cleanly. GptOss
-  EP checkpoints produced by a `param.dim()==3`-only filter (no 2-D biases) must be patched from the
-  source biases before reload.
+  `down_proj_bias` alongside the 3-D expert weights, so the gathered checkpoint reloads cleanly.
 - **CP-only state_dict drops dense MLP only on sparse layers** — `UlyssesCPModelWrapper.state_dict`
   (`src/distributed/context_parallel/wrapper.py`) filters duplicate dense `.mlp.{gate,up,down}_proj`
   keys per layer, gated on layers that actually carry routed experts. A model-global filter would drop
   the genuinely-dense early layers (GLM-4 MoE Lite, Mistral4 `first_k_dense_replace`) → a corrupt CP-only
-  checkpoint, masked on resume (CP reloads weights from `model_name_or_path`).
+  checkpoint.
 - **TP attention head divisibility** — `parallelize_attention.py` raises before sharding when
   `num_attention_heads` (or non-MLA GQA `num_key_value_heads`) is not divisible by `tp_size`;
   `ColwiseParallel` would otherwise split Q/K/V inside a head and silently corrupt attention. MLA

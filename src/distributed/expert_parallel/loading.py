@@ -24,6 +24,7 @@ from src.distributed.expert_parallel.lazy_loader import (
 )
 from src.distributed.expert_parallel.patching import (
     create_ep_buffers,
+    ep_claimed_blocks,
     patch_moe_model_for_ep,
 )
 from src.distributed.filesystem import sequential_load_within_node
@@ -37,6 +38,7 @@ from src.distributed.runtime import (
     move_model_to_local_device,
 )
 from src.models.loading.checkpoint_coverage import from_pretrained_verified
+from src.models.loading.dtype import cast_parameters_to_run_dtype
 from src.models.loading.lazy_safetensors.weights import (
     has_safetensors_checkpoint,
     resolve_run_dtype,
@@ -47,6 +49,19 @@ from src.models.patches.buffer_fixes import finalize_loaded_model
 _T = TypeVar("_T")
 
 logger = get_logger(__name__)
+
+
+def cast_loaded_parameters(model: torch.nn.Module, dtype, *, keep_fp32: bool, ep_wrapped: bool) -> None:
+    """:func:`cast_parameters_to_run_dtype` on a freshly loaded model, EP-aware.
+
+    ``keep_fp32`` (the run keeps fp32 masters, ``fp32_non_ep_params``) keeps stored fp32 values for the
+    parameters the trainer's fp32 upcast covers, which skips EP parameters: with ``ep_wrapped`` (the
+    MoE blocks get EP wrappers) a parameter inside one trains at the run dtype.
+    """
+    cast_parameters_to_run_dtype(model, dtype, keep_fp32=keep_fp32)
+    if keep_fp32 and ep_wrapped:
+        for _path, block in ep_claimed_blocks(model):
+            cast_parameters_to_run_dtype(block, dtype)
 
 
 def decide_lazy_loadable(local_dir: str | None, layout_supported: Callable[[str], bool]) -> bool:
@@ -161,6 +176,7 @@ def load_ep_model(
     max_concurrent_loading: int | None = None,
     lazy: bool = True,
     revision: str | None = None,
+    keep_fp32_params: bool = False,
     **model_kwargs,
 ) -> torch.nn.Module:
     """Load a MoE model for EP training.
@@ -171,6 +187,7 @@ def load_ep_model(
     back to per-rank ``from_pretrained`` + EP patch. ``model_name_or_path`` may be a
     Hub id (resolved to the cached snapshot dir), local path, or EP checkpoint dir. ``config`` is the
     caller's already-loaded model config, required so that no loader re-reads it per rank.
+    ``keep_fp32_params`` is :func:`cast_loaded_parameters`' ``keep_fp32`` on either path.
     """
     rank = get_global_rank()
 
@@ -195,6 +212,7 @@ def load_ep_model(
                 model_class=model_class,
                 max_concurrent_loading=max_concurrent_loading,
                 revision=revision,
+                keep_fp32_params=keep_fp32_params,
                 **model_kwargs,
             ),
         )
@@ -220,6 +238,7 @@ def load_ep_model(
                 dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 model_class=model_class,
+                keep_fp32_params=keep_fp32_params,
                 **model_kwargs,
             ),
         )
@@ -247,6 +266,7 @@ def load_ep_model(
             model_class=model_class,
             max_concurrent_loading=max_concurrent_loading,
             revision=revision,
+            keep_fp32_params=keep_fp32_params,
             **model_kwargs,
         ),
     )
@@ -262,8 +282,8 @@ def _load_ep_model_sharded(checkpoint_dir: str) -> torch.nn.Module:
         f"        --output_dir /path/to/merged_checkpoint\n\n"
         f"Then load the merged checkpoint:\n\n"
         f"    model = load_ep_model('/path/to/merged_checkpoint', ep_config)\n\n"
-        f"Alternatively, use save_ep_model(sharded=False) to save in gathered format "
-        f"which can be loaded directly without merging."
+        f"Alternatively, train with save_sharded_ep: false to save in gathered format, "
+        f"which loads directly without merging."
     )
 
 
@@ -276,6 +296,7 @@ def _load_ep_model_huggingface(
     model_class=None,
     max_concurrent_loading: int | None = None,
     revision: str | None = None,
+    keep_fp32_params: bool = False,
     **model_kwargs,
 ) -> torch.nn.Module:
     """Load EP model from HuggingFace checkpoint.
@@ -316,16 +337,7 @@ def _load_ep_model_huggingface(
             revision=revision,
             **model_kwargs,
         )
-
-        # Match the lazy loader's uniform parameter dtype: from_pretrained honors
-        # _keep_in_fp32_modules[_strict] (Inkling pins its short convolutions in fp32) and FSDP2
-        # rejects mixed-dtype parameters in one shard group. Parameters only: casting buffers would
-        # downcast fp32 state a family keeps deliberately (Zaya's balancing biases). The isinstance
-        # guard skips the "auto" spelling, which nn.Module.to reads as a device.
-        if isinstance(dtype, torch.dtype):
-            for param in model.parameters():
-                if param.is_floating_point() and param.dtype != dtype:
-                    param.data = param.data.to(dtype)
+        cast_loaded_parameters(model, dtype, keep_fp32=keep_fp32_params, ep_wrapped=True)
 
         logger.info(f"[Rank {rank}] Applying EP patching...")
         model = patch_moe_model_for_ep(model, ep_config)

@@ -118,12 +118,13 @@ A rank-0 preflight reads the served `max_model_len` from `/v1/models` and raises
 
 Weights are pushed before the **next** generation, not at the optimizer step: TRL syncs when `state.global_step` has moved since `_last_loaded_step`. That sentinel is per-process (`-1`) and `TrainerState` never carries it, so a resumed run pushes before its first rollout ([mechanics](../../infrastructure/rollout-servers.md#weight-sync)).
 
-`validate_weight_sync_support` refuses seven shapes at construction:
+`validate_weight_sync_support` refuses eight shapes at construction:
 
 - QLoRA (`load_in_4bit` / `load_in_8bit`): bnb-packed storage corrupts the served policy.
+- A PEFT layer the sync cannot fold (LoRA on `nn.MultiheadAttention`, trainable tokens, quantized LoRA, a variant other than DoRA, a grouped conv), or a PEFT adapter on a tensor its dense push does not send, such as EP expert weights ([PEFT](../../optimization/peft.md#online-rl--rollout-server-weight-sync)).
 - GptOss sinks removed by the `flash_attention_2` `reset_sinks` reset, and `train_sinks: true`.
 - Model types in the client's `UNSERVABLE_MODEL_TYPES`, and EP families setting `_supports_weight_sync = False` ([per-family restrictions](../../parallelism/expert-parallelism.md#per-family-ep-restrictions)).
-- An EP family with no live EP wrapper: `ep_size: 1` with `use_grouped_gemm: false`.
+- An EP family with no live EP wrapper: `expert_parallel_size: 1` with `use_grouped_gemm: false`.
 - Live `bias_update` balancing state: the payload is parameters only.
 
 ### Multi-homed nodes (`VLLM_GROUP_HOST`)
@@ -152,13 +153,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun --nproc_per_node=7 \
 
 `halo launch rlvr <config> --nproc 7` builds the same `torchrun` line — the device split stays yours — landing on FSDP2 data parallelism. Add `--tensor_parallel_size` for dense TP or `--expert_parallel_size` for MoE.
 
-Set `ep_size` to the training-GPU count so the trainer ranks form **one** DeepEP group. Above `ep_size: 2` a group narrower than the NVLink domain is rejected ([DeepEP](../../infrastructure/deepep.md#ep-grouping-what-is-reliable)), and `num_experts` must divide by `ep_size` — so most rosters want a power-of-two split: trainer on `CUDA_VISIBLE_DEVICES=0,1,2,3` with `--expert_parallel_size=4`, server on `VLLM_CUDA_DEVICES=4,5,6,7`. Under EP+TP, `tp_size` must divide the NVLink domain and `ep_size` must be a multiple of it.
+Set `expert_parallel_size` to the training-GPU count so the trainer ranks form **one** DeepEP group. Above `expert_parallel_size: 2` a group narrower than the NVLink domain is rejected ([DeepEP](../../infrastructure/deepep.md#ep-grouping-what-is-reliable)), and `num_experts` must divide by `ep_size` — so most rosters want a power-of-two split: trainer on `CUDA_VISIBLE_DEVICES=0,1,2,3` with `--expert_parallel_size=4`, server on `VLLM_CUDA_DEVICES=4,5,6,7`. Under EP+TP, `tp_size` must divide the NVLink domain and `ep_size` must be a multiple of it.
 
 ### LoRA
 
 Add `use_peft: true` and the `lora_*` fields. LoRA runs under FSDP2 DP, EP and pure ETP; any adapter on the TP-sharded backbone is **rejected under TP and EP+TP** (`_validate_lora_tp_compatibility`, `src/trainers/mixins/validation.py`), because PEFT keeps `lora_A`/`lora_B` as plain tensors outside the TP graph. Native expert adapters too.
 
-The weight sync merges the adapter into the base before broadcasting, so vLLM serves the plain base; under EP the gather folds native expert-LoRA in too ([PEFT](../../optimization/peft.md#hyperparameters)).
+The weight sync folds the adapter into each base weight out of place as it sends it, so vLLM serves the adapted policy with no adapter loaded and the trainer's frozen base is never written; under EP the gather folds native expert-LoRA in too ([PEFT](../../optimization/peft.md#online-rl--rollout-server-weight-sync)).
 
 ## Data flow and batch construction
 
@@ -180,7 +181,7 @@ Trainer-side, all three GRPO scripts default `attn_implementation` to **SDPA** f
 
 Run a smoke config against a live server first — `examples/grpo/online/qwen3/online-grpo-qwen3-4b-smoke.yaml` (dense) or `.../gptoss/online-grpo-gptoss-20b-ep-smoke.yaml` (EP). Each sets `max_steps: 3` and `save_strategy: "no"`, exercising rendering, rewards, the loss and one weight sync in minutes.
 
-CPU: `pytest tests/cpu/grpo -m cpu`. GPU: `tests/gpu/trainers/grpo/test_online_grpo_mock.py` needs no server; the `test_online_grpo_vllm_*_e2e.py` suites run the PEFT × parallelism × resume matrix against one.
+CPU: `pytest tests/cpu/grpo -m cpu`. GPU: the `test_online_grpo_vllm_*_e2e.py` suites run the PEFT × parallelism × resume matrix against a live server.
 
 ## What to watch
 

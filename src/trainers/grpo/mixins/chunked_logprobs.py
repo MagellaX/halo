@@ -27,6 +27,7 @@ from src.models.head_transform import IDENTITY_HEAD_TRANSFORM, HeadTransform, re
 from src.models.loading.config_levels import text_config
 from src.models.modality import config_declares_multimodality
 from src.models.structure import base_transformers_model
+from src.trainers.mixins.validation import evaluation_runs
 
 logger = logging.getLogger(__name__)
 
@@ -444,8 +445,7 @@ class ChunkedLogprobsCore:
         vocab = head.weight.shape[0]
         args = self.args
         rows, rows_set_by = args.per_device_train_batch_size, "per_device_train_batch_size"
-        evaluates = args.eval_strategy not in ("no", None) or args.eval_on_start
-        if evaluates and args.per_device_eval_batch_size > rows:
+        if evaluation_runs(args) and args.per_device_eval_batch_size > rows:
             rows, rows_set_by = args.per_device_eval_batch_size, "per_device_eval_batch_size"
         free_bytes, _ = torch.cuda.mem_get_info(self.accelerator.device)
         verdict = full_logits_verdict(rows, rows_set_by, width, vocab, free_bytes)
@@ -646,7 +646,7 @@ class ChunkedGRPOLogprobsMixin(ChunkedLogprobsCore):
             batch_size = (
                 self.args.per_device_train_batch_size if self.model.training else self.args.per_device_eval_batch_size
             )
-        chunked = getattr(self, "_use_chunked_grpo_logprobs", False)
+        chunked = self._use_chunked_grpo_logprobs
         is_multimodal = any(kwargs.get(k) is not None for k in self._multimodal_keys())
         # Mixed full (image) / chunked (text) paths across ranks diverge FSDP2's collectives and deadlock
         # backward, so any multimodal batch routes all ranks to the full forward; text-only models skip this.

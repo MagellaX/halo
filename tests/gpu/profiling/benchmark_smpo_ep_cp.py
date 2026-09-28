@@ -24,6 +24,7 @@ Usage:
 import gc
 import random
 import sys
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -39,8 +40,10 @@ from src.distributed.runtime import barrier
 from src.trainers.preference.smpo import SmoothMarginPOTrainer
 from tests.common.benchmark_args import create_benchmark_parser
 from tests.common.distributed import (
+    cleanup_dirs,
     ensure_model_downloaded,
     init_distributed,
+    setup_cache_dirs,
 )
 from tests.common.models import MODEL_CONFIGS
 from tests.common.reporting import emit_benchmark, format_benchmark_report
@@ -191,6 +194,7 @@ def main() -> int:
     # --- Distributed Setup ---
     rank, world_size, local_rank = init_distributed()
     PartialState()
+    output_dir, cache_dir = setup_cache_dirs("bench_smpo_epcp", rank)
 
     try:
         # Determine mode
@@ -271,8 +275,6 @@ def main() -> int:
             print(f"Dataset created: {len(dataset)} samples, seq_len={seq_len}")
 
         # --- SMPO Config ---
-        output_dir = f"/tmp/smpo_ep_cp_benchmark_{args.ep}_{args.cp}_{seq_len}"
-
         smpo_config = SmoothMarginPOConfig(
             output_dir=output_dir,
             per_device_train_batch_size=1,
@@ -287,6 +289,7 @@ def main() -> int:
             dataloader_pin_memory=False,
             remove_unused_columns=False,
             report_to=[],
+            logging_nan_inf_filter=False,
             include_num_input_tokens_seen=True,
             ddp_find_unused_parameters=True,
             # SMPO specific
@@ -341,8 +344,6 @@ def main() -> int:
         failed = True
         log(f"\nBENCHMARK FAILED: {e}")
         if rank == 0:
-            import traceback
-
             traceback.print_exc()
 
     finally:
@@ -354,6 +355,7 @@ def main() -> int:
         del model
         gc.collect()
         torch.cuda.empty_cache()
+        cleanup_dirs(output_dir, cache_dir)
 
         if dist.is_initialized():
             dist.destroy_process_group()

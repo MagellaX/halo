@@ -25,11 +25,11 @@ The two moments round differently:
 
 The kernel computes both EMAs and the weight update in fp32, truncating only on store-back, so the update always sees the exact fp32 second moment.
 
-SR seeds come from a dedicated, rank-synchronized RNG (`_SR_RNG`, one per optimizer module) kept separate from the global `random` module, so nothing in the data path can desync the noise across ranks. Replicas that hold the same parameter and receive the same averaged gradient — HSDP `dp_replicate` groups, DDP — round it identically and stay bit-for-bit in sync.
+SR seeds are drawn from no generator: `sr_seed_pair` hashes the parameter's optimizer step (`state["step"]`) and its position across the param groups (the optimizer state dict's index space) under a per-optimizer key. Replicas that hold the same parameter and receive the same averaged gradient — HSDP `dp_replicate` groups, DDP, EP replica groups — round it identically and stay bit-for-bit in sync. A resumed run restores `step` with the optimizer state, so it rounds exactly as the uninterrupted run would have; there is no generator state to checkpoint, and the zero-LR step torch runs to materialize state before a restore consumes nothing. An element's noise is keyed by its offset in the rank's local shard, so it reproduces for one sharding layout (the one an optimizer-shard resume must keep), not across layouts.
 
 ## Benchmarks
 
-**GPT-OSS-20B MoE (24 layers, 32 experts, 20.7B params, ~14B trainable with first 8 layers frozen), single B300 (Blackwell, SM100):** AdamWBF16 (Triton) steps in 51.6 ms vs 62.1 ms for `adamw_torch_fused` (**−17%**), at identical 134.2 GB peak and identical bf16 (4B) state dtype.
+**GPT-OSS-20B MoE (24 layers, 32 experts, 20.7B params, ~14B trainable with first 8 layers frozen), single B300 (SM103):** AdamWBF16 (Triton) steps in 51.6 ms vs 62.1 ms for `adamw_torch_fused` (**−17%**), at identical 134.2 GB peak and identical bf16 (4B) state dtype.
 
 The kernel is faster because it fuses state EMA + weight update + SR into one memory pass (14 B/element) and draws both SR noise streams from one `tl.randint4x` Philox call. This row compares two bf16-state optimizers; the 6-vs-12 B/param memory win is against fp32-state AdamW and is not visible here.
 
@@ -55,13 +55,15 @@ optim: adamw_torch  # adamw_torch / adamw_torch_fused both auto-enable AdamWBF16
 
 `bf16_optimizer` (a `DistributedArguments` field, so every training script parses it) overrides that
 resolution: `true` forces AdamWBF16 on where the auto path would decline (a non-AdamW `optim`, replicated
-DDP), `false` forces full fp32 master weights.
+DDP), `false` forces the stock AdamW over the parameters as loaded. Under `bf16: true` those are bf16, so
+`false` keeps bf16 master weights and moments with round-to-nearest updates (the stall above), not fp32
+ones; fp32 masters come from `fp32_non_ep_params` (dense params) or `bf16: false`.
 
 `false` is rejected only where the run mixes plain-tensor experts with FSDP2 DTensors: `ep_group_size` (`ep_size × expert_tp_size`) above 1, or `ep_group_size == 1` with `fsdp_shard_ep1_experts: false`. The raise lands when the optimizer is built, not at config time. Dense runs and MoE at `ep_size == expert_tp_size == 1` with the default `fsdp_shard_ep1_experts: true` are allowed.
 
 Combining `bf16_optimizer: true` with `optim: muon` or `optim: flash_adamw` **raises**: both select an optimizer and the bf16 path would silently win, so pick one.
 
-Direct use: `AdamWBF16(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8)`, with the standard HF decay / no-decay param groups. Pass `use_triton=False` for the eager PyTorch fallback (functionally equivalent, slower — multiple memory passes instead of the one fused kernel; it also engages automatically without CUDA). The eager path seeds its SR noise from the same rank-synchronized `_SR_RNG`, so replica bit-identity holds there too.
+Direct use: `AdamWBF16(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8)`, with the standard HF decay / no-decay param groups. Pass `use_triton=False` for the eager PyTorch fallback (functionally equivalent, slower — multiple memory passes instead of the one fused kernel; it also engages automatically without CUDA). The eager path seeds its SR noise from the same `sr_seed_pair`, so replica bit-identity and exact resume hold there too.
 
 ## Master-weight and grad-reduce options
 
@@ -76,9 +78,9 @@ AdamWBF16 auto-detects dtype per param: bf16 params take the fused Triton SR pat
 | **full bf16** (AdamWBF16, default) | 17,875 | 91.4 GB | 6 B/param; production path |
 | `fp32_non_ep_params` | 17,409 | 92.7 GB | non-EP params fp32, experts bf16; +1 GB only (experts dominate, stay bf16) |
 | `+ fp32_grad_reduce` | 16,117 | 92.7 GB | bf16 master, fp32 grad reduction (~−9%: 2× bandwidth on the grad all-reduce) |
-| **full fp32** (`bf16_optimizer=False`) | — | — | **rejected at `ep_group_size > 1`, and at `ep_group_size == 1` with `fsdp_shard_ep1_experts: false`** — fused AdamW cannot mix the plain-tensor expert FFN (EP rank-local experts, or the grouped-GEMM `gate_proj_gmm`/`up_proj_gmm` split at ep1) with FSDP2 DTensors (`aten._fused_adamw_ got mixed torch.Tensor and DTensor`); raised when the optimizer is built (still before the first step) |
+| **stock AdamW** (`bf16_optimizer=False`) | — | — | **rejected at `ep_group_size > 1`, and at `ep_group_size == 1` with `fsdp_shard_ep1_experts: false`** — fused AdamW cannot mix the plain-tensor expert FFN (EP rank-local experts, or the grouped-GEMM `gate_proj_gmm`/`up_proj_gmm` split at ep1) with FSDP2 DTensors (`aten._fused_adamw_ got mixed torch.Tensor and DTensor`); raised when the optimizer is built (still before the first step) |
 
-Full fp32 master (`bf16_optimizer=False`) is supported on dense models and on `ep_group_size == 1` MoE with the default FSDP-sharded experts. The fp32 deltas are small for gpt-oss because its non-expert params are a minor fraction; high-vocab or attention-heavy models cost more.
+`bf16_optimizer=False` builds on dense models and on `ep_group_size == 1` MoE with the default FSDP-sharded experts. The `fp32_non_ep_params` delta is small for gpt-oss because its non-expert params are a minor fraction; high-vocab or attention-heavy models cost more.
 
 `fp32_grad_reduce: true` upcasts gradients to fp32 for every cross-rank reduction the mixin owns (FSDP2 `reduce_dtype=fp32` for dense params, the EP router/expert grad-sync hooks, the TP replicated-grad sync, the QLoRA adapter AllReduce), then stores the averaged result bf16. It keeps bf16 master weights (6 B/param) — unlike `fp32_non_ep_params` it changes only the reduction, not storage.
 
@@ -98,15 +100,15 @@ Default `false`. `fp32_non_ep_params` implies it only for the FSDP2 reduce dtype
 
 Every distributed trainer supports `bf16_optimizer`; resolution lives in `DistributedTrainerMixin._configure_mixed_precision`, which all of them run. It auto-enables under FSDP, EP, TP, CP and their combinations (rank-local experts and per-rank DTensor shards alike).
 
-The one exception is accelerate-managed replicated DDP, where the auto-enable is skipped as a conservative default outside the validated FSDP/EP/TP/HSDP matrix, not a correctness limit. SR is replica-safe (the rank-synchronized RNG rounds shared params identically), so `bf16_optimizer: true` opts in.
+The one exception is accelerate-managed replicated DDP, where the auto-enable is skipped as a conservative default outside the validated FSDP/EP/TP/HSDP matrix, not a correctness limit. SR is replica-safe (the step-and-position seed rounds shared params identically), so `bf16_optimizer: true` opts in.
 
 Checkpoints use standard PyTorch `state_dict()` / `load_state_dict()`, round-tripping all state in bf16.
 
 ## Tests
 
 ```bash
-# Unit tests (single GPU, no torchrun)
-CUDA_VISIBLE_DEVICES=0 python tests/gpu/optimizers/test_adamw_bf16.py
+# Unit tests (single GPU)
+torchrun --nproc_per_node=1 tests/gpu/optimizers/test_adamw_bf16.py
 
 # EP end-to-end + SR correctness under EP=8 (8 GPUs)
 torchrun --nproc_per_node=8 \
@@ -116,7 +118,7 @@ torchrun --nproc_per_node=8 \
 CUDA_VISIBLE_DEVICES=0 python tests/gpu/optimizers/bench_adamw_bf16.py
 ```
 
-`test_adamw_bf16.py` covers the single-GPU claims: SR statistics (weight and `exp_avg_sq`, both paths), mixed dtypes, decay groups, state-dict round-trip, and that every shipped optimizer advances `param._version` across a step (the low-precision weight cache keys on it).
+`test_adamw_bf16.py` covers the single-GPU claims: SR statistics (weight and `exp_avg_sq`, both paths), mixed dtypes, decay groups, state-dict round-trip, a restored AdamWBF16 and Muon rounding bit-identically to the uninterrupted run, and that every shipped optimizer advances `param._version` across a step (the low-precision weight cache keys on it).
 
 `test_bf16_optimizer_ep.py` runs full + LoRA training under EP=8 and asserts the two distributed SR claims: `exp_avg_sq` on a local expert shard tracks an fp32 reference (de-bias), and the SR-rounded weight is bit-identical across the EP replicate group.
 

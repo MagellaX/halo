@@ -16,7 +16,7 @@ import os
 import re
 import shutil
 from collections.abc import Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -37,7 +37,8 @@ from src.models.structure import fp32_pinned_param_names, norm_param_keys, strip
 
 logger = logging.getLogger(__name__)
 
-# Distributed checkpoints (EP, TP) are saved bf16 even when training uses fp32 master weights.
+# Exports are saved bf16 even when training uses fp32 master weights; training checkpoints keep the
+# live dtype (:func:`save_dtype_caster`).
 _SAVE_DTYPE = torch.bfloat16
 
 # Per-file cap for gathered safetensors saves, shared by every save path and the arg default.
@@ -75,6 +76,9 @@ SCHEDULER_STATE_FILE = "scheduler.pt"
 # HF Trainer's replicated optimizer state, which the sharded modes deliberately replace.
 OPTIMIZER_STATE_FILES = ("optimizer.pt", "optimizer.bin")
 ROUTER_BALANCING_BIASES_FILE = "router_balancing_biases.pt"
+# The DPO/KTO ``precompute_ref_log_probs`` columns, per dataset split, with the row count and token
+# digest a resume verifies them against.
+REFERENCE_LOGPS_FILE = "reference_logps.pt"
 
 # PEFT adapter artifact filenames. ADAPTER_WEIGHT_NAMES is in load-preference order; PeftAdapterSaver
 # falls back to .bin, so detection must accept both.
@@ -86,19 +90,33 @@ ADAPTER_WEIGHT_NAMES = (ADAPTER_SAFETENSORS_FILE, ADAPTER_BIN_FILE)
 # sink policy). A sidecar rather than adapter_config.json, so stock PEFT loads the adapter unchanged.
 TRAINING_PROVENANCE_FILE = "training_provenance.json"
 PROVENANCE_GPT_OSS_SINKS = "gpt_oss_attention_sinks"
+# A merged checkpoint's resume state, beside the merged weights that serve: a
+# ``merge_expert_lora_on_save`` run's unmerged adapter, written as the non-merged save writes it, or
+# an embedding run's unfolded injected-LoRA tensors. A subdirectory, because an
+# ``adapter_config.json`` at the root makes ``from_pretrained`` load that adapter on top of the
+# merged weights, which already hold its delta. The root marker follows once the adapter is complete
+# and classifies the checkpoint as resume-from-base-plus-adapter: its presence is the verdict; the
+# body only names the directory for whoever reads the checkpoint.
+RESUME_ADAPTER_DIR = "resume_adapter"
+RESUME_ADAPTER_MARKER_FILE = "resume_adapter.json"
+# Resume state like the sidecars below, but not weight-suffixed: the aux copy carries them by
+# default and drops them by name where ``include_resume_sidecars`` is off.
+_RESUME_ADAPTER_ENTRIES = (RESUME_ADAPTER_DIR, RESUME_ADAPTER_MARKER_FILE)
 
 # Never carried over: a stray pytorch_model.bin or optimizer*.pt would shadow the fresh safetensors.
 _WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt")
 # Foreign-framework exports, never weights this toolkit reads. The aux copy and the hub-download
 # ignore list share this tuple so they cannot disagree.
 _FOREIGN_EXPORT_SUFFIXES = (".pth", ".gguf", ".h5", ".msgpack", ".onnx", ".onnx_data", ".tflite", ".ot", ".mlmodel")
-# Exempt from that skip: dropping these restarts the LR schedule or zeroes the router biases.
-_RESUME_SIDECAR_FILES = (SCHEDULER_STATE_FILE, ROUTER_BALANCING_BIASES_FILE)
+# Exempt from that skip: dropping these restarts the LR schedule, zeroes the router biases, or leaves
+# a precompute resume with no untrained reference to restore.
+_RESUME_SIDECAR_FILES = (SCHEDULER_STATE_FILE, ROUTER_BALANCING_BIASES_FILE, REFERENCE_LOGPS_FILE)
 # Same exemption by prefix: losing ``rng_state_<rank>.pth`` re-draws every shuffle and dropout mask.
 _RESUME_SIDECAR_PREFIXES = ("rng_state",)
-# Vendor dumps of the same weights in a raw format: hundreds of GB the aux copy must not duplicate.
-# Exact names rather than prefixes, since ``original_adapter_config/`` is aux data the copy must keep.
-_WEIGHT_DUMP_DIRS = ("original", "consolidated")
+# Vendor dumps of the same weights in a raw format (gpt-oss ships ``original/`` and ``metal/``):
+# hundreds of GB the aux copy must not duplicate. Exact names rather than prefixes, since
+# ``original_adapter_config/`` is aux data the copy must keep.
+_WEIGHT_DUMP_DIRS = ("original", "consolidated", "metal")
 # Hub-download counterpart of copy_checkpoint_aux_files' skip: fetch an aux source minus its weights.
 WEIGHT_FILE_IGNORE_PATTERNS = tuple(
     f"*{suffix}" for suffix in (*_WEIGHT_FILE_SUFFIXES, *_FOREIGN_EXPORT_SUFFIXES)
@@ -152,7 +170,11 @@ def cast_state_dict_to_save_dtype(state: dict[str, torch.Tensor]) -> dict[str, t
     return {k: cast_to_save_dtype(v) for k, v in state.items()}
 
 
-def save_dtype_caster(model: torch.nn.Module):
+def _as_live(_name: str, tensor: torch.Tensor) -> torch.Tensor:
+    return tensor
+
+
+def save_dtype_caster(model: torch.nn.Module, *, keep_live_dtype: bool = False):
     """``cast(name, tensor)`` for checkpoint saves that hold the live model.
 
     Floating tensors go to the save dtype except three tree-derived keep-sets that hold their trained
@@ -160,9 +182,16 @@ def save_dtype_caster(model: torch.nn.Module):
     family's fp32 pins. That way a direct EP/TP save of an fp32-master run matches its merged-shards
     save, and the export quantizes neither the balancing state nor a family's declared fp32 modules.
 
+    ``keep_live_dtype`` (a training checkpoint) casts nothing: every tensor is written at the dtype the
+    gather produced, which is the live one, so a resume reads fp32 masters (``fp32_router``,
+    ``fp32_experts``, ``fp32_non_ep_params``) back unrounded. Decided on the tensor, not its name, since
+    a gathered expert's hub key need not name any live parameter.
+
     Keys also match with their PEFT adapter segment stripped: the EP gather feeds this pre-remap
     keys, where a ``modules_to_save`` router spells its bias ``router.modules_to_save.default.bias``.
     """
+    if keep_live_dtype:
+        return _as_live
     keep = norm_param_keys(model) | balancing_param_keys(model) | fp32_pinned_param_names(model)
 
     def cast(name: str, t: torch.Tensor) -> torch.Tensor:
@@ -242,14 +271,15 @@ def revert_load_conversions(model: torch.nn.Module, state_dict: dict) -> dict:
         model._weight_conversions = load_conversions
 
 
-def normalize_gathered_state_dict(model: torch.nn.Module, state_dict: dict) -> dict:
+def normalize_gathered_state_dict(model: torch.nn.Module, state_dict: dict, *, keep_live_dtype: bool = False) -> dict:
     """Bring a gathered state dict to its on-disk form: save-dtype cast, then hub expert layout.
 
     The order is load-bearing: the caster's keep-set is derived from the module tree, so it uses the
     live key spelling and must run before the revert respells the expert keys. Shared by the FSDP2/CP
     and TP gathered writers, whose artifacts must be byte-identical for the same model.
+    ``keep_live_dtype`` is :func:`save_dtype_caster`'s.
     """
-    cast = save_dtype_caster(model)
+    cast = save_dtype_caster(model, keep_live_dtype=keep_live_dtype)
     return revert_load_conversions(model, {key: cast(key, tensor) for key, tensor in state_dict.items()})
 
 
@@ -415,9 +445,10 @@ def copy_checkpoint_aux_files(
     reads the card, and most callers run this copy after their weight pass.
 
     Skips every top-level weight file and safetensors index, which the caller writes fresh, but
-    preserves the resume sidecars (``scheduler.pt``, ``router_balancing_biases.pt``, ``rng_state_*``)
-    a resume-from-merged run restores; ``include_resume_sidecars=False`` drops them, for an artifact
-    that describes no single run (an N-way merge).
+    preserves the resume sidecars (``scheduler.pt``, ``router_balancing_biases.pt``,
+    ``reference_logps.pt``, ``rng_state_*``) a resume-from-merged run restores;
+    ``include_resume_sidecars=False`` drops them, for an artifact that describes no single run (an
+    N-way merge).
 
     Subdirectories are copied whole, weight files included: a SentenceTransformer module directory
     carries weights no caller rewrites, and filtering them out leaves ``modules.json`` pointing at
@@ -427,6 +458,9 @@ def copy_checkpoint_aux_files(
 
     ``output_dir`` nested inside ``input_dir`` raises: the walk would copy the destination into
     itself until the disk fills.
+
+    A merged checkpoint's resume adapter and its marker are resume state too: carried by default,
+    dropped with the sidecars.
     """
     input_root = os.path.realpath(input_dir)
     if os.path.commonpath([input_root, os.path.realpath(output_dir)]) == input_root:
@@ -436,6 +470,8 @@ def copy_checkpoint_aux_files(
             f"artifact to a directory outside the source checkpoint."
         )
     for name in os.listdir(input_dir):
+        if name in _RESUME_ADAPTER_ENTRIES and not include_resume_sidecars:
+            continue
         src = os.path.join(input_dir, name)
         if os.path.isdir(src):
             if name.startswith((".", f"{PREFIX_CHECKPOINT_DIR}-")) or name in _WEIGHT_DUMP_DIRS:
@@ -566,6 +602,79 @@ def has_whole_model_weight_file(checkpoint_dir: str, *, safetensors_only: bool =
     """
     names = (SAFETENSORS_INDEX_FILE, SAFETENSORS_WEIGHTS_FILE) if safetensors_only else WHOLE_MODEL_WEIGHT_FILES
     return any(os.path.isfile(os.path.join(checkpoint_dir, name)) for name in names)
+
+
+def adapter_weight_paths(adapter_dir: str) -> tuple[str, ...]:
+    """The adapter weight files a directory may carry, in PEFT's own load-preference order.
+
+    Taken from the :data:`ADAPTER_WEIGHT_NAMES` tuple that declares it: a reader that misses the
+    ``.bin`` fallback reads a saved adapter as absent.
+    """
+    return tuple(os.path.join(adapter_dir, name) for name in ADAPTER_WEIGHT_NAMES)
+
+
+def has_adapter_weight_file(directory: str) -> bool:
+    """Whether a directory holds a PEFT adapter weight file (:func:`adapter_weight_paths`); stat-only,
+    like :func:`has_whole_model_weight_file`."""
+    return any(os.path.isfile(path) for path in adapter_weight_paths(directory))
+
+
+def write_resume_adapter_marker(checkpoint_dir: str) -> None:
+    """Mark ``checkpoint_dir`` as resuming from its :data:`RESUME_ADAPTER_DIR`, not its weights.
+
+    The caller writes it only once that directory is complete, so a marked checkpoint carries its
+    adapter.
+    """
+    with open(os.path.join(checkpoint_dir, RESUME_ADAPTER_MARKER_FILE), "w") as fh:
+        json.dump({"adapter_dir": RESUME_ADAPTER_DIR}, fh, indent=2)
+
+
+def remove_resume_adapter_marker(checkpoint_dir: str) -> None:
+    """Unmark ``checkpoint_dir``, so it no longer resumes from its adapter; a no-op when unmarked."""
+    with suppress(FileNotFoundError):
+        os.remove(os.path.join(checkpoint_dir, RESUME_ADAPTER_MARKER_FILE))
+
+
+def resume_adapter_dir(checkpoint_dir: str) -> str | None:
+    """The adapter directory a marked checkpoint resumes from, or ``None`` for any other checkpoint.
+
+    Stat-only, like :func:`has_whole_model_weight_file`, for the same rank-0-then-broadcast callers.
+    """
+    if not os.path.isfile(os.path.join(checkpoint_dir, RESUME_ADAPTER_MARKER_FILE)):
+        return None
+    return os.path.join(checkpoint_dir, RESUME_ADAPTER_DIR)
+
+
+def missing_resume_adapter_reason(checkpoint_dir: str) -> str:
+    """The refusal for a marked checkpoint whose :data:`RESUME_ADAPTER_DIR` holds no adapter file."""
+    return (
+        f"{checkpoint_dir} is marked to resume from its adapter ({RESUME_ADAPTER_MARKER_FILE}), but "
+        f"{os.path.join(checkpoint_dir, RESUME_ADAPTER_DIR)} holds no adapter file, so the adapters would "
+        f"resume from initialization. Resume from a complete checkpoint."
+    )
+
+
+def resume_adapter_on_own_weights_reason(checkpoint_dir: str) -> str:
+    """The refusal for resuming a marked checkpoint onto a model built from its own merged weights."""
+    return (
+        f"{checkpoint_dir} holds merged weights, which already carry the adapter delta, and resume "
+        f"restores the unmerged adapters from {os.path.join(checkpoint_dir, RESUME_ADAPTER_DIR)} onto the "
+        f"base model. This model was loaded from the checkpoint itself, so the delta would apply twice. "
+        f"Load the model from the base the run started from (the training scripts keep "
+        f"model_name_or_path there for this checkpoint)."
+    )
+
+
+def unmarked_merged_checkpoint_reason(checkpoint_dir: str) -> str:
+    """The refusal for an adapter run resuming merged weights that carry no resume adapter."""
+    return (
+        f"{checkpoint_dir} holds merged weights without its resume adapter (no {RESUME_ADAPTER_MARKER_FILE}: "
+        f"a torn save, or one written without it), and this run trains adapters. Resuming would restart "
+        f"them from initialization under their restored optimizer state, on weights that may already "
+        f"hold their trained delta. Resume from a checkpoint that carries its resume adapter, or start a "
+        f"new run from its merged weights (model_name_or_path: {checkpoint_dir}, without "
+        f"resume_from_checkpoint)."
+    )
 
 
 def load_full_state_dict(checkpoint_dir: str, device: str = "cpu") -> dict[str, torch.Tensor] | None:

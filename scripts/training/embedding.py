@@ -11,7 +11,7 @@ CP is not supported (pooling reads the complete sequence); use EP and/or TP.
 
 Usage:
     torchrun --nproc_per_node=8 scripts/training/embedding.py \\
-        examples/embedding/qwen3/embedding-qwen3-4b-nq.yaml --expert_parallel_size=8
+        examples/embedding/gptoss/embedding-gptoss-20b-gooaq-ep.yaml
 """
 
 from accelerate.logging import get_logger
@@ -29,9 +29,12 @@ from src.data.sources.loading import reject_image_columns
 from src.distributed.filesystem import fs_aware_main_first
 from src.distributed.loading.peft_setup import build_peft_config
 from src.distributed.runtime import barrier, is_global_main_process
-from src.models.loading.dtype import resolve_training_dtype
+from src.models.loading.dtype import cast_parameters_to_run_dtype, resolve_training_dtype
+from src.models.loading.model_preparation import finalize_run_model
 from src.models.loading.tokenizer_setup import resolve_length_to_context
-from src.models.patches.gpt_oss_sinks import SinksPolicy, apply_sinks_policy
+from src.models.patches.buffer_fixes import finalize_loaded_model
+from src.models.patches.gpt_oss_sinks import SinksPolicy
+from src.models.structure import tuner_adapter_param_ids
 from src.trainers.embedding.sentence_transformers_compat import PreloadedTransformer
 from src.trainers.embedding.trainer import EmbeddingTrainer
 from src.training.environment import run_training
@@ -117,19 +120,22 @@ def build_sentence_transformer(
                 trust_remote_code=model_config.trust_remote_code,
                 model_kwargs=model_kwargs,
             )
-        # ST loads the backbone itself, so the parallel loader's sinks policy is applied here too: a
-        # GptOss backbone would otherwise keep live sinks under an attention backend that drops them.
-        backbone = getattr(st_model[0], "auto_model", None)
-        if backbone is not None:
-            apply_sinks_policy(
-                backbone,
-                backbone.config,
-                policy=SinksPolicy.from_flags(reset_sinks=dist_args.reset_sinks, train_sinks=dist_args.train_sinks),
-                attn_implementation=model_kwargs.get("attn_implementation"),
-            )
+        # Refuses a pipeline without a transformer backbone before anything reads it.
+        resolve_embedding_max_length(embedding_config, st_model[0])
+        # ST loads the backbone itself, so the post-load steps of the parallel loader run here too: the
+        # run-dtype cast, the buffer repair, and the shared finalization (a GptOss backbone would
+        # otherwise keep live sinks under an attention backend that drops them).
+        backbone = st_model[0].auto_model
+        cast_parameters_to_run_dtype(backbone, model_kwargs["dtype"], keep_fp32=parallelism_config.fp32_non_ep_params)
+        finalize_loaded_model(backbone)
+        finalize_run_model(
+            backbone,
+            backbone.config,
+            sinks_policy=SinksPolicy.from_flags(reset_sinks=dist_args.reset_sinks, train_sinks=dist_args.train_sinks),
+            attn_implementation=model_kwargs.get("attn_implementation"),
+        )
         # The checkpoint's modules.json decides pooling/normalization/length here while the EP/TP branch
         # builds them from the config; align them or those three knobs are inert on the default path.
-        resolve_embedding_max_length(embedding_config, st_model[0])
         align_st_pipeline_to_config(st_model, embedding_config)
     # sentence-transformers writes its card from model_card_data, never from the backbone's model_tags.
     st_model.model_card_data.add_tags(list(HUB_TAGS))
@@ -195,6 +201,45 @@ def align_st_pipeline_to_config(st_model: SentenceTransformer, embedding_config:
         )
 
 
+def inject_lora(model: SentenceTransformer, model_config: ModelConfig, dist_args: DistributedArguments) -> None:
+    """Inject the run's LoRA into ``model``'s transformer backbone in place and train the adapters
+    alone; no-op without PEFT.
+
+    The backbone only: checkpoints fold and resume its adapters, and the trainer refuses any outside
+    it. ``inject_adapter_in_model``, not ``SentenceTransformer.add_adapter``: that goes through
+    transformers' adapter API, which requires peft >= 0.19.1 while the image pins 0.18.1. EP/TP are
+    rejected by the trainer's own gates, which see the injected adapters structurally.
+    """
+    backbone = model[0].auto_model
+    peft_config = build_peft_config(backbone, model_config)
+    if peft_config is None:
+        return
+    # modules_to_save is unsupported here: the trainable copies are created, the freeze below
+    # re-freezes them, and the wrapper renames the base tensor, so the saved ST module lacks the
+    # plain <mod>.weight.
+    if model_config.lora_modules_to_save:
+        raise ValueError(
+            f"lora_modules_to_save={list(model_config.lora_modules_to_save)} is not supported for "
+            "embedding training: the SentenceTransformer path injects adapters in place, which "
+            "leaves the modules_to_save copies frozen and rewrites the base module's keys so the "
+            "saved model no longer reloads. Train those modules with a full fine-tune instead."
+        )
+    # The freeze below re-freezes everything that is not an adapter — trainable sinks included.
+    if dist_args.train_sinks:
+        raise ValueError(
+            "train_sinks: true needs full fine-tuning: embedding LoRA freezes every non-adapter "
+            "parameter after injection, so the sinks would train nowhere. Keep the sinks live and "
+            "frozen instead (reset_sinks: false without train_sinks), or drop the adapters."
+        )
+    inject_adapter_in_model(peft_config, backbone)
+    adapters = tuner_adapter_param_ids(backbone)
+    for param in model.parameters():
+        param.requires_grad = id(param) in adapters
+    if is_global_main_process():
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Applied LoRA adapters (r={model_config.lora_r}); trainable params: {trainable / 1e6:.2f}M")
+
+
 def main():
     parser = H4ArgumentParser((EmbeddingScriptArguments, EmbeddingConfig, ModelConfig, DistributedArguments))
     args, embedding_config, model_config, dist_args = parser.parse()
@@ -229,8 +274,7 @@ def main():
         model_config,
         dist_args,
         script_prefix="embedding",
-        supports_cp=False,
-        supports_pp=False,
+        trainer_cls=EmbeddingTrainer,
         split_expert_lora=False,
     )
     parallelism_config = runtime.parallelism_config
@@ -238,7 +282,7 @@ def main():
     ds, dataset_presharded = load_script_datasets(args, parallelism_config, conversation_field=None)
     reject_image_columns(ds, "Embedding training")
     train_dataset = ds["train"]
-    eval_dataset = ds.get("test") or ds.get("validation")
+    eval_dataset = ds.get("test")
 
     if is_global_main_process():
         logger.info(f"Train dataset: {len(train_dataset)} examples")
@@ -252,35 +296,7 @@ def main():
         logger.info(f"Model: {model}")
         logger.info(f"Embedding dimension: {model.get_sentence_embedding_dimension()}")
 
-    # Inject LoRA with peft's inject_adapter_in_model, not SentenceTransformer.add_adapter (ST 5.5
-    # gates that on peft >= 0.18.2 while the image pins 0.18.1). It does not freeze, so freeze every
-    # non-adapter param below.
-    peft_config = build_peft_config(model, model_config)
-    if peft_config is not None:
-        # modules_to_save is unsupported here: the trainable copies are created, the freeze below
-        # re-freezes them, and the wrapper renames the base tensor, so the saved ST module lacks the
-        # plain <mod>.weight.
-        if model_config.lora_modules_to_save:
-            raise ValueError(
-                f"lora_modules_to_save={list(model_config.lora_modules_to_save)} is not supported for "
-                "embedding training: the SentenceTransformer path injects adapters in place, which "
-                "leaves the modules_to_save copies frozen and rewrites the base module's keys so the "
-                "saved model no longer reloads. Train those modules with a full fine-tune instead."
-            )
-        # The freeze below re-freezes everything that is not an adapter — trainable sinks included.
-        if dist_args.train_sinks:
-            raise ValueError(
-                "train_sinks: true needs full fine-tuning: embedding LoRA freezes every non-adapter "
-                "parameter after injection, so the sinks would train nowhere. Keep the sinks live and "
-                "frozen instead (reset_sinks: false without train_sinks), or drop the adapters."
-            )
-        # EP/TP are rejected by the trainer's own gates, which see the injected adapters structurally.
-        inject_adapter_in_model(peft_config, model)
-        for name, param in model.named_parameters():
-            param.requires_grad = "lora_" in name
-        if is_global_main_process():
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            logger.info(f"Applied LoRA adapters (r={model_config.lora_r}); trainable params: {trainable / 1e6:.2f}M")
+    inject_lora(model, model_config, dist_args)
 
     apply_distributed_trainer_config(embedding_config, parallelism_config)
 

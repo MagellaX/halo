@@ -10,7 +10,6 @@ routed weights alone changes every weight.
 """
 
 import json
-import sys
 
 import pytest
 import torch
@@ -24,6 +23,7 @@ from src.distributed.expert_parallel.layers.inkling import EPInklingMoELayer
 from src.distributed.expert_parallel.lazy_loader import lazy_loader_supports_checkpoint
 from src.distributed.expert_parallel.patching import MOE_LAYER_MAP
 from src.distributed.pipeline_parallel.split import PP_SPEC_MAP
+from src.models.moe_balancing import ROUTER_EXPERT_COUNT_FIELDS, get_first_router_field
 
 SEED = 1234
 N_ROUTED = 8
@@ -121,8 +121,6 @@ def _joint_normalisation(router, router_logits: torch.Tensor, indices: torch.Ten
 def test_expert_count_resolves_from_config():
     """Config-side consumers (loader dispatch, EP divisibility validation, MoE metrics) probe
     `num_local_experts`, which InklingTextConfig must alias to `n_routed_experts`."""
-    from src.models.moe_balancing import ROUTER_EXPERT_COUNT_FIELDS, get_first_router_field
-
     config = InklingTextConfig(n_routed_experts=N_ROUTED, n_shared_experts=N_SHARED)
     assert get_first_router_field(config, ROUTER_EXPERT_COUNT_FIELDS) == N_ROUTED
 
@@ -181,4 +179,4 @@ def test_balancing_bias_steers_selection_only():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

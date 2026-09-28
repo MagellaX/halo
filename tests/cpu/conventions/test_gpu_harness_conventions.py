@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 """Conventions a GPU test script must honour, pinned so a new script cannot quietly break them.
 
-Both are about scratch: a GPU test allocates its dirs through the launcher and hands them back.
+Every manifest script runs under ``gpu_test_main`` unless its lifecycle is one the harness cannot
+express, named in ``_OWN_LIFECYCLE`` with the reason.
+
+The rest are about scratch: a GPU test allocates its dirs through the launcher and hands them back.
 
 ``tests.common.distributed.setup_cache_dirs`` hands back two ``tempfile.mkdtemp`` dirs — an
 output dir and an HF datasets cache. Nothing reclaims them on its own, so a test that allocates
@@ -9,7 +12,7 @@ and never frees leaks two directories per rank per run; across a nightly suite t
 of stale trees on the scratch volume, and the HF cache half is not small.
 
 Four spellings discharge the obligation, and the scan accepts any of them: a ``cleanup_dirs``
-call, the ``gpu_test_main`` harness (whose ``finally`` calls ``cleanup_dirs`` for the body),
+call, a ``gpu_test_main`` call (the harness's ``finally`` calls ``cleanup_dirs`` for the body),
 ``ctx.on_teardown(...)``, or a ``finally:`` that ``shutil.rmtree``s. Anything else is a leak.
 
 AST, not grep: the check is whether the call is really made, so a mention inside a docstring,
@@ -30,7 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.common.utils import REPO_ROOT, imports_name
+from tests.common.utils import REPO_ROOT
+from tests.gpu.manifest import MANIFEST, script_path
 
 _GPU_ROOT = Path(REPO_ROOT) / "tests" / "gpu"
 
@@ -39,6 +43,16 @@ _RECLAIMERS = ("cleanup_dirs", "on_teardown")
 _HARNESS = "gpu_test_main"
 _RMTREE = "rmtree"
 _FORBIDDEN_PATH_PREFIX = "/mnt/"
+# Manifest scripts that keep their own lifecycle, each for a reason the harness cannot express.
+_OWN_LIFECYCLE = {
+    "kernels/test_deepgemm.py": "prints SKIP: when deep_gemm is absent; the harness has no skip channel",
+    "trainers/other/test_checkpoint_roundtrip_gptoss_20b.py": "tears the group down before a rank-0 verify",
+    "trainers/other/test_checkpoint_roundtrip_qwen3_8b.py": "its rank-0-only reload skips the closing barrier",
+}
+
+
+def _parse(path: Path) -> ast.AST:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
 def _called_names(tree: ast.AST) -> set[str]:
@@ -79,17 +93,23 @@ def _has_finally_rmtree(tree: ast.AST) -> bool:
     )
 
 
-def _reclaims_its_dirs(path: Path, tree: ast.AST) -> bool:
-    """Whether ``path`` discharges the cleanup obligation by any of the four accepted spellings."""
+def _calls_the_harness(tree: ast.AST) -> bool:
+    """Whether ``tree`` calls ``gpu_test_main``, by its imported name or through its module
+    (``harness.gpu_test_main(...)``). The entry is a decorator factory, so every use is a call."""
+    return _HARNESS in _called_names(tree)
+
+
+def _reclaims_its_dirs(tree: ast.AST) -> bool:
+    """Whether ``tree`` discharges the cleanup obligation by any of the four accepted spellings."""
     called = _called_names(tree)
-    return any(name in called for name in _RECLAIMERS) or imports_name(path, _HARNESS) or _has_finally_rmtree(tree)
+    return any(name in called for name in _RECLAIMERS) or _calls_the_harness(tree) or _has_finally_rmtree(tree)
 
 
 def _allocating_scripts() -> list[tuple[Path, ast.AST]]:
     """Every GPU test script that calls ``setup_cache_dirs``, parsed."""
     found = []
     for script in sorted(_GPU_ROOT.rglob("test_*.py")):
-        tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        tree = _parse(script)
         if _ALLOCATOR in _called_names(tree):
             found.append((script, tree))
     return found
@@ -100,7 +120,7 @@ def test_every_gpu_test_that_allocates_cache_dirs_also_reclaims_them():
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{_allocator_linenos(tree)[0]}"
         for path, tree in _allocating_scripts()
-        if not _reclaims_its_dirs(path, tree)
+        if not _reclaims_its_dirs(tree)
     ]
     assert not offenders, (
         "these GPU tests call setup_cache_dirs and never free the dirs — add cleanup_dirs(output_dir, "
@@ -121,9 +141,9 @@ def test_the_scan_is_not_vacuous(tmp_path):
 
     leaker = tmp_path / "test_leaker.py"
     leaker.write_text("def main():\n    out, cache = setup_cache_dirs('x', 0)\n", encoding="utf-8")
-    leaker_tree = ast.parse(leaker.read_text(encoding="utf-8"))
+    leaker_tree = _parse(leaker)
     assert _ALLOCATOR in _called_names(leaker_tree), f"the sweep no longer sees a {_ALLOCATOR!r} call"
-    assert not _reclaims_its_dirs(leaker, leaker_tree), "a script that never frees its dirs must be an offender"
+    assert not _reclaims_its_dirs(leaker_tree), "a script that never frees its dirs must be an offender"
 
     reclaimer = tmp_path / "test_reclaimer.py"
     reclaimer.write_text(
@@ -132,15 +152,67 @@ def test_the_scan_is_not_vacuous(tmp_path):
         "    try:\n        pass\n    finally:\n        cleanup_dirs(out, cache)\n",
         encoding="utf-8",
     )
-    reclaimer_tree = ast.parse(reclaimer.read_text(encoding="utf-8"))
-    assert _reclaims_its_dirs(reclaimer, reclaimer_tree), "a cleanup_dirs call must discharge the obligation"
+    reclaimer_tree = _parse(reclaimer)
+    assert _reclaims_its_dirs(reclaimer_tree), "a cleanup_dirs call must discharge the obligation"
+
+
+def _runs_under_the_harness(path: Path) -> bool:
+    """Whether the script calls ``gpu_test_main``, or re-launches another suite's entry that does."""
+    tree = _parse(path)
+    return _calls_the_harness(tree) or any(
+        isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("tests.gpu.")
+        and _calls_the_harness(_parse(REPO_ROOT / (node.module.replace(".", "/") + ".py")))
+        for node in ast.walk(tree)
+    )
+
+
+def test_every_manifest_script_runs_under_the_harness():
+    """A hand-rolled lifecycle hides a non-zero rank's error, blocks teardown until the NCCL watchdog
+    on a single-rank failure, and emits no result line, so the launcher cannot tell FAIL from ERROR."""
+    offenders = sorted(
+        rel for rel in MANIFEST if rel not in _OWN_LIFECYCLE and not _runs_under_the_harness(script_path(rel))
+    )
+    assert not offenders, (
+        "move these onto tests.common.harness.gpu_test_main (or, for a lifecycle the harness cannot "
+        "express, add an _OWN_LIFECYCLE entry naming why):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_a_module_qualified_harness_call_counts(tmp_path):
+    """``harness.gpu_test_main(...)`` is the same entry as the imported name, so neither pin may flag
+    it, while importing the harness module without calling the entry still runs no lifecycle."""
+    qualified = tmp_path / "test_qualified.py"
+    qualified.write_text(
+        "from tests.common import harness\n\n\n"
+        "@harness.gpu_test_main(min_world_size=2)\n"
+        "def run(ctx):\n    out, cache = setup_cache_dirs('x', 0)\n",
+        encoding="utf-8",
+    )
+    assert _runs_under_the_harness(qualified), "a module-qualified gpu_test_main call must count as the harness"
+    assert _reclaims_its_dirs(_parse(qualified)), "a module-qualified gpu_test_main call must reclaim the dirs"
+
+    uncalled = tmp_path / "test_uncalled.py"
+    uncalled.write_text(
+        "from tests.common import harness\n\n\ndef run():\n    out, cache = setup_cache_dirs('x', 0)\n",
+        encoding="utf-8",
+    )
+    assert not _runs_under_the_harness(uncalled), "an import alone must not count as running under the harness"
+    assert not _reclaims_its_dirs(_parse(uncalled)), "an import alone must not discharge the cleanup obligation"
+
+
+def test_own_lifecycle_exemptions_are_live():
+    """An exemption that outlives its reason blesses a script nothing checks."""
+    for rel in _OWN_LIFECYCLE:
+        assert rel in MANIFEST, f"stale exemption: {rel} is not a manifest script"
+        assert not _runs_under_the_harness(script_path(rel)), f"{rel} now runs under the harness — drop its exemption"
 
 
 def test_no_gpu_test_names_a_host_scratch_path():
     """Scratch comes from the launcher's ``TMPDIR``, checkpoint locations from a shared constant."""
     offenders = []
     for script in sorted(_GPU_ROOT.rglob("*.py")):
-        tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        tree = _parse(script)
         offenders += [
             f"{script.relative_to(REPO_ROOT)}:{node.lineno}: {node.value!r}"
             for node in ast.walk(tree)

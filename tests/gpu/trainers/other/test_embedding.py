@@ -2,9 +2,9 @@
 """
 Test suite for EmbeddingTrainer.
 
-Tests multiple loss types (MNRL, CoSENT) as well as import and capability
-checks. Uses sentence-transformers/paraphrase-MiniLM-L3-v2 for speed;
-production workloads use Qwen/Qwen3-Embedding-0.6B.
+Tests multiple loss types (MNRL, CoSENT) as well as capability checks.
+Uses sentence-transformers/paraphrase-MiniLM-L3-v2 for speed; production
+workloads use Qwen/Qwen3-Embedding-0.6B.
 
 Every leg runs collectives (``dist.barrier``, ``gather_saveable_tensors``, ``trainer.train``), so a
 failure must end the process rather than fall through to the next leg: a rank that swallowed its own
@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 from peft import LoraConfig, TaskType, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
 from sentence_transformers import SentenceTransformer
 
 from src.checkpoint.format import save_dtype_caster
@@ -37,7 +38,7 @@ from tests.common.peft_helpers import (
     snapshot_adapters,
     unwrap,
 )
-from tests.common.utils import cleanup_memory, log
+from tests.common.utils import cleanup_memory, log, step_losses
 
 MODEL_NAME = PARAPHRASE_MINILM
 NUM_TRAIN_STEPS = 10
@@ -91,6 +92,7 @@ def make_config(output_dir: str, **overrides) -> EmbeddingConfig:
         "save_strategy": "no",
         "eval_strategy": "no",
         "report_to": "none",
+        "logging_nan_inf_filter": False,
         "loss_type": "mnrl",
         "max_length": 128,
         "dataloader_drop_last": True,
@@ -103,8 +105,8 @@ def make_config(output_dir: str, **overrides) -> EmbeddingConfig:
 def lora_model() -> SentenceTransformer:
     """A SentenceTransformer with LoRA injected exactly the way the embedding script does it.
 
-    ``inject_adapter_in_model`` (not ``ST.add_adapter``, which needs peft>=0.18.2) adds the adapters
-    in place without globally freezing, so the freeze-by-name below is part of the wiring under test.
+    ``inject_adapter_in_model`` (not ``ST.add_adapter``, whose transformers adapter API needs
+    peft>=0.19.1) adds the adapters in place; the freeze-by-name below is part of the wiring under test.
     """
     model = SentenceTransformer(MODEL_NAME)
     inject_adapter_in_model(
@@ -114,16 +116,6 @@ def lora_model() -> SentenceTransformer:
     for name, param in model.named_parameters():
         param.requires_grad = "lora_" in name
     return model
-
-
-def check_basic_import() -> bool:
-    """Verify EmbeddingTrainer imports correctly and the re-export is the same class."""
-    log("Check: Basic Import")
-
-    from src.trainers.embedding.trainer import EmbeddingTrainer as ET
-
-    assert ET is EmbeddingTrainer, "EmbeddingTrainer re-exported from src.trainers should be identical"
-    return True
 
 
 def check_capability_flags() -> bool:
@@ -173,7 +165,7 @@ def check_loss_leg(ctx, loss_type: str, train_dataset: Dataset, eval_dataset: Da
     ctx.barrier()
     result = trainer.train()
 
-    losses = [e["loss"] for e in trainer.state.log_history if "loss" in e]
+    losses = step_losses(trainer)
     log(f"  Steps: {result.global_step}  Loss: {losses[0]:.6f} -> {losses[-1]:.6f}")
     assert len(losses) == NUM_TRAIN_STEPS, f"expected {NUM_TRAIN_STEPS} logged steps, got {len(losses)}"
     assert torch.isfinite(torch.tensor(losses)).all(), f"non-finite loss in {losses}"
@@ -303,7 +295,7 @@ def check_lora_save_roundtrip(ctx, shared_dir: str) -> bool:
 
     # collective gather — must run on ALL ranks
     backbone = trainer._get_unwrapped_model()
-    scaling = trainer._lora_scaling(backbone)
+    scaling = next(module.scaling["default"] for module in backbone.modules() if isinstance(module, LoraLayer))
     full = gather_saveable_tensors(backbone, retain=True)
     target = next(
         k[: -len(".base_layer.weight")]
@@ -363,7 +355,6 @@ def run(ctx):
 
     return {
         "checks": {
-            "basic_import": check_basic_import(),
             "capability_flags": check_capability_flags(),
             "training_pairs_mnrl": check_loss_leg(ctx, "mnrl", create_pairs_dataset(64), create_pairs_dataset(16)),
             "training_scored_pairs_cosent": check_loss_leg(

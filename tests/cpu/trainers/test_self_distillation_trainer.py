@@ -9,14 +9,22 @@ The loss equations themselves are covered by test_distillation_shared_losses.py.
 Run: python tests/cpu/trainers/test_self_distillation_trainer.py
 """
 
+import logging
+import types
+from unittest.mock import patch
+
 import pytest
 import torch
 
+import src.trainers.distillation.self_distillation as sd
+from src.args.self_distill_args import SelfDistillationArguments
+from src.data.collators.vlm import SelfDistillVLMDataCollator
+from src.trainers.distillation.losses import masked_token_mean
+from src.trainers.distillation.self_distillation import DistributedSelfDistillationTrainer
+from src.trainers.sft import DistributedSFTTrainer
+
 
 def test_trainer_mro_and_flags():
-    from src.trainers.distillation.self_distillation import DistributedSelfDistillationTrainer
-    from src.trainers.sft import DistributedSFTTrainer
-
     assert issubclass(DistributedSelfDistillationTrainer, DistributedSFTTrainer)
     # Privileged teacher uses a second, longer sequence => CP unsupported; EP/TP fine.
     assert DistributedSelfDistillationTrainer._supports_ep is True
@@ -25,8 +33,6 @@ def test_trainer_mro_and_flags():
 
 
 def test_args_defaults():
-    from src.args.self_distill_args import SelfDistillationArguments
-
     a = SelfDistillationArguments()
     assert a.sdpg_loss == "reverse_kl"
     assert a.sdpg_beta_base == 1.0
@@ -35,11 +41,7 @@ def test_args_defaults():
 
 
 def test_collator_inject_hint_string_and_list():
-    import types
-
-    from src.data.collators.vlm import SelfDistillVLMDataCollator
-
-    # _inject_hint needs only hint_template; the stub tokenizer just satisfies the base __init__,
+    # _teacher_history needs only hint_template; the stub tokenizer just satisfies the base __init__,
     # which resolves the eos set and the image-token ids once at construction.
     tokenizer = types.SimpleNamespace(eos_token_id=2, pad_token_id=0, get_vocab=dict)
     c = SelfDistillVLMDataCollator(None, tokenizer, hint_template="\n[Hint] {answer}\n")
@@ -49,20 +51,18 @@ def test_collator_inject_hint_string_and_list():
         {"role": "assistant", "content": "A1"},
         {"role": "user", "content": "Q2"},
     ]
-    out = c._inject_hint(hist, answer="B", solution=None)
+    out = c._teacher_history(hist, {"answer": "B"})
     assert out[0]["content"] == "Q1"
     assert out[2]["content"] == "Q2\n[Hint] B\n"
     assert hist[2]["content"] == "Q2"  # input row not mutated
 
     hist2 = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Q"}]}]
-    out2 = c._inject_hint(hist2, answer="7", solution=None)
+    out2 = c._teacher_history(hist2, {"answer": "7"})
     assert out2[0]["content"][-1] == {"type": "text", "text": "\n[Hint] 7\n"}
 
 
 def test_opd_gating_zero_weight_contributes_nothing():
     """SDPG gates OPD on positive advantage; a zero-weight sample must add 0 to the mean."""
-    from src.trainers.distillation.losses import masked_token_mean
-
     torch.manual_seed(0)
     per_token_vocab = torch.rand(2, 3, 5)  # [B, S, V]
     mask = torch.ones(2, 3)
@@ -77,12 +77,6 @@ def _vision_reuse_probe(model_type):
 
     Returns ``(activated, wrapper_installed)``.
     """
-    import logging
-    import types
-    from unittest.mock import patch
-
-    import src.trainers.distillation.self_distillation as sd
-    from src.trainers.distillation.self_distillation import DistributedSelfDistillationTrainer
 
     def original_get_image_features(*args, **kwargs):
         return "features"

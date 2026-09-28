@@ -4,6 +4,7 @@ from dataclasses import MISSING, fields
 from typing import TYPE_CHECKING
 
 from src.distributed.parallelism_config import ParallelismConfig
+from src.models.loading.tokenizer_setup import is_bounded_length
 
 if TYPE_CHECKING:
     from src.distributed.expert_parallel.config import ExpertLoraSpec
@@ -58,10 +59,8 @@ def forward_rows_per_example(trainer_cls) -> int:
 def parallelism_config_from_args(
     dist_args,
     *,
+    trainer_cls,
     training_config=None,
-    trainer_cls=None,
-    supports_cp: bool = True,
-    supports_pp: bool = True,
     allow_low_precision: bool = False,
     supports_init_from_scratch: bool = False,
     expert_lora: "ExpertLoraSpec | None" = None,
@@ -75,17 +74,14 @@ def parallelism_config_from_args(
             token budget (``rows × per_device_train_batch_size × max_length``) — what
             :meth:`ParallelismConfig.validate_against_model_config` judges against DeepEP's dispatch
             ceilings. ``None``, or a config declaring no ``max_length``, leaves that gate off.
-        trainer_cls: the trainer class this script builds, read for
-            :data:`FORWARD_ROWS_PER_EXAMPLE_ATTR`, the number of sequence rows one model call carries
-            per dataset example. The preference and Bradley-Terry reward trainers score chosen and
-            rejected in a single concatenated forward, so their MoE layers present twice the rows a
-            token budget computed from ``per_device_train_batch_size`` alone would predict. The
-            attribute is declared on the trainer class, not as a per-script constant.
-        supports_cp: ``False`` rejects a CLI ``context_parallel_size > 1`` and forces CP off (all
-            non-CP trainers; SFT leaves it ``True``).
-        supports_pp: ``False`` rejects a CLI ``pipeline_parallel_size > 1`` at config time. The
-            trainer's ``_supports_pp`` gate would reject it anyway, but only after the model (and
-            for distillation/GRPO scripts a second model or a vLLM probe) has already loaded.
+        trainer_cls: the trainer class this script builds. Its ``_supports_cp`` / ``_supports_pp``
+            gates reject a ``context_parallel_size`` / ``pipeline_parallel_size`` above 1 here, at
+            config time: the trainer's own check would reject it too, but only after the model (and
+            for distillation/GRPO scripts a second model or a vLLM probe) has already loaded. Also
+            read for :data:`FORWARD_ROWS_PER_EXAMPLE_ATTR`, the number of sequence rows one model
+            call carries per dataset example. The preference and Bradley-Terry reward trainers score
+            chosen and rejected in a single concatenated forward, so their MoE layers present twice
+            the rows a token budget computed from ``per_device_train_batch_size`` alone would predict.
         allow_low_precision: forward the ``lowp_*`` knobs (SFT only); elsewhere a non-``bf16``
             ``lowp_precision`` is rejected.
         expert_lora: peeled native EP expert-LoRA spec. Must be passed here, not assigned onto the
@@ -115,16 +111,16 @@ def parallelism_config_from_args(
             "this script would silently ignore it and train pretrained weights."
         )
 
-    if not supports_cp and dist_args.context_parallel_size > 1:
+    if not trainer_cls._supports_cp and dist_args.context_parallel_size > 1:
         raise ValueError(
-            "This trainer does not support Context Parallelism (CP). Use Expert Parallelism (EP) "
-            "and/or Tensor Parallelism (TP) instead, or remove --context_parallel_size."
+            f"{trainer_cls.__name__} does not support Context Parallelism (CP). Use Expert Parallelism "
+            "(EP) and/or Tensor Parallelism (TP) instead, or remove --context_parallel_size."
         )
 
-    if not supports_pp and dist_args.pipeline_parallel_size > 1:
+    if not trainer_cls._supports_pp and dist_args.pipeline_parallel_size > 1:
         raise ValueError(
-            "This trainer does not support Pipeline Parallelism (PP). Use Expert Parallelism (EP) "
-            "and/or Tensor Parallelism (TP) instead, or remove --pipeline_parallel_size."
+            f"{trainer_cls.__name__} does not support Pipeline Parallelism (PP). Use Expert Parallelism "
+            "(EP) and/or Tensor Parallelism (TP) instead, or remove --pipeline_parallel_size."
         )
 
     # The PP seams (config validation, rank math, stage/loss contracts) ship, but the schedule engine
@@ -137,14 +133,12 @@ def parallelism_config_from_args(
             "agent-docs/parallelism/pipeline-parallelism.md."
         )
 
-    effective_cp_size = dist_args.context_parallel_size if supports_cp else 1
-
     # Fields the two dataclasses spell identically forward themselves; only the renames, the
     # derivations and the SFT-gated lowp block below stay explicit.
     kwargs = {name: getattr(dist_args, name) for name in same_name_arg_forwards(dist_args)}
     kwargs.update(
         ep_size=dist_args.expert_parallel_size,
-        cp_size=effective_cp_size,
+        cp_size=dist_args.context_parallel_size,
         tp_size=dist_args.tensor_parallel_size,
         expert_tp_size=dist_args.expert_tensor_parallel_size,
         pp_size=dist_args.pipeline_parallel_size,
@@ -157,15 +151,32 @@ def parallelism_config_from_args(
         # The two factors stay separate because only one of them is knowable here: a config with no
         # max_length field at all (generation-shaped budgets) declares neither rows nor budget, while
         # ``max_length: null`` declares its rows and leaves the length to the gate's context-window
-        # resolution.
+        # resolution unless a bounded prompt + completion budget caps each row.
         ep_rows_per_device=(
             forward_rows_per_example(trainer_cls)
             * int(getattr(training_config, "per_device_train_batch_size", 0) or 0)
             if hasattr(training_config, "max_length")
             else 0
         ),
-        ep_declared_max_length=int(getattr(training_config, "max_length", 0) or 0),
+        ep_declared_max_length=declared_row_length(training_config),
     )
     if allow_low_precision:
         kwargs.update({name: getattr(dist_args, name) for name in _LOWP_KNOBS})
     return ParallelismConfig(**kwargs)
+
+
+def declared_row_length(training_config) -> int:
+    """The token cap a config puts on one training row, or 0 when it declares none.
+
+    ``max_length`` where set; otherwise a bounded prompt + completion budget, which the trainers that
+    carry both (offline GRPO) truncate each row to. 0 leaves the EP capacity gate to the model's
+    context window.
+    """
+    max_length = getattr(training_config, "max_length", None)
+    if is_bounded_length(max_length):
+        return int(max_length)
+    prompt = getattr(training_config, "max_prompt_length", None)
+    completion = getattr(training_config, "max_completion_length", None)
+    if is_bounded_length(prompt) and is_bounded_length(completion):
+        return int(prompt) + int(completion)
+    return 0

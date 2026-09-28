@@ -72,7 +72,7 @@ want to be large — keep it at the length you actually embed.
 ## Run
 
 ```bash
-# single GPU or FSDP2 data parallel
+# single GPU; add -n 8 for FSDP2 data parallel
 halo launch embedding examples/embedding/qwen3/embedding-qwen3-4b-nq.yaml
 
 # MoE backbone with expert parallelism pinned in the config
@@ -81,8 +81,15 @@ halo launch embedding examples/embedding/gptoss/embedding-gptoss-20b-gooaq-ep.ya
 
 Recipes for Qwen3-Embedding, Qwen3.5, GPT-OSS and Gemma 4 ship under `examples/embedding/`. Expert,
 tensor and expert-tensor parallelism all work; context parallelism does not, because pooling needs
-the whole sequence on one rank. LoRA (`use_peft: true`) is supported on the plain data-parallel path
-only and rejected under EP, ETP and TP.
+the whole sequence on one rank. Tensor and expert-tensor parallelism batch through a loader that
+cannot apply `no_duplicates`, so they refuse it: set `batch_sampler: batch_sampler` there (as
+`--batch_sampler=batch_sampler` on the command line). A pipeline with weights after the backbone
+that train or that FSDP2 would shard (a `Dense` head) runs on one GPU or under DDP
+(`accelerate launch`) only: FSDP2, TP and EP refuse it at startup. LoRA (`use_peft: true`) is
+supported on the plain data-parallel path only and rejected under EP, ETP and TP; its targets may
+include the input embedding (`embed_tokens`), and DoRA applies. Its saves fold the adapters into the
+weights, so the output loads as a plain `SentenceTransformer`; training checkpoints also keep the
+unfolded adapters, which `resume_from_checkpoint` restores onto the base.
 
 ## What this path does not take
 

@@ -19,14 +19,14 @@ engine loader, and only the served policy distinguishes them.
 
 ``peft`` puts the run on the adapter path (``"lora"`` attention PEFT, ``"expert_lora"`` native
 grouped expert adapters), where an adapter reaches the engine only through the fold the sync performs
-(``merge_adapter`` for attention, ``merge_lora=True`` in the expert gather).
+(the out-of-place PEFT fold for attention, ``merge_lora=True`` in the expert gather).
 
 ``resume`` covers the train-begin force sync. Phase 1 trains to ``RESUME_MAX_STEPS`` with a
 checkpoint at ``RESUME_SAVE_STEP``, and the perturbation round then moves the engine off that policy.
 Phase 2 is a fresh model and trainer resuming with one step left, so the train-begin push is the only
-thing that can reach the engine before the resumed rollout. Where the resumed policy lands is exact
-for a full fine-tune and a nearer-of-the-two verdict for an adapter row, whose two pushes merge into
-bases one bf16 merge round-trip apart.
+thing that can reach the engine before the resumed rollout. The resumed policy must land exactly on
+the checkpoint's: a full fine-tune's checkpoint restores the weights, an adapter row's restores its
+adapters bit-equal over a freshly loaded base, which phase 1's syncs left as loaded.
 """
 
 import math
@@ -43,12 +43,12 @@ from src.distributed.fsdp import reshard_fsdp2_modules
 from src.env import env_int, env_str
 from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer
 from src.training.environment import resolve_resume_weights_source
-from tests.common.distributed import ensure_model_downloaded
+from tests.common.checkpoint_io import RestorePointSnapshot
+from tests.common.distributed import ensure_model_downloaded, shared_output_dir
 from tests.common.models import QWEN3_30B_A3B
 from tests.common.on_policy_e2e import (
     RESUME_MAX_STEPS,
     RESUME_SAVE_STEP,
-    RestorePointSnapshot,
     adapter_file_agreement,
     expert_lora_under_etp_refusal,
     expert_round,
@@ -66,7 +66,7 @@ from tests.common.on_policy_e2e import (
     record_served_baseline,
     record_step_losses,
     served_policy_delta,
-    shared_output_dir,
+    served_policy_moved,
     sink_round,
 )
 from tests.common.peft_helpers import assert_only_adapters_trainable, snapshot_adapters, unwrap
@@ -124,6 +124,7 @@ def _grpo_config(*, output_dir: str, max_steps: int, group_port: int, save: bool
         # the consumed batches would re-run generation for steps already in the checkpoint.
         ignore_data_skip=True,
         report_to="none",
+        logging_nan_inf_filter=False,
         num_generations=2,
         max_completion_length=128,
         beta=0.0,
@@ -213,7 +214,7 @@ def run_env_grpo_e2e(
     if expert_tp_size > 1:
         refusal = expert_lora_under_etp_refusal(expert_tp_size)
         checks["expert_lora_under_expert_tp_refused"] = bool(refusal)
-        checks["expert_lora_etp_refusal_names_expert_tp"] = "expert_tp_size > 1" in refusal
+        checks["expert_lora_etp_refusal_names_expert_tp"] = "expert_tensor_parallel_size > 1" in refusal
         log(f"  expert-LoRA under expert_tp_size={expert_tp_size} refusal: {refusal or '<NOT RAISED>'}")
 
     # ── 1. the server is up, serving the checkpoint we are about to train, and reproducible ───
@@ -273,7 +274,7 @@ def run_env_grpo_e2e(
         checks["adapters_under_tp_refused"] = bool(refusal)
         # Matched by name rather than by exception type: every other construction-time refusal on
         # this path (weight sync, environment spec, batch shape) also raises ValueError.
-        checks["tp_refusal_names_tensor_parallelism"] = "Tensor Parallelism (tp_size > 1)" in refusal
+        checks["tp_refusal_names_tensor_parallelism"] = "Tensor Parallelism (tensor_parallel_size > 1)" in refusal
         log(f"  adapters under tp_size={tp_size} refusal: {refusal.splitlines()[0] if refusal else '<NOT RAISED>'}")
         return {"checks": ctx.broadcast_checks(checks), "metrics": metrics}
 
@@ -353,9 +354,9 @@ def run_env_grpo_e2e(
 
     if ctx.rank == 0:
         after = probe_top_logprobs(server_url, model_name)
-        checks["forced_sync_moved_the_served_policy"] = after != pre_perturb
-        if after == pre_perturb:
-            log(f"  IDENTICAL logprobs after a {what} perturbation: the weight sync did not land")
+        checks["forced_sync_moved_the_served_policy"] = served_policy_moved(after, pre_perturb)
+        if not checks["forced_sync_moved_the_served_policy"]:
+            log(f"  IDENTICAL or non-finite logprobs after a {what} perturbation: the weight sync did not land")
         log(f"  post-forced-sync: { {k: round(v, 4) for k, v in after.items()} }")
         # A failed update leaves the engine partially written, and both engines' docs say to discard
         # such a server rather than keep serving from it, so check that it still answers.
@@ -404,7 +405,7 @@ def run_env_grpo_e2e(
         # comparison below with nothing pushed. It is also the state a resume that skipped its push
         # would leave behind, bit for bit.
         moved_off = probe_top_logprobs(server_url, model_name)
-        checks["engine_moved_off_the_checkpoint_policy"] = moved_off != pre_perturb
+        checks["engine_moved_off_the_checkpoint_policy"] = served_policy_moved(moved_off, pre_perturb)
     ctx.barrier()
 
     # A fresh model and trainer, as a resumed job starts. The client is closed first: its group port
@@ -463,22 +464,10 @@ def run_env_grpo_e2e(
         after_resume = probe_top_logprobs(server_url, model_name)
         # A skipped push leaves the engine bit-identical to what phase 1 left there (the server is
         # idle and the probe is greedy), so this half is exact on every row.
-        checks["resume_left_the_stale_engine_state"] = after_resume != moved_off
+        checks["resume_left_the_stale_engine_state"] = served_policy_moved(after_resume, moved_off)
         to_checkpoint = served_policy_delta(after_resume, pre_perturb)
-        if peft is None:
-            # A full fine-tune's checkpoint restores the weights themselves: both pushes send the
-            # same tensors, so the two probes must agree exactly.
-            checks["resumed_rollouts_served_the_checkpoint_policy"] = after_resume == pre_perturb
-        else:
-            # An adapter run's two pushes merge into different bases: PEFT's
-            # merge_adapter/unmerge_adapter round-trip is not bf16-reversible, so phase 1 pushed from
-            # a base that had round-tripped and phase 2 from a freshly loaded one. The verdict is
-            # therefore which state the engine is nearer, since a push that never happened sits at
-            # zero from the stale one. What the push carried is pinned by
-            # resume_adapters_match_the_checkpoint_file below.
-            checks["resumed_rollouts_served_the_checkpoint_policy"] = to_checkpoint < served_policy_delta(
-                after_resume, moved_off
-            )
+        # Both pushes send the same tensors, so the two probes must agree exactly on every row.
+        checks["resumed_rollouts_served_the_checkpoint_policy"] = after_resume == pre_perturb
         if not checks["resumed_rollouts_served_the_checkpoint_policy"]:
             log("  the resumed run's engine is NOT on the checkpoint's policy: the train-begin sync did not land")
         log(

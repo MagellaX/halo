@@ -96,8 +96,9 @@ Enforced in `src/distributed/parallelism_config.py` before model loading:
 - Cross-node EP (`ep_scope=global`) + ETP is supported as **one ETP group per NVLink domain** only:
   `expert_tp_size == EP members per domain` and `ep_size == domains spanned`. A finer split that
   would straddle a domain boundary is rejected — the ETP all-reduce must stay on NVLink.
-- Multi-domain multi-group EP+ETP is rejected — the in-backward cross-replica expert grad sync races
-  the DeepEP combine across domains.
+- Multi-domain multi-group EP+ETP is rejected — expert-TP keeps the deferred cross-replica DP path
+  (`is_deferred_dp`) off, so FSDP2's DP-wide reduce-scatter would race the narrower DeepEP combine
+  across domains.
 
     This rule, not the one above, is what refuses `ep2+etp4` and `ep4+etp2` on 2×8 (both leave
     `ep_group_size=8` under a 16-rank world), at either scope; `ep2+etp8` is the working shape.
@@ -108,14 +109,14 @@ Enforced in `src/distributed/parallelism_config.py` before model loading:
   domain, for instance.
 
 > [!NOTE]
-> **`ep4+etp2` on 8 GPUs is validated**
+> **`ep4+etp2` on 8 GPUs passes the gate**
 >
 > It is the only 4-way expert split on a single 8-GPU node, and it clears the racy-EP gate that
 > refuses bare `ep4` because ETP raises `ep_group_size` to the full domain —
-> [Expert Parallelism](expert-parallelism.md#single-domain-multi-group-ep-races-and-hangs). For a
-> 4-way *expert-FFN* split without that topology, `ep2+etp4` reaches the same 8-way total split
-> through 2-rank dispatch groups, at DP 2 instead of DP 4; it is what the 8-GPU Mistral4 matrix
-> (`tests/gpu/manifest.py`) runs.
+> [Expert Parallelism](expert-parallelism.md#single-domain-multi-group-ep-races-and-hangs). The GPU
+> test matrix does not run it. For a 4-way *expert-FFN* split without that topology, `ep2+etp4`
+> reaches the same 8-way total split through 2-rank dispatch groups, at DP 2 instead of DP 4; it is
+> what the 8-GPU Mistral4 and Cohere2 MoE matrices (`tests/gpu/manifest.py`) run.
 
 ETP reduces data parallelism — it counts toward `max(tp_size, cp_size, expert_tp_size)` in the
 `dp_size` formula owned by [Distributed Data Loading](data-loading.md#data-parallel-size). On 8 GPUs
@@ -220,7 +221,7 @@ are [not yet available in this release](pipeline-parallelism.md).
 | `save_sharded_ep` | rejected — the merge script cannot reconstruct TP-sharded expert weights | `validate_ep_sharded_save` |
 | `use_hsdp` | rejected — ETP builds its own `(dp, tp)` mesh | `_validate_hsdp` |
 | `use_peft` / attention LoRA | supported — pure ETP leaves attention unsharded, so the adapter is a genuine replica | — |
-| `use_grouped_gemm` on GptOss | silently falls back to the per-expert loop — once TP-sharded, the interleaved `gate_up_proj` cannot be de-interleaved | `EPGptOssMoELayer._grouped_mm_enabled` |
+| `use_grouped_gemm` on GptOss | runs the per-expert loop, reported in the layer's init summary (`grouped_mm=False`) — ETP stores the de-interleaved gate/up pair under the plain names the loop reads, not the `*_gmm` pair the grouped path reads | `EPGptOssMoELayer._grouped_mm_enabled` |
 
 The same-token invariant ETP depends on — partners must hold identical batches, since
 `ReduceFromExpertTP` sums element-wise in token space — is maintained by the rank layout, the
@@ -231,10 +232,10 @@ runtime**: a custom data path that bypasses those would sum unrelated tokens wit
 
 - **"Node-local EP group size (N) cannot exceed the NVLink domain (M)"** — `ep_size * expert_tp_size`
   must fit one domain under `ep_scope=node`. Reduce either, or use `ep_scope=global`.
-- **"Cross-node EP+ETP supports one ETP group per NVLink domain only"** — set `expert_tp_size` to the
-  EP members per domain and `ep_size` to the domain count (both quoted in the message), or use
-  `ep_scope=node`.
-- **"Sharded EP save (save_sharded_ep=True) is not supported with expert_tp_size=N"** — use the
+- **"Cross-node EP+ETP supports one ETP group per NVLink domain only"** — set `expert_tensor_parallel_size`
+  to the EP members per domain and `expert_parallel_size` to the domain count (both quoted in the
+  message), or use `ep_scope=node`.
+- **"Sharded EP save (save_sharded_ep=True) is not supported with expert_tensor_parallel_size=N"** — use the
   default gathered save.
 - **OOM** — raise `expert_tp_size`, or switch to EP+TP if attention is also a bottleneck (the two
   are mutually exclusive).

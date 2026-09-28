@@ -2,7 +2,8 @@
 
 Halo against upstream `trl.SFTTrainer` on transformers v5 with native FSDP — same model, data, attention, and
 kernels, only the framework changes. Measured with the same `EfficiencyCallback` and synthetic dataset as
-[Throughput Benchmarks](throughput-benchmarks.md), so tokens/s/GPU and peak memory are directly comparable.
+[Throughput Benchmarks](throughput-benchmarks.md), in a run set of its own: a config both pages list agrees
+within ~10% (batch-1 EP steps are communication-bound and vary run to run), so compare within one page.
 
 Unless a header says otherwise, every number is **gpt-oss-20b** (`unsloth/gpt-oss-20b-BF16`, 20.7B, 32
 experts, top_k=4) on **8× B300**, bf16, FA4 + Liger, `grouped_mm` experts, gradient checkpointing on, DeepEP
@@ -47,8 +48,8 @@ The baseline gets the strongest stock options — ZeRO-3 and Liger's FLCE, which
 
 - **EP8 trades throughput for memory** — 1.3–2.1× TRL at ~½ its memory (26 vs 48 GB at 4k·b1).
 - **EP1 z3 isolates the framework gap** to AdamWBF16 + Halo's FSDP2+EP wrapper: both sides shard every
-  param 8-way with the same kernel, and EP1 still leads 1.4× (4k·b1) to 2.7× (16k) on throughput *and*
-  memory. **Prefer z2 at short sequence, z3 when memory-tight.**
+  param 8-way with the same kernel, and EP1 still leads 1.2× (4k·b2) to 2.7× (16k·b1) on throughput, and
+  on memory everywhere but 16k·b2 (68.4 vs 55.6 GB). **Prefer z2 at short sequence, z3 when memory-tight.**
 
     TRL is slower because `full_shard` re-gathers all 20.7B params every microstep, a fixed cost a short
     step cannot hide. That is why EP1 z3 is −38% vs its own z2 at 4k·b1 but only −5% at 16k·b1.
@@ -119,9 +120,9 @@ past ~64k tokens/rank nothing fits GC-off. EP8 32k·b1 GC-off needs the **legacy
 
 ## Long context: 64k → 256k
 
-*b1 · GC-on · FLCE on both sides · stock TRL ZeRO-3.* Dense Halo (EP1) is the **throughput** corner —
-2.1× TRL at 64k, 1.6× at 128k, 1.28× at 256k, each at less memory than TRL (the lead narrows as quadratic
-attention comes to dominate). `EP8+CP8` and dense `CP-only` are the **memory** corner at ≈½ TRL's memory.
+*b1 · GC-on · stock TRL ZeRO-3 with FLCE; Halo on Liger CE through 64k, FLCE at 128k/256k.* Dense Halo
+(EP1) is the **throughput** corner — 2.1× TRL at 64k, 1.6× at 128k, 1.28× at 256k, at less memory than
+TRL from 128k (the lead narrows as quadratic attention comes to dominate). `EP8+CP8` and dense `CP-only` are the **memory** corner at ≈½ TRL's memory.
 
 ![Long context throughput and memory at 64k/128k/256k](../assets/benchmarks/long_context.png)
 
@@ -155,7 +156,7 @@ ZeRO-2 (64k: 100 vs 138 GB) — the better dense choice when memory is tight.
   (256k z3: CP4 2,257·98 vs CP8 1,836·56).
 - `EP1 z2` OOMs (ZeRO-2 keeps ~40 GB of params resident); `EP8`, `EP8+CP2`, `EP8+TP8` hit the ceiling below.
 
-### The EP8 dispatch ceiling: ~64k tokens/rank {#the-ep8-dispatch-ceiling-64k-tokensrank}
+### The EP8 dispatch ceiling: ~64k tokens/rank
 
 Multi-step EP8 *training* has a practical ceiling around **64k tokens/rank**:
 
@@ -170,7 +171,7 @@ Multi-step EP8 *training* has a practical ceiling around **64k tokens/rank**:
 
 For ≥128k sequences, keep per-rank tokens ≤64k by **splitting further with CP** (EP8+CP8 = 16k/rank at
 128k), or **go dense** (EP1 / dense CP-only — neither uses DeepEP). Related kernel-side detail:
-[DeepEP → dispatch wire-index limit](../infrastructure/deepep.md#token-count-ceiling).
+[DeepEP → dispatch wire-index limit](../infrastructure/deepep.md#dispatch-wire-index-limit).
 
 ## Why Halo's EP wins: all-to-all vs masked all-reduce
 

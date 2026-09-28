@@ -59,7 +59,7 @@ The atomic-free path runs the EP step at ~6,310 vs ~1,256 tok/s/GPU for the defa
 
 The token permute/unpermute (`MoEGatherPermute`, `MoEScatterUnpermute`) is the larger lever for high-top_k MoE. Qwen3.6 (top-8, 256 experts, 32 local/rank at EP8) measures the scatter-back `index_add_` at ~32% of the step: 4.3 ms/call vs gpt-oss (top-4, 4 local/rank) 0.38 ms/call (11× gap, pure collision rate).
 
-The fix expresses both directions with no atomics via a precomputed `inv_map` (`[recv_N, top_k]` of sorted positions feeding each recv token, sentinel-padded), turning the scatter into gather + reduction (numerically identical to `index_add_`, float64-checked fwd+bwd).
+The permute expresses both directions with no atomics via a precomputed `inv_map` (`[recv_N, top_k]` of sorted positions feeding each recv token, sentinel-padded), turning the scatter into gather + reduction (numerically identical to `index_add_`, float64-checked fwd+bwd).
 
 It is gated on **`top_k ≥ ep_size`** (`base_layer._sort_tokens_for_grouped_mm` builds `inv_map` via `_build_inv_map`). Below that (gpt-oss top-4 at EP8, the top-8 families at `ep16`, DeepSeek-V4-Flash top-6 at `ep8`) the plain `index_select` + `index_add_` is kept, since the extra `top_k`× read would cost ~4%.
 
@@ -80,9 +80,9 @@ gpt-oss-120b at EP8, same 64-sequence effective batch: bs2 × GA4 measures ~20% 
 
 The grouped GEMM is one part of an EP step (also: all-to-all dispatch/combine, permute, attention, optimizer). The general sequence/batch playbook is in [Throughput Benchmarks](throughput-benchmarks.md#maximizing-throughput-sequence--batch); the kernel-side levers, measured on 8× B300 (SM 10.3, PyTorch 2.11+cu130, FA4, bf16):
 
-1. **Pick parallelism by fit.** If it fits FSDP2, FSDP has no all-to-all and reaches higher achieved TFLOPS — gpt-oss-20b 1,014 TFLOPS (FSDP) vs 218 (EP=8) at seq 4096 — but is memory-heavy (148 GB at b1, near OOM at larger batch). Use EP only when FSDP OOMs.
-2. **Smallest EP degree that fits the experts.** Fewer ranks = smaller all-to-all + larger per-rank GEMMs. gpt-oss EP2 (DP8) 516 TFLOPS vs EP8 218 at seq 4096.
-3. **GC off when the batch fits** — recompute is ~+19% overhead on 192 GB B300 at moderate seq.
+1. **Pick parallelism by fit.** If it fits FSDP2, FSDP has no all-to-all and reaches higher achieved TFLOPS — gpt-oss-20b 1,203 TFLOPS (FSDP, experts replicated) vs 228 (EP=8) at seq 4096, batch 1 — but is memory-heavy (148 GB at b1, near OOM at larger batch). Use EP only when FSDP OOMs.
+2. **Smallest EP degree that fits the experts.** Fewer ranks = smaller all-to-all + larger per-rank GEMMs. gpt-oss EP2 (DP8) 745 TFLOPS vs EP8 228 at seq 4096, batch 1.
+3. **GC off when the batch fits** — recompute is ~+19% overhead on a 288 GB B300 at moderate seq.
 4. **Atomic-free expert permute** (above) — automatic for `top_k ≥ ep_size`, +18% (seq 4k) to +65% (seq 16k) on qwen3.6.
 5. **Do not use low precision** (fp8/fp4) — measured net-slower (experts are tiny-M / bandwidth-bound, bf16 at the roofline). See [Low-Precision Kernels](low-precision-moe-kernels.md).
 
@@ -135,7 +135,7 @@ Families whose activation is a standard SiLU gate fuse the activation and the mu
 > [!NOTE]
 > **Expert Tensor Parallelism**
 >
-> When `expert_tp_size > 1`, GptOss falls back to the loop path (interleaved weights cannot be pre-de-interleaved once TP-sharded). The other families use grouped GEMM regardless of ETP, on the 3-call separate-projection path (`gate_up_proj` is split into `gate_proj`/`up_proj` before the intermediate dim is sharded).
+> When `expert_tp_size > 1`, GptOss runs the loop path: ETP stores its de-interleaved gate/up pair under the plain `gate_proj`/`up_proj` names the loop reads, not the `gate_proj_gmm`/`up_proj_gmm` pair the grouped path reads (the layer's init summary reports `grouped_mm=False`). The other families use grouped GEMM regardless of ETP, on the 3-call separate-projection path (`gate_up_proj` is split into `gate_proj`/`up_proj` before the intermediate dim is sharded).
 
 ## Standalone grouped GEMM mode
 

@@ -49,7 +49,7 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 import src.distributed.expert_parallel.layers.roster  # noqa: F401 — registers the EP export roster the config finalizer requires
-from scripts._common import add_max_shard_size_arg, add_trust_remote_code_arg
+from scripts._common import add_dtype_arg, add_max_shard_size_arg, add_trust_remote_code_arg
 from src.checkpoint.config_export import finalize_exported_config
 from src.checkpoint.format import (
     DEFAULT_MAX_SHARD_SIZE,
@@ -470,9 +470,9 @@ def _copy_aux_files(
     # tuple copy_checkpoint_aux_files refuses, so downloaded and local sources drop alike.
     if not os.path.isdir(source_dir):
         source_dir = snapshot_download(source_dir, ignore_patterns=list(WEIGHT_FILE_IGNORE_PATTERNS))
-    # No resume sidecars (rng_state*, scheduler.pt, router_balancing_biases.pt): they describe a
-    # single training run's state, and an N-way merged artifact has none, so shipping one input's
-    # sidecars would seed a resume or serve with state the merged weights never trained under.
+    # No resume state (include_resume_sidecars=False): it describes a single training run, and an N-way
+    # merged artifact has none, so shipping one input's would seed a resume or serve with state the
+    # merged weights never trained under.
     copy_checkpoint_aux_files(source_dir, output_dir, include_resume_sidecars=False)
     if not any(name.startswith(("tokenizer", "vocab", "spiece", "merges")) for name in os.listdir(output_dir)):
         # Raise rather than warn: a merged artifact with no usable tokenizer would fail at the next
@@ -516,7 +516,7 @@ def main() -> int:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--method", default="linear", choices=list(_METHODS))
     parser.add_argument("--base_model", default=None, help="Base for task_arithmetic / ties.")
-    parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPE_BY_NAME))
+    add_dtype_arg(parser)
     # Knob defaults stay None here and resolve in merge_models(), so a knob a method ignores raises;
     # the help text renders each op signature's own default rather than a copy of it.
     parser.add_argument(

@@ -45,7 +45,7 @@ output_dir: checkpoints/self-distill-qwen3.5-9b
 | `sdpg_beta_base` | `1.0` | Base OPD coefficient; `0` skips the teacher forward entirely |
 | `sdpg_beta_warmup_steps` / `sdpg_beta_decay_steps` | `0` / `0` | `beta(k) = base · min(1, k/T_warm) · min(1, (T−k)/T_decay)` |
 | `opd_exclude_eos` | `True` | Drops EOS/stop tokens from OPD but not from SFT |
-| `reference_kl_coef` | `0.0` | Alpha on a frozen-reference KL anchor; `0` loads no reference |
+| `reference_kl_coef` | `0.0` | Alpha on a frozen-reference KL anchor; `0` loads no reference. Refused under EP, ETP and TP: the dense reference would run the unpatched path, so its log-probs would not match the policy's |
 | `reference_kl_loss` | `unnormalized_kl` | The anchor's divergence; or `reverse_kl`, `forward_kl` |
 | `reference_model_name_or_path` | `None` | The anchor model; defaults to the student's init weights |
 | `confidence_field` / `confidence_power` | `None` / `4.0` | Per-sample weight `conf**p`, mean-normalized across the batch |
@@ -55,7 +55,7 @@ With `reference_kl_coef <= 0`, a non-default `reference_model_name_or_path` or `
 
 Neither branch is ever truncated — the teacher is systematically longer, so right-truncation would cut response tokens the student keeps. On the text path a row over `max_length` raises, naming the branch, and a prep-time audit makes that raise world-uniform instead of hanging the peers of one rank. Size `max_length` with headroom for the hint.
 
-The dataset stays raw: the collator tokenizes the student and the hinted teacher branch at collation time. Inherited SFT knobs that cannot reach it are refused, not ignored — `packing`, `padding_free`, `completion_only_loss`, `assistant_only_loss`, `train_on_last_assistant_only`, `generate_eval_examples` and `num_eval_examples`.
+The dataset stays raw: the collator tokenizes the student and the hinted teacher branch at collation time. Inherited SFT knobs that cannot reach it are refused, not ignored — `packing`, `padding_free`, `eval_packing`, `completion_only_loss`, `assistant_only_loss`, `dataset_text_field`, `dataset_kwargs`, `train_on_last_assistant_only`, `generate_eval_examples` and `num_eval_examples`.
 
 ## Launch
 

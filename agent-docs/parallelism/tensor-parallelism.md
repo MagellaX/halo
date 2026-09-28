@@ -258,8 +258,9 @@ Transformers validates no head count of its own, so without it the run dies on t
 reshape, after the whole checkpoint has been pulled and placed on every rank.
 
 **Axis combinations.** TP composes with EP only. TP+CP, TP+ETP, EP+TP+ETP and PP+TP are refused by
-the [allowlist](README.md#supported-combinations); multi-domain multi-group EP+TP is rejected
-separately (`_validate_tp`).
+the [allowlist](README.md#supported-combinations). EP+TP also meets two topology rejections:
+single-domain multi-group EP with `ep_size > 2` (`ep4+tp2` on 8) and multi-domain multi-group EP
+([Multi-Node → EP+TP](multi-node.md#eptp-mode)).
 
 **Knobs.** Everything below raises unless the verdict says otherwise.
 
@@ -290,7 +291,7 @@ across nodes. `nvlink_domain_size % tp_size == 0` is enforced at config time.
 # Each node (set --node_rank per node)
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=4 \
     --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    scripts/training/sft.py --tensor_parallel_size=4
+    scripts/training/sft.py <config>.yaml --tensor_parallel_size=4
 ```
 
 `DIST_NCCL_TIMEOUT_MINUTES` (default 30) is pinned onto the default group and every EP/CP/TP subgroup

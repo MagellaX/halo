@@ -42,7 +42,6 @@ It wraps a `def run(ctx) -> dict` body and owns the full lifecycle so the body i
 | `ctx.output_dir`, `ctx.cache_dir` | per-rank isolated dirs (auto-cleaned) |
 | `ctx.on_teardown(fn)` | register a finalizer (e.g. `trainer.cleanup_ep`); run LIFO before teardown |
 | `ctx.barrier()` | `dist.barrier()` if initialized |
-| `ctx.broadcast_seed(seed=42)` | seed torch/cuda/random identically on all ranks (rank-0 value wins); returns the shared seed. Use when every rank must generate the **same** data. |
 | `ctx.broadcast_checks(checks)` | AND rank 0's verdict into this rank's dict, for a check only rank 0 can make (a served model's response, an HTTP probe). Merges rather than replaces, so a check that failed only on rank 1 survives — the harness exits per rank, and a rank-0-only failure would otherwise read as a teardown race. |
 | `ctx.metrics(trainer_or_cb)` | snapshot headline metrics from a trainer (or an `EfficiencyCallback`); returns `{}` if none attached |
 
@@ -50,13 +49,33 @@ It wraps a `def run(ctx) -> dict` body and owns the full lifecycle so the body i
 
 ```python
 return {
-    "checks":  {"loss_finite": True, "loss_decreased": True, "rank_loss_consistent": True},
+    "checks":  {"loss_finite": True, "all_steps_finite": True, "expert_bank_split_ep_way": True},
     "metrics": ctx.metrics(trainer),   # {} is allowed for pure-correctness tests
 }
 ```
 
 The decorator computes `all(checks.values())`. **Returning no checks is an error** — always
 return at least one. `metrics` is optional but should be present on any test that trains.
+
+Every check must be able to fail. A cross-rank spread of a logged loss cannot (HF logs the world
+mean), and neither can `trainer.is_ep_mode` / `is_tp_mode` / `is_cp_mode`, which return the
+`ParallelismConfig` the trainer was handed; read the axis off the model instead.
+
+### Shared checks and probes
+
+Build checks from these rather than re-deriving them per file:
+
+| Helper | Module | What it gives |
+|---|---|---|
+| `step_losses(trainer)` | `tests/common/utils.py` | the per-step training losses, eval entries and the run summary excluded |
+| `training_run_checks(result, trainer, max_steps, *, loss_band=, grad_norms=, loss_decreased=)` | `tests/common/utils.py` | `loss_finite`, `all_steps_finite`, `steps_completed`, and on request `loss_reasonable`, `grad_norms_finite`, `loss_decreased` |
+| `parallel_shape_checks(model, parallelism_config)` | `tests/common/parallel_shape.py` | one model-side probe per axis the config enables: EP wrappers, the expert bank split EP-way, ETP sharding, TP-sharded params, Ulysses attention layers |
+| `ep_layers(model)` | `tests/common/ep_reference.py` | every EP/ETP-wrapped MoE layer |
+| `group_max_abs_diff(tensor, group)` | `tests/common/distributed.py` | the replica-identity probe: the largest elementwise difference across a group, NaN-propagating (collective) |
+| `model_save_checks` / `resume_checkpoint_checks` / `resume_continuity_checks` | `tests/common/checkpoint_io.py` | the files a `save_model` or a mid-training checkpoint must hold, and what a resume restored at its first step |
+| `run_sft_suite(ctx, SFTSuite(...), {key: SFTMode(...)}, default_mode=)` | `tests/common/sft_modes.py` | the whole SFT smoke body: one `--mode` per manifest row, load → train → the checks above |
+| `train_recording_first_step` / `score_first_step` / `first_step_checks` / `first_step_gradient_checks` | `tests/common/first_step.py` | a parallel run's first optimizer step (microbatch losses, logged loss, sharded gradients, c10d autograd fallbacks) scored against a reference trainer on the same microbatches, for an objective a parallel axis could miscount |
+| `skip_unless_local_checkpoint(path, env_var)` | `tests/common/harness.py` | the `SKIP:` exit for a suite whose local checkpoint is absent, called under `__main__` before `run()` |
 
 ## Minimal copy-pasteable skeleton
 
@@ -66,42 +85,34 @@ return at least one. `metrics` is optional but should be present on any test tha
 
 Run: torchrun --nproc_per_node=2 tests/gpu/<area>/test_<name>.py
 """
-import math
-
-from tests.common.distributed import world_any, world_mean
 from tests.common.harness import gpu_test_main
-from tests.common.tolerances import TOL
+from tests.common.parallel_shape import parallel_shape_checks
+from tests.common.utils import training_run_checks
+
+MAX_STEPS = 5
 
 
 @gpu_test_main(min_world_size=2, prefix="test_sft_ep")
 def run(ctx) -> dict:
-    ctx.broadcast_seed(42)               # every rank generates the SAME synthetic data
-
     # 1. Build a tiny model + deterministic synthetic dataset (NO Hub download on hot path).
     #    Load from a cached snapshot or a small local config.
     model, tokenizer = build_tiny_model(ctx)
-    dataset = make_synthetic_sft_dataset(seed=42)   # seeded, reproducible
+    dataset = make_synthetic_sft_dataset(seed=42)   # same seed on every rank: the SAME data
 
     # 2. Train a few REAL steps (>= 2 so the decrease check has signal).
     #    The body builds its own ParallelismConfig — ctx carries the launch, not the mode.
-    pc = ParallelismConfig(ep_size=2, use_grouped_gemm=has_grouped_mm())
+    pc = ParallelismConfig(ep_size=2)
     trainer = DistributedSFTTrainer(model=model, ..., parallelism_config=pc)
     ctx.on_teardown(trainer.cleanup_ep)   # finalizer the decorator can't reach
-    trainer.train()
-    losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
+    checks = parallel_shape_checks(model, pc)   # the axis, read off the model
+    result = trainer.train()
 
-    # 3. Assert BEHAVIOR + cross-rank invariants (verdict computed on ALL ranks).
-    loss_finite = all(math.isfinite(x) for x in losses)
-    loss_decreased = len(losses) >= 2 and losses[-1] < losses[0]
-    mean = world_mean(losses[-1])                            # tests/common/distributed.py
-    rank_loss_consistent = not world_any(abs(losses[-1] - mean) > TOL.rank_loss_consistency_abs)
+    # 3. Assert BEHAVIOR (verdict computed on ALL ranks). A logged loss is already the world mean
+    #    (HF all-gathers it at every log step), so a cross-rank spread of it cannot fail.
+    checks |= training_run_checks(result, trainer, MAX_STEPS, grad_norms=True, loss_decreased=True)
 
     return {
-        "checks": {
-            "loss_finite": loss_finite,
-            "loss_decreased": loss_decreased,
-            "rank_loss_consistent": rank_loss_consistent,
-        },
+        "checks": checks,
         "metrics": ctx.metrics(trainer),   # headline tokens/s/GPU + peak mem + step time
     }
 
@@ -115,8 +126,10 @@ numerical equivalence with `TOL.kernel_atol` / `TOL.kernel_rtol`.
 
 `record_check(checks, name, fn)` (same module) is the sanctioned way to record many independent
 verdicts in one launch without aborting at the first failure — the conventions test names it as the
-replacement for a printed pass/fail summary. Every `fn` must be rank-symmetric and collective-free.
-Cross-rank verdicts come from `tests/common/distributed.py` (`world_mean`, `world_any`, `world_min`).
+replacement for a printed pass/fail summary. Every raise inside an `fn` must be rank-symmetric or come
+after its last collective, or the ranks desynchronize. Cross-rank verdicts come from
+`tests/common/distributed.py` (`world_mean`, `world_any`, `world_min`, `world_spread`,
+`group_max_abs_diff`).
 
 ## Register in the manifest (`tests/gpu/manifest.py`)
 
@@ -126,7 +139,7 @@ A GPU script is invisible until it has a `TestSpec`. Add one row (path relative 
 ```python
 MANIFEST: dict[str, TestSpec] = {
     ...
-    "trainers/sft/test_sft_ep.py": TestSpec(
+    "trainers/sft/test_sft_example.py": TestSpec(
         nproc=2,                                       # --nproc_per_node
         markers=('gpu', 'full', '2gpu', 'ep', 'moe', 'qwen3'),  # all from ALL_MARKERS
         timeout=1000,                                  # seconds; process group killed on expiry
@@ -183,11 +196,10 @@ those, kept separate only so the manifest can attach its family markers, timeout
   offline run over it fails a cache miss (`HALO_TEST_REQUIRE_HUB_CACHE`; see
   [Contributing → Tests](../../agent-docs/contributing/README.md#tests)).
 - **Tolerances** (`tests/common/tolerances.py`) — `from tests.common.tolerances import TOL`,
-  then use the named constant: `TOL.rank_loss_consistency_abs`, `TOL.tp_grad_norm_spread_abs`,
+  then use the named constant: `TOL.ep_identical_batch_rank_spread_abs`,
   `TOL.parallel_vs_baseline_loss_abs`, `TOL.parallel_vs_baseline_train_loss_abs`,
-  `TOL.ep_rank_loss_abs`, `TOL.logprob_atol/rtol`, `TOL.weight_atol`, `TOL.resume_loss_abs`,
-  `TOL.grad_norm_rel`, `TOL.kernel_atol/rtol`. Never re-inline a literal — the name is the
-  contract. An EP-vs-reference gradient test scores its `name -> (EP grad, reference)` pairs with
+  `TOL.logprob_atol`, `TOL.weight_atol`, `TOL.resume_loss_abs`, `TOL.kernel_atol/rtol`. Never
+  re-inline a literal — the name is the contract. An EP-vs-reference gradient test scores its `name -> (EP grad, reference)` pairs with
   `tests.common.ep_reference.score_ep_grad_pairs(pairs, checks, metrics, cos_min=TOL.ep_grad_cosine_min)`;
   its norm-ratio band defaults to `TOL.ep_grad_norm_ratio_band`.
 - **Reporting** (`tests/common/reporting.py`):

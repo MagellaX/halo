@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.distributed.expert_parallel.base_layer import EPSeparateGluMoELayerBase
+from src.distributed.expert_parallel.base_layer import TOPK_WEIGHT_NORM_EPS, EPSeparateGluMoELayerBase
 
 
 class EPBailingMoELayer(EPSeparateGluMoELayerBase):
@@ -19,8 +19,9 @@ class EPBailingMoELayer(EPSeparateGluMoELayerBase):
     handles by testing the return for a tuple.
 
     Bias-update balancing uses the gate's own persistent ``expert_bias`` buffer, added to the sigmoid
-    scores for selection only (``topk_method: noaux_tc``), instead of the base's transient
-    side-buffer. That buffer is part of the checkpoint, so a gathered save exports the trained bias.
+    scores for selection only (``moe_router_enable_expert_bias``; Ling 3.0 also declares
+    ``topk_method: noaux_tc``), instead of the base's transient side-buffer. That buffer is part of
+    the checkpoint, so a gathered save exports the trained bias.
     """
 
     HF_MODULE_NAMES = ("BailingMoeV2SparseMoeBlock", "BailingMoeV3SparseMoeBlock")
@@ -66,12 +67,12 @@ class EPBailingMoELayer(EPSeparateGluMoELayerBase):
         self._store_separate_glu_params(gate_stacked, up_stacked, down_stacked)
 
     def _gate_weights_at(self, router_logits: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """``BailingMoeV2Gate`` weights at ``indices``: sigmoid scores, gather, top-k renorm (+1e-20),
+        """``BailingMoeV2Gate`` weights at ``indices``: sigmoid scores, gather, floored top-k renorm,
         then ``routed_scaling_factor``. The gate's ``expert_bias`` perturbs selection only, so it does
         not appear here."""
         scores = torch.sigmoid(router_logits.float()).type_as(router_logits)
         scores = torch.gather(scores, dim=1, index=indices).type_as(router_logits)
-        weights = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
+        weights = scores / (scores.sum(dim=-1, keepdim=True) + TOPK_WEIGHT_NORM_EPS) if self.top_k > 1 else scores
         return weights * float(self.gate.routed_scaling_factor)
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:

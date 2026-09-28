@@ -21,7 +21,6 @@ Run: pytest tests/cpu/data/test_vlm_refusal_and_rejection_logging.py
 import base64
 import io
 import logging
-import sys
 
 import numpy as np
 import pytest
@@ -36,6 +35,7 @@ from src.data.pipeline.processing import (
     _HIGH_REJECTION_WARN_FRACTION,
     process_dataset_with_map_and_filter,
 )
+from src.trainers.reward.classification import _filter_over_length
 from tests.common.vlm_fakes import FakeVLMProcessorBase
 
 _PROCESSING_LOGGER = "src.data.pipeline.processing"
@@ -269,8 +269,6 @@ def test_classification_over_length_filter_logs(caplog):
     """The classification trainer's over-length filter must report the dropped count through the
     shared reporter — WARNING at its threshold, INFO below it. A silent filter hides how much of the
     split it removed, and a private copy of the report would drift from that threshold."""
-    from src.trainers.reward.classification import _filter_over_length
-
     long_ids = list(range(32))
     short_ids = [1, 2, 3]
     dataset = Dataset.from_dict({"input_ids": [long_ids] * 3 + [short_ids]})
@@ -291,6 +289,4 @@ def test_classification_over_length_filter_logs(caplog):
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

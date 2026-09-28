@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """
-SMPO Trainer test with padding-free mode (Flash Attention 2).
+SMPO Trainer smoke test with padding-free mode (Flash Attention 2).
 
-Validates that SmoothMarginPOTrainer works correctly in padding-free mode
-on Qwen3-0.6B with:
+Runs SmoothMarginPOTrainer in padding-free mode on Qwen3-0.6B with:
 - Padding-free flattening (eliminates padding waste)
 - Flash Attention 2 for document boundary handling
 - Gradient checkpointing
@@ -14,14 +13,16 @@ on Qwen3-0.6B with:
 Test Phases:
 1. Synthetic preference dataset creation (prompt/chosen/rejected)
 2. SMPO training for 10 steps with padding_free=True
-3. Validation: loss is finite and reasonable
+3. Validation: the trainer runs padding-free, every configured step ran, and the final and every
+   per-step loss is finite
+
+It does not compare the SMPO objective against a reference. Per-document isolation of the
+flattened rows is pinned by tests/gpu/trainers/preference/test_smpo_padding_free_segments.py.
 
 Run with 2 GPUs:
     torchrun --nproc_per_node=2 \
         tests/gpu/trainers/preference/test_smpo_padding_free.py
 """
-
-import math
 
 import torch
 
@@ -32,7 +33,7 @@ from src.trainers.preference.smpo import SmoothMarginPOTrainer
 from tests.common.datasets import create_preference_dataset
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import log
+from tests.common.utils import log, training_run_checks
 
 # Configuration
 
@@ -102,6 +103,7 @@ def run(ctx):
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=MAX_LENGTH,
         max_prompt_length=MAX_PROMPT_LENGTH,
         dataloader_drop_last=True,
@@ -127,35 +129,12 @@ def run(ctx):
     log("\n[4/4] Training...")
     train_result = trainer.train()
 
-    # -- Collect metrics --
-    training_loss = train_result.training_loss
-    log_history = trainer.state.log_history
-    step_losses = [entry["loss"] for entry in log_history if "loss" in entry and "eval_loss" not in entry]
-
-    log("\n  --- Training Results ---")
-    log(f"  Final training loss: {training_loss:.6f}")
-    log(f"  Per-step losses: {[f'{l:.4f}' for l in step_losses]}")
-
     # -- Assertions --
     log("\n  --- Assertions ---")
-    checks = {}
+    checks = training_run_checks(train_result, trainer, MAX_STEPS)
+    checks["padding_free_active"] = trainer.padding_free is True
 
-    # Check 1: Training completed (loss is finite)
-    loss_finite = math.isfinite(training_loss)
-    checks["loss_finite"] = loss_finite
-    log(f"  Loss is finite: {'PASS' if loss_finite else 'FAIL'} (loss={training_loss:.6f})")
-
-    # Check 2: All step losses are finite (no NaN/Inf)
-    all_finite = all(math.isfinite(l) for l in step_losses)
-    checks["all_steps_finite"] = all_finite
-    log(f"  All step losses finite: {'PASS' if all_finite else 'FAIL'}")
-
-    # Check 3: Training loss is reasonable (not diverged)
-    loss_reasonable = training_loss < 100.0
-    checks["loss_reasonable"] = loss_reasonable
-    log(f"  Loss reasonable (<100): {'PASS' if loss_reasonable else 'FAIL'}")
-
-    return {"checks": checks, "metrics": {"final_train_loss": training_loss}}
+    return {"checks": checks, "metrics": {"final_train_loss": train_result.training_loss}}
 
 
 main = gpu_test_main(min_world_size=1, prefix="smpo_padding_free")(run)

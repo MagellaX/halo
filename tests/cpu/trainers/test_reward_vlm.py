@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch.nn as nn
+from accelerate import PartialState
 from datasets import Dataset, DatasetDict
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
@@ -61,8 +62,6 @@ class StubTextTokenizer(StubTokenizer):
 
 @pytest.fixture(autouse=True)
 def _accelerate_state(monkeypatch):
-    from accelerate import PartialState
-
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     PartialState()  # the coordinated dataset ops and the accelerate logger need an initialized state
 
@@ -456,6 +455,7 @@ def test_pipeline_parallelism_refuses_a_multimodal_reward_run_fed_images():
         gradient_checkpointing=False,
         gradient_checkpointing_kwargs=None,
         eval_strategy="no",
+        eval_on_start=False,
         activation_offloading=False,
         torch_compile=False,
     )
@@ -474,4 +474,4 @@ def test_reward_trainer_declares_no_context_parallel_support():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

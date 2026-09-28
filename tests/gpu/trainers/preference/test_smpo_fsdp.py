@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """
-SMPO Trainer test with standard FSDP (no EP/CP/TP).
+SMPO Trainer smoke test with standard FSDP (no EP/CP/TP).
 
-Validates that SmoothMarginPOTrainer works correctly in standard FSDP mode
-on Qwen3-0.6B with:
+Runs SmoothMarginPOTrainer in standard FSDP mode on Qwen3-0.6B with:
 - Gradient checkpointing
 - Liger kernels (fused RMSNorm + cross-entropy)
 - BF16 mixed precision
@@ -13,14 +12,14 @@ on Qwen3-0.6B with:
 Test Phases:
 1. Synthetic preference dataset creation (prompt/chosen/rejected)
 2. SMPO training for 10 steps
-3. Validation: loss is finite
+3. Validation: every configured step ran, and the final and every per-step loss is finite
+
+It does not compare the SMPO objective against a reference, so a wrong-but-finite loss passes.
 
 Run with 2 GPUs:
     torchrun --nproc_per_node=2 \
         tests/gpu/trainers/preference/test_smpo_fsdp.py
 """
-
-import math
 
 import torch
 
@@ -31,7 +30,7 @@ from src.trainers.preference.smpo import SmoothMarginPOTrainer
 from tests.common.datasets import create_preference_dataset
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import log
+from tests.common.utils import log, training_run_checks
 
 # Configuration
 
@@ -110,6 +109,7 @@ def run(ctx):
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=MAX_LENGTH,
         max_prompt_length=MAX_PROMPT_LENGTH,
         dataloader_drop_last=True,
@@ -134,39 +134,14 @@ def run(ctx):
     train_result = trainer.train()
 
     # ── Collect metrics ─────────────────────────────────────────────
-    training_loss = train_result.training_loss
-    log_history = trainer.state.log_history
-    step_losses = [entry["loss"] for entry in log_history if "loss" in entry and "eval_loss" not in entry]
-
     log("\n  --- Training Results ---")
-    log(f"  Final training loss: {training_loss:.6f}")
-    log(f"  Per-step losses: {[f'{l:.4f}' for l in step_losses]}")
-
-    # Log SMPO-specific metrics if available
-    margin_metrics = [entry.get("margin", None) for entry in log_history if "margin" in entry]
+    margin_metrics = [entry["margin"] for entry in trainer.state.log_history if "margin" in entry]
     if margin_metrics:
-        log(f"  Margins: {[f'{m:.4f}' for m in margin_metrics if m is not None]}")
+        log(f"  Margins: {[f'{m:.4f}' for m in margin_metrics]}")
 
     # ── Assertions ──────────────────────────────────────────────────
     log("\n  --- Assertions ---")
-    checks = {}
-
-    # Check 1: Training completed (loss is finite)
-    loss_finite = math.isfinite(training_loss)
-    checks["loss_finite"] = loss_finite
-    log(f"  Loss is finite: {'PASS' if loss_finite else 'FAIL'} (loss={training_loss:.6f})")
-
-    # Check 2: All step losses are finite (no NaN/Inf)
-    all_finite = all(math.isfinite(l) for l in step_losses)
-    checks["all_steps_finite"] = all_finite
-    log(f"  All step losses finite: {'PASS' if all_finite else 'FAIL'}")
-
-    # Check 3: Training loss is reasonable (not diverged)
-    loss_reasonable = training_loss < 100.0
-    checks["loss_reasonable"] = loss_reasonable
-    log(f"  Loss reasonable (<100): {'PASS' if loss_reasonable else 'FAIL'}")
-
-    return {"checks": checks}
+    return {"checks": training_run_checks(train_result, trainer, MAX_STEPS)}
 
 
 main = gpu_test_main(min_world_size=2, prefix="smpo_fsdp")(run)

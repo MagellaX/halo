@@ -191,6 +191,7 @@ def _build_trainer(trainer, model, tokenizer, peft_config, output_dir, paralleli
         "logging_steps": 1,
         "save_strategy": "no",
         "report_to": "none",
+        "logging_nan_inf_filter": False,
         "dataloader_drop_last": True,
         "gradient_checkpointing": False,
         "use_liger_kernel": False,
@@ -294,7 +295,8 @@ def run(ctx) -> dict:
     checks["adapter_checkpoint"] = ok
     log(f"  [checkpoint] {detail}")
 
-    return {"checks": checks}
+    # Only rank 0 reads the checkpoint back; share its verdict so every rank exits alike.
+    return {"checks": ctx.broadcast_checks(checks)}
 
 
 main = gpu_test_main(min_world_size=2, prefix="lora_pref_heads")(run)

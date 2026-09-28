@@ -4,15 +4,17 @@
 
 Validates storage shapes/dtypes, quantize->dequantize round-trip error within each
 format's tolerance, axis handling, divisibility guards, the NVFP4 saturating-scale
-outlier guard, the straight-through ``fake_quant`` estimator, and the per-step
-``cached_fake_quant`` weight cache.
+outlier guard, the straight-through ``fake_quant`` estimator, the per-step
+``cached_fake_quant`` weight cache, and which failures switch the compiled round trip to eager.
 
 Run: ``pytest tests/cpu/kernels/test_quantization.py``.
 """
 
 import pytest
 import torch
+from torch._dynamo.exc import TorchDynamoException
 
+from src.kernels.lowp import quantization
 from src.kernels.lowp.quantization import (
     E2M1_MAX,
     cached_fake_quant,
@@ -22,13 +24,10 @@ from src.kernels.lowp.quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tests.common.utils import fro_rel_err
 
 # Each format's intrinsic round-trip tolerance (fp8 ~ 8-bit, fp4 ~ 4-bit).
 _TOL = {"mxfp8": 0.05, "mxfp4": 0.25, "nvfp4": 0.25}
-
-
-def _relerr(a: torch.Tensor, b: torch.Tensor) -> float:
-    return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
 
 # Storage form: shapes, dtypes, packing
@@ -73,7 +72,7 @@ def test_roundtrip_within_tolerance_all_formats():
     for fmt, quantizer in (("mxfp8", quantize_mxfp8), ("mxfp4", quantize_mxfp4), ("nvfp4", quantize_nvfp4)):
         recon = dequantize(quantizer(x))
         assert recon.dtype == torch.bfloat16
-        re = _relerr(recon, x)
+        re = fro_rel_err(recon, x)
         assert re < _TOL[fmt], f"{fmt} round-trip relerr {re:.4f} >= {_TOL[fmt]}"
 
 
@@ -81,7 +80,7 @@ def test_fp8_beats_fp4_accuracy():
     # 8-bit elements must reconstruct more faithfully than 4-bit ones.
     torch.manual_seed(1)
     x = torch.randn(128, 256) * 0.4
-    assert _relerr(dequantize(quantize_mxfp8(x)), x) < _relerr(dequantize(quantize_nvfp4(x)), x)
+    assert fro_rel_err(dequantize(quantize_mxfp8(x)), x) < fro_rel_err(dequantize(quantize_nvfp4(x)), x)
 
 
 def test_axis_0_quantization():
@@ -89,7 +88,7 @@ def test_axis_0_quantization():
     x = torch.randn(128, 96) * 0.3
     q = quantize_mxfp8(x, axis=0, block_size=32)
     assert q.scales.shape == (128 // 32, 96)  # blocks along axis 0
-    assert _relerr(dequantize(q), x) < _TOL["mxfp8"]
+    assert fro_rel_err(dequantize(q), x) < _TOL["mxfp8"]
 
 
 def test_zero_input_roundtrips_to_zero():
@@ -169,7 +168,7 @@ def test_fake_quant_matches_roundtrip_and_ste_backward():
         x = (torch.randn(64, 256) * 0.3).requires_grad_(True)
         y = fake_quant(x, fmt, axis=-1)
         # Forward equals the explicit quantize->dequantize round-trip.
-        assert _relerr(y.detach(), x.detach()) < _TOL[fmt]
+        assert fro_rel_err(y.detach(), x.detach()) < _TOL[fmt]
         # Backward is the identity (gradient reaches the master weight unchanged).
         (y * 2.0).sum().backward()
         assert torch.allclose(x.grad, torch.full_like(x.grad, 2.0)), "STE backward must be identity"
@@ -203,13 +202,42 @@ def test_cached_fake_quant_reuses_until_version_bumps():
         w.add_(1.0)
     after = cached_fake_quant(w, "mxfp8", axis=-1).detach()
     assert not torch.equal(first, after)
-    assert _relerr(after, w.detach()) < _TOL["mxfp8"]
+    assert fro_rel_err(after, w.detach()) < _TOL["mxfp8"]
 
 
 def test_cached_fake_quant_is_straight_through():
     w = torch.nn.Parameter(torch.randn(8, 64) * 0.3)
     (cached_fake_quant(w, "mxfp8", axis=-1) * 3.0).sum().backward()
     assert w.grad is not None and torch.allclose(w.grad, torch.full_like(w.grad, 3.0))
+
+
+# Compiled round trip: only a compile failure disables compile
+
+
+@pytest.fixture
+def fresh_compile_state(monkeypatch):
+    monkeypatch.setattr(quantization, "_compiled_round_trip", None)
+    monkeypatch.setattr(quantization, "_compile_failed", False)
+    monkeypatch.setenv("HALO_LOWP_COMPILE", "1")
+
+
+def test_a_callers_error_leaves_compile_on(fresh_compile_state):
+    """A shape the quantizer rejects is the caller's error: it must surface as that error, not switch
+    every later weight quantization in the process to the eager path."""
+    with pytest.raises(ValueError, match="not divisible"):
+        quantization._round_trip(torch.randn(4, 33), "mxfp8", -1)
+    assert quantization._compile_failed is False
+
+
+def test_a_compile_failure_falls_back_to_eager(fresh_compile_state, monkeypatch):
+    def fail_to_compile(*args):
+        raise TorchDynamoException("simulated backend failure")
+
+    monkeypatch.setattr(quantization, "_compiled_round_trip", fail_to_compile)
+    x = torch.randn(4, 64)
+    out = quantization._round_trip(x, "mxfp8", -1)
+    assert quantization._compile_failed is True
+    assert torch.equal(out, quantization._block_round_trip(x, "mxfp8", -1))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
+from src.distributed.loading import vlm_setup
 from src.models.loading.model_preparation import resolve_auto_model_class
 
 
@@ -97,8 +98,6 @@ def test_text_only_skips_the_vlm_branch_in_load_model_for_training(monkeypatch):
     """The flag must divert BEFORE the VLM probe: the probe enters a rank-coordinated store phase,
     and the wrapper class it leads to is exactly what text_only_model exists to avoid — patching
     the resolver alone is not enough, since sft.py loads through this entry point."""
-    from src.distributed.loading import vlm_setup
-
     calls = {}
     monkeypatch.setattr(vlm_setup, "is_vlm_model", lambda *a, **k: calls.setdefault("probe", True) or True)
     monkeypatch.setattr(
@@ -108,7 +107,7 @@ def test_text_only_skips_the_vlm_branch_in_load_model_for_training(monkeypatch):
     )
     model_config = SimpleNamespace(model_name_or_path="fake/vlm", model_revision=None, trust_remote_code=False)
     result = vlm_setup.load_model_for_training(
-        model_config, SimpleNamespace(), SimpleNamespace(), text_only_model=True
+        model_config, SimpleNamespace(), SimpleNamespace(), vlm_run=False, text_only_model=True
     )
     assert "probe" not in calls, "text_only_model=True must not enter the vlm_probe store phase"
     assert calls["loader_kwargs"]["text_only_model"] is True

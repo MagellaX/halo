@@ -10,8 +10,9 @@ substitution, and the vLLM file's training service loads it into the container.
 **The image already sets the tricky ones** — NCCL tuning, CUDA connection
 limits, the TF32 fix. Don't paste `-e NCCL_*=...` flags in from other clusters;
 the baked defaults are deliberate. The exceptions are the EFA recipe
-(`make ... EFA=1`) and `NCCL_SOCKET_IFNAME` on a multi-homed host — see
-[Clusters](clusters.md).
+(`make ... EFA=1`), the no-fabric recipe a GRPO trainer shares with its rollout
+server ([cookbook container](cookbooks/README.md#start-the-training-container)),
+and `NCCL_SOCKET_IFNAME` on a multi-homed host — see [Clusters](clusters.md).
 
 ## Paths — pass these, pointed at a big disk
 
@@ -24,9 +25,9 @@ the baked defaults are deliberate. The exceptions are the EFA recipe
 
 The defaults land on the root filesystem, which is usually too small for real
 runs — see [Installation](installation.md). On the host side, the `make`
-targets and the compose files share one variable for the large volume:
-`HALO_SCRATCH` (default `/mnt`). Export it once on a host whose big disk lives
-elsewhere and every `make` target mounts and caches there.
+targets and the vLLM compose file's `training` service share one variable for
+the large volume: `HALO_SCRATCH` (default `/mnt`). Export it once on a host
+whose big disk lives elsewhere and every `make` target mounts and caches there.
 
 ## Secrets — put these in `.env`
 
@@ -57,9 +58,9 @@ elsewhere and every `make` target mounts and caches there.
 | `DIST_INPUT_SHARED_FILESYSTEM` | the umbrella | read side — model/dataset downloads, dataset map/pack, HF caches |
 | `DIST_OUTPUT_SHARED_FILESYSTEM` | the umbrella | write side — checkpoints, `run.log`, dumped artifacts |
 | `DIST_STORE_TIMEOUT_HOURS` | `4` | raise when one rank's model download or corpus pack runs longer than four hours while the others wait; this is not the NCCL watchdog |
-| `DIST_NCCL_TIMEOUT_MINUTES` | `30` | raise when slow dataset prep or 100B-scale checkpoint saves outlast the NCCL watchdog |
-| `NVLINK_DOMAIN_SIZE` | GPUs per node | `72` on GB200/GB300 NVL72 racks |
-| `NCCL_SOCKET_IFNAME` | `^docker,veth` in the `make` targets and compose files | pin NCCL to the fast NIC on multi-homed nodes |
+| `DIST_NCCL_TIMEOUT_MINUTES` | `30` | raise when 100B-scale gathered checkpoint saves or large cross-node all-to-alls outlast the NCCL watchdog |
+| `NVLINK_DOMAIN_SIZE` | GPUs per node | `72` on an NVL72 rack, whose NVLink domain spans the rack |
+| `NCCL_SOCKET_IFNAME` | `^docker,veth` in the compose bases, `make test-gpu-vllm`/`-sglang` and the no-fabric GRPO recipe; `^lo,docker,veth,tailscale` under `EFA=1` and the EFA overlays; otherwise unset | pin NCCL to the fast NIC on multi-homed nodes |
 | `NCCL_NET_PLUGIN=ofi NCCL_NET=Libfabric` | unset | AWS EFA only: the trainer via `make ... EFA=1`, a rollout server via its compose EFA overlay — see [Clusters](clusters.md) |
 
 A side variable inherits the umbrella while unset and overrides it once set.
@@ -72,14 +73,14 @@ rank; rank 0's values are broadcast and any disagreeing rank warns.
 
 ## Tuning knobs worth knowing
 
-Halo has around twenty more `HALO_*` knobs, all optional and all defaulted to
+Halo has some thirty more `HALO_*` knobs, all optional and all defaulted to
 production-sane values. They're read through `src/env.py`, so booleans accept
 `1/true/yes/on`, and a non-numeric value warns and falls back instead of
 crashing mid-run. These are the ones that come up:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HALO_S3_DEFAULT_BUCKET` | `my-bucket` (placeholder) | bucket for the key-only S3 helpers when a path names none — set it before using them |
+| `HALO_S3_DEFAULT_BUCKET` | unset | bucket for the key-only S3 helpers when a path names none — they raise until it is set |
 | `HALO_DATASET_NUM_PROC` | `max(1, min(cpus/4, 4))` | dataset map/filter workers; pin it fleet-wide on heterogeneous nodes |
 | `HALO_FP32_MATMUL_PRECISION` | `highest` | fp32 matmul mode; `high` opts back into TF32, which corrupts long-context RoPE — leave it alone |
 | `HALO_DEEPEP_GPU_TIMEOUT_SECONDS` | `100` | device-side spin budget of the dispatch/combine barrier — bounds rank skew |
@@ -89,13 +90,16 @@ crashing mid-run. These are the ones that come up:
 | `HALO_ALLOW_MISSING_CHECKPOINT_KEYS` | `0` | demote the missing-checkpoint-key error to a warning; only for deliberately partial checkpoints |
 | `CUDA_DEVICE_MAX_CONNECTIONS` | `1`, baked into both images | driver-owned, latched at `deep_ep`'s `cuInit` — a Python write is too late; `1` is worth +9.7% on ep8 |
 
-The rollout servers have a set of their own (`VLLM_*` / `SGLANG_*`: R3 capture,
-speculative decoding, attention backend, the address the server dials back for
-the weight-sync group). They are set on the server container, and
-[Rollout Servers](rollout-servers.md) is where they belong.
+The rollout-server switches (`VLLM_*` / `SGLANG_*`: R3 capture, speculative
+decoding, attention backend) are `docker compose` interpolation variables: export
+them or put them in `.env` where you run compose. Neither engine reads them, so a
+hand-run server takes `--enable-return-routed-experts` / `--speculative-config` /
+`--attention-backend` directly. `VLLM_GROUP_HOST` / `SGLANG_GROUP_HOST`, the
+weight-sync dial-back address, are read by the trainer. See
+[Rollout Servers](rollout-servers.md).
 
 The rest — DeepEP buffer sizing, gradient-bucket geometry, low-precision cache
-switches, weight-sync timeouts, the EP profiling switches — are catalogued with
+switches, weight-sync timeouts, the EP profiling switches — are cataloged with
 their defaults in the
 [Configuration Reference](../agent-docs/reference/configuration-reference.md) ↗;
 the `HALO_TEST_*` and `*_SERVER_URL` variables belong to the test launcher and

@@ -3,20 +3,24 @@
 import hashlib
 
 import numpy as np
-import torch
-import torch.distributed as dist
 from accelerate.logging import get_logger
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 
 from src.data.pipeline.preprocessed_metadata import is_preprocessed_dataset
 from src.data.pipeline.processing import coordinated_filter, missing_render_column_splits, require_render_column
 from src.data.probe_consensus import agree_probe_across_ranks
-from src.data.sources.paths import DATA_FILE_BUILDERS, parse_dataset_source, parse_hub_spec
+from src.data.sources.paths import (
+    DATA_FILE_BUILDERS,
+    eval_split_name,
+    hub_repo_id,
+    parse_dataset_source,
+    parse_hub_spec,
+)
 from src.data.sources.s3_client import load_dataset_from_s3_uri
 from src.data.sources.sharded_dataset import ShardedDatasetLoader
-from src.data.vlm import VLM_IMAGE_COLUMNS, carried_image_columns
+from src.data.vlm import VLM_IMAGE_COLUMNS, VLM_RAW_IMAGE_COLUMNS, carried_image_columns
 from src.distributed.filesystem import fs_aware_main_first, store_join_recorded_failure
-from src.distributed.runtime import current_device, get_global_world_size
+from src.distributed.runtime import get_global_world_size, rank_consensus
 
 # INFO opt-in (the convention vlm_setup and the training scripts use): this module's INFO lines are
 # the run's only record of what data actually loaded (columns kept, split sizes, source dispatch).
@@ -37,11 +41,10 @@ _DEFAULT_DATA_SEED = 42
 _FALLBACK_CONVERSATION_FIELD = "conversation"
 _UNDECLARED = object()
 
-# The image-column spellings a vision route hard-codes: TRL's preference trainers read them off the
-# first sample to pick the vision branch, and list only these two among their signature columns. A
-# run that declares its images elsewhere is aliased onto the first (:func:`alias_images_column`).
-_VISION_ROUTE_COLUMN = "images"
-_VISION_ROUTE_COLUMNS = (_VISION_ROUTE_COLUMN, "image")
+# TRL's preference trainers read the raw image spellings off the first sample to pick the vision
+# branch, and list only these among their signature columns. A run that declares its images
+# elsewhere is aliased onto the first (:func:`alias_images_column`).
+_VISION_ROUTE_COLUMN = VLM_RAW_IMAGE_COLUMNS[0]
 # The tools column TRL's RewardTrainer hands to the chat template (:func:`alias_tools_column`).
 _TOOLS_ROUTE_COLUMN = "tools"
 
@@ -183,12 +186,11 @@ def _reject_divergent_split_presence(dataset: DatasetDict, path: str) -> None:
     """
     if get_global_world_size() <= 1:
         return
-    splits = ("train", "test")
-    present = torch.tensor([1 if name in dataset else 0 for name in splits], device=current_device())
-    anywhere, everywhere = present.clone(), present.clone()
-    dist.all_reduce(anywhere, op=dist.ReduceOp.MAX)
-    dist.all_reduce(everywhere, op=dist.ReduceOp.MIN)
-    diverged = [name for name, hi, lo in zip(splits, anywhere.tolist(), everywhere.tolist(), strict=True) if hi != lo]
+    diverged = []
+    for name in ("train", "test"):
+        everywhere, anywhere = rank_consensus(name in dataset)
+        if anywhere and not everywhere:
+            diverged.append(name)
     if diverged:
         raise ValueError(
             f"Dataset {path} loaded split(s) {diverged} on some ranks but not others — the per-rank "
@@ -209,8 +211,9 @@ def _load_dataset_from_path(
     """Load a dataset and ensure train/test splits; returns ``(dataset, sharded)``.
 
     For sharded datasets each rank loads only its assigned shards when data_parallel_size > 1
-    (``sharded=True``, each DP rank then holding a rank-specific slice). Without a test split:
-    re-split train by test_size, else use the first 100 train rows as test.
+    (``sharded=True``, each DP rank then holding a rank-specific slice). A source with no test split
+    reads its validation split as test; with neither, train is re-split by test_size, else its first
+    100 rows are used as test.
     ``placeholder_test=False`` returns a train-only source as a train-only ``DatasetDict`` instead.
     """
     # Cross-rank-agreed probe: a per-rank S3-creds fault must not split ranks onto different data
@@ -247,6 +250,10 @@ def _load_dataset_from_path(
                     f"Dataset {path} has no 'train' split (available splits: {available}). "
                     f"Append an '@split' selector to pick one, e.g. '{path}@{suggestion}'."
                 )
+            held_out = eval_split_name(dataset)
+            if held_out not in (None, "test"):
+                logger.info(f"Dataset {path} has no test split; its {held_out!r} split is the test split")
+                dataset["test"] = dataset.pop(held_out)
             if "test" not in dataset:
                 if test_size is not None:
                     dataset = dataset["train"].train_test_split(test_size, seed=_TRAIN_TEST_SPLIT_SEED)
@@ -383,7 +390,7 @@ def alias_images_column(dataset: DatasetDict, images_field: str | None, path: st
     verdicts identical.
     """
     return _alias_render_column(
-        dataset, "images_field", images_field, _VISION_ROUTE_COLUMN, _VISION_ROUTE_COLUMNS, path
+        dataset, "images_field", images_field, _VISION_ROUTE_COLUMN, VLM_RAW_IMAGE_COLUMNS, path
     )
 
 
@@ -649,15 +656,20 @@ def load_datasets(
 
     if len(ds["train"]) == 0:
         raise ValueError("No training data after schema normalization. Please check your dataset.")
-    else:
-        logger.info(f"Training data after schema normalization: {len(ds['train'])}")
-        logger.info(f"Columns in training dataset: {ds['train'].column_names}")
+    logger.info(f"Training data after schema normalization: {len(ds['train'])}")
+    logger.info(f"Columns in training dataset: {ds['train'].column_names}")
 
-    if len(ds["test"]) == 0:
+    test_empty = len(ds["test"]) == 0
+    if sharded:
+        # An eval split with fewer shards than ranks leaves some ranks none, which the trainer's
+        # pre-sharded eval equalization refuses world-uniformly once evaluation runs. Only a split
+        # empty on every rank is refused here: a rank raising alone would leave its peers blocked in
+        # their next collective.
+        test_empty, _ = rank_consensus(test_empty)
+    if test_empty:
         raise ValueError("No test data after schema normalization. Please check your dataset.")
-    else:
-        logger.info(f"Test data after schema normalization: {len(ds['test'])}")
-        logger.info(f"Columns in test dataset: {ds['test'].column_names}")
+    logger.info(f"Test data after schema normalization: {len(ds['test'])}")
+    logger.info(f"Columns in test dataset: {ds['test'].column_names}")
 
     # HF's own fingerprints diverge between writer and loader ranks, breaking downstream cache keys.
     # Unguarded: a failure here would leave the ranks disagreeing on every downstream cache key, and
@@ -712,6 +724,15 @@ def load_preprocessed_dataset(
     Pass the data-parallel rank/size, not global rank/world_size: CP/TP-group siblings must share
     data, while EP ranks (orthogonal to DP) get disjoint shards.
     """
+    if parse_dataset_source(path)[0] == "hf_hub":
+        # Refused on every rank alike, off the path string. ``load_dataset`` infers the Json builder
+        # from the saved tree's ``state.json`` sidecars and would hand back those as rows.
+        raise ValueError(
+            f"Pre-processed dataset {path} is on the Hub, which training does not read in place. "
+            f"Download it (hf download {hub_repo_id(path)} --repo-type dataset --local-dir <dir>) "
+            f"and point dataset at <dir>."
+        )
+
     if is_sharded_dataset_coordinated(path):
         logger.info(f"Loading sharded pre-processed dataset from {path}")
         logger.info(f"  Data parallel rank: {data_parallel_rank}/{data_parallel_size}")

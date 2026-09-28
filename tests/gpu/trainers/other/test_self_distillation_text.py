@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""Test: DistributedSelfDistillationTrainer (SDPG) on a text LLM — single-GPU smoke.
+"""Test: DistributedSelfDistillationTrainer (offline SDPG approximation) on a text LLM — single-GPU smoke.
 
-Validates the text SDPG self-distillation path end-to-end under TRL 1.6:
-1. SelfDistillTextCollator emits the student batch + teacher_* branch (privileged hint) with
-   byte-identical response tokens.
-2. The trainer runs the student + privileged-teacher forward and computes
-   L = L_sft + beta(k) * L_OPD on the shared response tokens (opd_loss metric recorded).
+Runs the text self-distillation path end-to-end under TRL 1.6: SelfDistillTextCollator builds the
+student batch plus the privileged-hint teacher_* branch, and the trainer runs the student and
+teacher forwards for L = L_sft + beta(k) * L_OPD. It checks only that every configured step ran,
+that every logged step loss is finite and that the opd_loss metric was recorded (the
+privileged-teacher forward ran); it does not compare either loss term against a reference. The
+student/teacher response-token alignment is pinned on CPU by
+tests/cpu/trainers/test_self_distillation_text_collator.py.
 
 Model defaults to Qwen3-0.6B (CI); set HALO_TEST_MODEL to override (e.g. Qwen/Qwen3.5-4B).
 
@@ -24,7 +26,7 @@ from src.env import env_str
 from src.trainers.distillation.self_distillation import DistributedSelfDistillationTrainer
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import log
+from tests.common.utils import log, step_losses
 
 MODEL_NAME = env_str("HALO_TEST_MODEL", QWEN3_0_6B)
 NUM_TRAIN_SAMPLES = 16
@@ -83,6 +85,7 @@ def run(ctx) -> dict:
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=512,
         dataloader_drop_last=True,
         dataset_num_proc=1,
@@ -105,15 +108,15 @@ def run(ctx) -> dict:
 
     trainer.train()
 
-    losses = [e["loss"] for e in trainer.state.log_history if "loss" in e]
+    losses = step_losses(trainer)
     opd = [e["opd_loss"] for e in trainer.state.log_history if "opd_loss" in e]
     if opd:
         log(f"OPD loss recorded: {opd[0]:.4f}")
 
     return {
         "checks": {
-            "enough_steps_logged": len(losses) >= 2,
-            "losses_finite": all(torch.isfinite(torch.tensor(v)) for v in losses),
+            "steps_completed": trainer.state.global_step == NUM_TRAIN_STEPS,
+            "losses_finite": bool(losses) and all(torch.isfinite(torch.tensor(v)) for v in losses),
             # No opd_loss metric ⇒ the privileged-teacher forward never ran.
             "opd_loss_recorded": bool(opd),
         }

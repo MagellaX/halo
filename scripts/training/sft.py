@@ -9,11 +9,11 @@ pre-processed datasets, QLoRA and ``init_from_scratch``; the VLM path loads an
 not apply to images).
 
 Supported Parallelism Modes: EP, CP, TP, EP+CP, EP+TP (TP+CP unsupported; CP incompatible with
-padding-free, and CP patches only the text-decoder attention on VLMs).
+padding-free, and CP is text-only: the CP wrapper raises on a batch carrying ``pixel_values``).
 
 Usage:
     torchrun --nproc_per_node=8 scripts/training/sft.py \\
-        examples/sft/gptoss/gptoss-20b-multinode-ep.yaml --expert_parallel_size=8
+        examples/sft/qwen3_5/qwen3.5-35b-a3b-ultrachat-ep.yaml
 """
 
 from accelerate.logging import get_logger
@@ -30,11 +30,10 @@ from src.data.pipeline.processing import (
     process_dataset_with_map_and_filter,
     resolve_map_num_proc,
 )
-from src.data.pipeline.row_processors import create_llm_processor
+from src.data.pipeline.row_processors import create_llm_processor, text_render_kwargs
 from src.data.pipeline.vlm_dataset import prepare_vlm_dataset, vlm_map_features
 from src.data.probe_consensus import agree_probe_across_ranks
 from src.data.sources.loading import load_datasets_auto
-from src.data.vlm import is_vlm_run
 from src.distributed.loading.peft_setup import setup_peft_model
 from src.distributed.loading.vlm_setup import load_model_for_training
 from src.distributed.runtime import barrier, init_distributed, is_global_main_process
@@ -54,8 +53,9 @@ from src.training.script_runner import (
     install_resolved_tokenizer,
     load_script_datasets,
     log_script_dataset_examples,
-    reject_images_under_text_only_model,
-    reject_unsupported_args,
+    reject_non_default_args,
+    reject_trl_dataset_prep_args,
+    resolve_vlm_run,
     run_trainer,
 )
 
@@ -98,27 +98,13 @@ def _prepare_text_data(ds, is_preprocessed, args, sft_config, model_config, toke
     else:
         collator_packing = sft_config.packing
         use_padding = not sft_config.padding_free
-        common = {
-            "tokenizer": tokenizer,
-            "max_length": sft_config.max_length,
-            "conversation_field": args.conversation_field,
-            "system_prompt": args.system_prompt,
-            "model_supports_system_role": args.model_supports_system_role,
-            "interleaved_thinking": args.interleaved_thinking,
-            "tools_field": args.tools_field,
-        }
+        cache_extras = text_render_kwargs(args)
+        common = {"tokenizer": tokenizer, "max_length": sft_config.max_length, **cache_extras}
         train_processor = create_llm_processor(**common, add_generation_prompt=False, use_padding=use_padding)
         generate_processor = create_llm_processor(**common, add_generation_prompt=True, use_padding=True)
         # sorted: this list feeds the coordinated-map cache key — set order is hash-randomized per process.
         extra_columns = sorted(set(ds["train"].column_names))
         map_kwargs = {"num_proc": resolve_map_num_proc(sft_config.dataset_num_proc)}
-        cache_extras = {
-            "conversation_field": args.conversation_field,
-            "system_prompt": args.system_prompt,
-            "model_supports_system_role": args.model_supports_system_role,
-            "interleaved_thinking": args.interleaved_thinking,
-            "tools_field": args.tools_field,
-        }
         # Build the generation set from the raw test split before the train map remaps `ds`.
         generate_dataset = process_dataset_with_map_and_filter(
             ds["test"],
@@ -235,39 +221,66 @@ def main():
         )
     if sft_config.packing and sft_config.padding_free:
         raise ValueError("Cannot use both 'packing' and 'padding_free' simultaneously.")
-    # TRL applies these inside its own dataset prep + default collator, both replaced here, so they would
-    # parse and mask nothing. Completion masking is train_on_completions_only + assistant_message_template.
-    reject_unsupported_args(
+    if sft_config.eval_packing and not sft_config.packing:
+        raise ValueError(
+            "eval_packing=True packs nothing without packing=True: it can only turn packing off for the "
+            "eval split. Set packing: true to pack both splits, or remove eval_packing."
+        )
+    reject_trl_dataset_prep_args(
         "Halo SFT",
-        # Tri-state: an explicit False ("train on the full sequence") is ignored the same as True.
-        completion_only_loss=sft_config.completion_only_loss is not None,
-        assistant_only_loss=sft_config.assistant_only_loss,
+        sft_config,
+        render_remedy="it renders conversation_field itself; tokenize a raw-text column offline with "
+        "scripts/before_training/prepare_dataset.py --mode text",
     )
 
-    # The checkpoint's modality picks the processing class and the run label, both needed before the
-    # dataset exists. Pinned like the model load: an unpinned probe reads hub `main`, whose config can
+    # The checkpoint's modality names the run, which init_training_script needs before the dataset
+    # exists. Pinned like the model load: an unpinned probe reads hub `main`, whose config can
     # name a different modality than the commit this run trains. The process group is initialized
     # first (init_training_script's own call is then a no-op) because the main-rank-first ordering
     # that guards transformers' unlocked remote-code module cache needs a live group; without it
     # every rank of every node fetches at once.
     init_distributed()
-    is_vlm_checkpoint = is_vlm_model(model_config.model_name_or_path, revision=model_config.model_revision)
+    is_vlm_checkpoint = is_vlm_model(
+        model_config.model_name_or_path,
+        revision=model_config.model_revision,
+        trust_remote_code=model_config.trust_remote_code,
+    )
     runtime = init_training_script(
         args,
         sft_config,
         model_config,
         dist_args,
         script_prefix=f"sft{'-vlm' if is_vlm_checkpoint and not dist_args.text_only_model else ''}",
+        trainer_cls=DistributedSFTTrainer,
         sync_tokens=("eos_token", "pad_token"),
         allow_low_precision=True,
         supports_init_from_scratch=True,
     )
     parallelism_config = runtime.parallelism_config
 
-    model, processing_class, tokenizer, is_vlm_checkpoint = load_model_for_training(
+    (ds, is_preprocessed), dataset_presharded = load_script_datasets(
+        args,
+        parallelism_config,
+        loader=load_datasets_auto,
+        conversation_field=args.conversation_field,
+    )
+    if is_preprocessed:
+        # Both splits are used as baked, so eval_packing has nothing to decide.
+        reject_non_default_args("Halo SFT on a pre-processed dataset", sft_config, "eval_packing")
+
+    # The run's data path, decided before the model load because it also decides whether the
+    # checkpoint's processor is required: a multimodal checkpoint carrying text-only rows is a text
+    # run, and packing / padding_free / train_on_last_assistant_only stay legal for it. The model
+    # class is unaffected; it follows the checkpoint.
+    is_vlm = resolve_vlm_run(
+        args, model_config, ds, text_only_model=dist_args.text_only_model, vlm_checkpoint=is_vlm_checkpoint
+    )
+
+    model, processing_class, tokenizer, _ = load_model_for_training(
         model_config,
         sft_config,
         parallelism_config,
+        vlm_run=is_vlm,
         reset_sinks=dist_args.reset_sinks,
         train_sinks=dist_args.train_sinks,
         init_from_scratch=dist_args.init_from_scratch,
@@ -283,24 +296,11 @@ def main():
             "memory); it cannot default to the model context window. Set max_length in the config."
         )
     tokenizer = apply_max_length(sft_config, args, model, tokenizer)
-    processing_class = install_resolved_tokenizer(processing_class, tokenizer, is_vlm_checkpoint)
+    processing_class = install_resolved_tokenizer(processing_class, tokenizer)
+    enforce_text_path_padding_side(tokenizer, is_vlm)
 
     peft_config = setup_peft_model(args, model, model_config, "CAUSAL_LM")
     log_model_info(model, tokenizer)
-
-    (ds, is_preprocessed), dataset_presharded = load_script_datasets(
-        args,
-        parallelism_config,
-        loader=load_datasets_auto,
-        conversation_field=args.conversation_field,
-    )
-
-    # The run's data path, decided now that the dataset is known: a multimodal checkpoint carrying
-    # text-only rows is a text run, and packing / padding_free / train_on_last_assistant_only stay
-    # legal for it. The model class is unaffected; it was resolved from the checkpoint above.
-    reject_images_under_text_only_model(args, ds, text_only_model=dist_args.text_only_model)
-    is_vlm = is_vlm_run(args, model_config.model_name_or_path, ds, config=model.config)
-    enforce_text_path_padding_side(tokenizer, is_vlm)
 
     if is_vlm:
         train_dataset, eval_dataset, generate_dataset, collator = _prepare_vlm_data(

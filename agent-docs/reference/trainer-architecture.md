@@ -9,13 +9,13 @@ composes its seven sibling sub-mixins:
 
 | Sub-mixin | Owns |
 |---|---|
-| `CheckpointingMixin` | Save / resume, plus the LR-scheduler and router-balancing-bias sidecars |
+| `CheckpointingMixin` | Save / resume, plus the LR-scheduler and router-balancing-bias sidecars and a per-trainer sidecar hook |
 | `DataParallelDataLoaderMixin` | Parallelism-aware DP dataloaders |
 | `EpIntrospectionMixin` | EP module/param discovery, EP-safe gradient checkpointing |
 | `GradientSyncMixin` | The per-mode FSDP2 wrap, the QLoRA / deferred-EP / TP-replicated grad sweeps, the EP/DTensor-aware global-norm clips |
 | `ParallelismValidationMixin` | Mode and LoRA/EP/TP compatibility checks |
 | `PipelineTrainerMixin` | PP hooks, inert unless `pp_size > 1` |
-| `TokenMetricsMixin` | The loss-token counter behind `train/total_output_tokens`: an on-device per-step accumulator, gathered once per log |
+| `TokenMetricsMixin` | The loss-token counter behind `num_unmasked_output_tokens_seen`: an on-device per-step accumulator, gathered once per log |
 
 Each is a class because it reads live trainer state; the methods a test or a caller reaches as
 `DistributedTrainerMixin.<name>` resolve through the MRO unchanged. `CheckpointingMixin`'s zero-arg
@@ -104,13 +104,15 @@ on the **run** (`is_vlm_run`): the VLM data path needs a multimodal checkpoint *
 data, so text-only rows on a natively-multimodal model (Qwen3.5/3.6, Gemma 4, Inkling) train through
 the text pipeline with packing available ([declaration rules](../data/dataset-formats.md#sft-vlm)).
 
-KTO takes its processor **class** from the checkpoint (`install_resolved_tokenizer` keeps the
-processor a multimodal checkpoint resolved to) but routes its data path off the **dataset**, as
-`scripts/training/preference/kto.py` states. The model class always follows the checkpoint.
+KTO routes its data path off the **dataset** (TRL's own column probe), as
+`scripts/training/preference/kto.py` states. The model class always follows the checkpoint. SFT,
+DPO, KTO, SMPO and distillation load the processing class by the rule in
+[SFT — VLMs](../training-methods/sft.md#vision-language-models); reward modeling loads the processor
+for an image run only.
 
 | Method | Vision | Notes |
 |---|---|---|
-| SFT | Yes | Conversation-embedded images or an `images_field` column; packing/padding-free rejected on the VLM path; CP patches text attention only. See [SFT — VLMs](../training-methods/sft.md#vision-language-models) |
+| SFT | Yes | Conversation-embedded images or an `images_field` column; packing/padding-free rejected on the VLM path; CP is text-only (the CP wrapper raises on a batch carrying `pixel_values`). See [SFT — VLMs](../training-methods/sft.md#vision-language-models) |
 | DPO / KTO | Yes | `images`/`image` column routes to TRL's vision collators. Vision excludes `precompute_ref_log_probs`, so EP DPO needs standard-PEFT adapters |
 | SMPO | Yes | `DataCollatorForVLMSMPO` processes images at collation; CP, padding-free and PP are text-only. See [SMPO — VLMs](../training-methods/preference/smpo.md) |
 | Teacher distillation | Yes | Student and teacher share the processor's vision geometry; over-length rows pre-filtered |
@@ -199,10 +201,13 @@ hijacked onto the mixin's FSDP2. An MoE whose experts are already wrapped under 
 raises here.
 
 `_setup_ep_only()` patches gradient clipping and installs the EP gradient sync (which applies FSDP2
-with EP modules in `ignored_params`); it handles EP, pure ETP, and EP+ETP. CP setup validates the
+with EP modules in `ignored_params`, except at `ep_group_size == 1` —
+[below](#gradient-synchronization)); it handles EP, pure ETP, and EP+ETP. CP setup validates the
 model is already a `UlyssesCPModelWrapper` (wrapped at load time). FSDP2 (`fully_shard`,
 `reshard_after_forward` from `fsdp_reshard_after_forward`, default `false`) carries non-EP gradient
-sync wherever DP > 1 — pure TP and EP+TP at DP=1 skip the wrap entirely.
+sync wherever DP > 1 — pure TP and EP+TP at DP=1 skip the wrap entirely. The wrap leaves out
+frozen parameters of a dtype no trainable parameter shares, and raises if it would leave out a
+trainable one nothing else syncs ([Data Parallelism](../parallelism/data-parallelism.md#fsdp2-strategy-by-mode)).
 
 QLoRA skips FSDP2 on both the plain-DP and the CP path (`fully_shard` cannot wrap bnb's non-float
 `Params4bit`). `_setup_qlora_gradient_sync` sets a flag rather than per-parameter hooks, whose
@@ -242,9 +247,9 @@ In CP-only mode each rank computes partial gradients from its chunk and FSDP ave
 correct global mean (`effective_grad = (1/cp_size) * sum(partial_grad_i)`). In EP+TP with DP=1,
 DTensor and EP hooks alone sync; with DP>1, FSDP2 syncs non-EP params across nodes.
 
-Clipping and sync read their process groups (TP, DP, dispatch-EP, expert-TP, expert-replica) through
-one `ParallelDims` view (`src/distributed/mesh.py`) rather than re-deriving mesh lookups
-per call site.
+Clipping and sync read the mesh groups (TP, DP) through the `ParallelDims` view
+(`src/distributed/mesh.py`) and the expert groups (dispatch-EP, expert-TP, expert-replica) off
+`EPConfig`, rather than re-deriving them per call site.
 
 ### EP-aware gradient clipping
 
@@ -409,7 +414,8 @@ sends, and resets the vLLM prefix cache — see
 [the gather](../training-methods/grpo/online-grpo.md#weight-sync) for what it collects.
 EP layers are found by `isinstance(module, EPMoELayerBase)` rather than an `ep_config` probe (a PEFT
 `modules_to_save` wrapper forwards `__getattr__` and would match the wrapper too), and PEFT/LoRA is
-merged into the base for the gather and forwarded under base-model param names.
+folded out of place into each base weight as it is sent, under base-model param names, without writing
+the frozen base ([PEFT](../optimization/peft.md#online-rl--rollout-server-weight-sync)).
 
 ## FSDP2 output capturing
 
@@ -439,6 +445,9 @@ Around it the mixin keeps the non-weight parts of a checkpoint: `_save_checkpoin
 `save_total_limit` rotation until the new checkpoint is complete),
 `_persist_lr_scheduler_for_resume`, and `_persist_router_balancing_biases` /
 `_restore_router_balancing_biases` for the `router_balancing_biases.pt` sidecar.
+`_persist_trainer_sidecars` is a trainer's own hook, called on every rank before rotation. The
+DPO/KTO precompute mixin overrides it to write `reference_logps.pt`; those trainers list the mixin
+ahead of `DistributedTrainerMixin` in their bases, so the empty default does not shadow it.
 
 `load_best_model_at_end` is refused at construction for every shape whose end-of-run reload is
 guaranteed to be refused: `cp_size > 1`, a MoE carrying EP or grouped-GEMM wrappers (`ep_size: 1`

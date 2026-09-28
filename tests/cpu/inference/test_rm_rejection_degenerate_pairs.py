@@ -8,21 +8,19 @@ hypotheses always skip; all-equal scores skip for preference output only (offlin
 full reward vector — the trainer's degenerate-group handling owns that case).
 
 *One record shape per output format.* The sampler writes two trainer contracts — preference and
-offline-GRPO — through the shared writers in ``scripts/inference/_common.py``, adding only what its
-own scorer knows; the tests below fail the moment the records drift away from those contracts.
+offline-GRPO; the tests below fail the moment the records drift away from those contracts.
 
 Run: pytest tests/cpu/inference/test_rm_rejection_degenerate_pairs.py
 """
 
 import json
-import sys
 import types
 
 import numpy as np
 import pytest
 
-from scripts.inference._common import degenerate_hypotheses_reason
 from scripts.inference.reward_model import rm_rejection_sampling as rm_rs
+from scripts.inference.reward_model.rm_rejection_sampling import degenerate_hypotheses_reason
 
 
 def test_single_hypothesis_is_degenerate_for_every_format():
@@ -109,7 +107,7 @@ def test_the_rewards_survive_json():
 
 _PREF_ARGS = types.SimpleNamespace(
     id_field="id",
-    model_name="gen-model",
+    model="gen-model",
     rm_model_path="rm-model",
 )
 _PREFERENCE_KEYS = {
@@ -148,4 +146,4 @@ def test_the_preference_pair_invents_no_id_its_source_row_lacks():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

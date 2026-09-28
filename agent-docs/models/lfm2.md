@@ -4,11 +4,9 @@ Liquid AI's `Lfm2MoeForCausalLM` — a hybrid MoE (interleaved short-convolution
 
 | | EP | CP | TP | ETP | PP | EP+TP |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
-| LFM-2 MoE | Yes | **No** | Yes | Yes | **No** | Yes |
+| LFM-2 MoE | Yes | **No** | Yes | Yes | — | Yes |
 
-PP is refused at load. `tie_word_embeddings` is `True` (the config-class default, which no released checkpoint overrides), and a tied checkpoint splits stage 0's embedding from the last stage's head with no reconcile, so the tie gate rejects it ([Pipeline Parallelism](../parallelism/pipeline-parallelism.md)).
-
-Setting the flag `false` is not a way around it: the released weights carry no `lm_head` tensor, so the untied head would train from random init.
+Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 ## EP wrapper
 
@@ -55,4 +53,4 @@ On a `use_expert_bias: false` checkpoint the slot is **materialized** at enable 
 
 `moe_balancing: auto` picks `bias_update` here. `Lfm2MoeForCausalLM` has no aux-loss path — no `output_router_logits` / `router_aux_loss_coef` config field, no router-logit output, no aux term in the loss — and a `forward` that declares no `output_router_logits` parameter is the signal `auto` keys on, so it takes the EP-wrapper bias wherever the wrappers apply (`ep_size > 1` or `use_grouped_gemm`, the default under torchrun).
 
-Without the wrappers nothing carries the bias and no aux term can reach the loss, so `auto` resolves to `none` with a warning; freeze the router there. See [Performance & Balancing Flags](../reference/configuration-reference.md#performance-balancing-flags) and [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback).
+Without the wrappers nothing carries the bias and no aux term can reach the loss, so `auto` resolves to `none` with a warning; freeze the router there. See [Performance & Balancing Flags](../reference/configuration-reference.md#performance--balancing-flags) and [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback).

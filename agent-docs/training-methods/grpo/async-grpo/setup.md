@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 DIST_NCCL_TIMEOUT_MINUTES=60 torchrun --nproc_per_n
     scripts/training/environmental_grpo.py <config>
 ```
 
-Add `--expert_parallel_size=4` for MoE expert distribution. `halo launch environmental-grpo <config> --nproc 4` builds the same line; `accelerate launch` works for plain data parallelism. Context and Pipeline Parallelism are rejected at config time.
+Add `--expert_parallel_size=4` for MoE expert distribution. `halo launch environmental-grpo <config> --nproc 4` builds the same line; `accelerate launch` works only for plain data parallelism on a dense model: on a MoE it refuses the grouped-GEMM expert wrappers that weight sync needs. Context and Pipeline Parallelism are rejected at config time.
 
 ## Expert parallelism group size
 

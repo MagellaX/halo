@@ -20,7 +20,8 @@ Two things only a GPU run can check:
    what fails when it does not.
 
 Both varlen kernels available on the host are covered, because the production default differs by
-architecture (FA4 on Blackwell, FA2 elsewhere) and the shape handling is per-kernel.
+architecture (FA4 on Blackwell, FA2 elsewhere) and the shape handling is per-kernel. On Blackwell an
+FA4 that fails to import fails the test rather than dropping out of the covered set.
 
 Usage::
 
@@ -35,9 +36,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.data.collators.packing import DataCollatorWithPacking
 from src.hardware import is_blackwell_gpu
 from tests.common.harness import gpu_test_main
+from tests.common.models import QWEN3_0_6B
 from tests.common.utils import cleanup_memory, log
 
-MODEL = "Qwen/Qwen3-0.6B"
+MODEL = QWEN3_0_6B
 # Rows of UNEQUAL length: collation pads row 0 and the flatten must drop that padding, so the seam
 # is row 0's last real token against row 1's first. Equal-length rows would sidestep that path.
 DOCS_ROW0 = ["The capital of France is Paris.", "Water boils at one hundred degrees."]
@@ -51,14 +53,13 @@ def _varlen_impls() -> list[str]:
     """The varlen kernels this host can actually dispatch, production default first."""
     impls = []
     if is_blackwell_gpu():
-        try:
-            from flash_attn.cute import flash_attn_func  # noqa: F401
+        # Unguarded: the Blackwell image always ships FA4, its production default, so an import
+        # failure is a broken install, and swallowing it would cover FA2 alone and still pass.
+        from flash_attn.cute import flash_attn_func  # noqa: PLC0415, F401
 
-            impls.append("flash_attention_4")
-        except Exception:
-            pass
+        impls.append("flash_attention_4")
     try:
-        import flash_attn  # noqa: F401
+        import flash_attn  # noqa: PLC0415, F401
 
         impls.append("flash_attention_2")
     except ImportError:

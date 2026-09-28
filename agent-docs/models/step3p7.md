@@ -6,7 +6,7 @@
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | Step-3.7 Flash | Yes | **No** | **No** | Yes | — ¹ | Yes |
 
-¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md) — the shipped split contract for the family is under [Limitations](#limitations).
+¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 ## Architecture
 
@@ -19,7 +19,7 @@
 
     Layers 43–44 clamp the routed SwiGLU at 7 (`swiglu_limits`, applied **after** the activation) and the shared expert at 16 (`swiglu_limits_shared`); every other layer runs unclamped.
 
-- **MTP** — the checkpoint ships 3 MTP tail layers (indices 45–47); transformers never builds them (their keys are ignored on load), so every export ships without them. The config field `num_nextn_predict_layers: 3` survives as metadata; the PP gate rejects only live MTP layers, so it passes.
+- **MTP** — the checkpoint ships 3 MTP tail layers (indices 45–47); transformers never builds them (their keys are ignored on load), so every export ships without them. The config field `num_nextn_predict_layers: 3` survives as metadata.
 
 ## Checkpoint
 
@@ -45,7 +45,9 @@ A source that itself declares no `auto_map` (a synthetic checkpoint) has no sche
 
 The checkpoint is a composite VLM with **no text-only CausalLM sibling** in transformers, so `text_only_model` is refused for this family — and the refusal sees through the hub config's poisoned `auto_map`, whose `AutoModelForCausalLM` entry is the remote-code *conditional-generation* class itself, not a text-only sibling (`resolve_auto_model_class` rejects a masquerading entry). The composite class loads through the shared VLM path; a text-only dataset still takes the text data path ([SFT — VLMs](../training-methods/sft.md#vision-language-models)).
 
-Native `AutoProcessor` is broken for the repo (it ships no `preprocessor_config.json`; the only processor is remote code). Text-only training needs neither: the text path uses the native `AutoTokenizer`, which carries the chat template (`<|im_start|>`/`<|im_end|>` roles, a `reasoning_effort` template variable, and a generation prompt that forces `<think>`).
+Train with `trust_remote_code: false` (the default). The repo's `auto_map` names remote-code config, processor and modeling classes for the serving engines; trusting it makes `AutoConfig` return the remote config, which the native class cannot build from (`StepRoboticsVisionEncoderConfig` has no `hidden_size`).
+
+The repo ships no native processor config (`processor_config.json` / `preprocessor_config.json`; its only processor is remote code), so a text run takes the native `AutoTokenizer` as its processing class ([SFT — VLMs](../training-methods/sft.md#vision-language-models)). It carries the chat template: `<|im_start|>`/`<|im_end|>` roles, a `reasoning_effort` template variable, and a generation prompt that forces `<think>`. An image-data run requires the native `Step3p7Processor` and stops at its load unless a processor config sits beside the checkpoint. `tests/cpu/models/test_run_processing_class.py` pins that choice on a tiny checkpoint — the tokenizer for a text run without a processor config, the refusal for an image run without one, `Step3p7Processor` for either run with one — but no test trains on image data.
 
 Two tokenizer facts to hold:
 
@@ -99,10 +101,6 @@ Upstream declares `_supports_flash_attn = False`; SDPA is the only fast backend 
 
 - **CP** — `Step3p7Attention` has no Ulysses wrapper registered, so validation rejects the model as having no supported attention module ([Context Parallelism](../parallelism/context-parallelism.md#supported-model-architectures)). Nothing architectural blocks a wrapper: both head counts (64 full / 96 sliding) and the 8 KV heads divide cp 2/4/8.
 - **TP** — the per-layer head counts fit no uniform q/k/v shard plan, so `Step3p7Attention` is outside the selective-TP accept-list and `tensor_parallel_size > 1` is rejected (zero shardable layers).
-- **PP** — [not yet available in this release](../parallelism/pipeline-parallelism.md). The shipped contract admits the composite class (the only class the family ships) only for a run that feeds no images: the vision tower and projector are held by no stage and re-emitted unchanged in every checkpoint, and image data refuses the run.
-
-    The text tower splits with untied embeddings and a hidden-states-only residual; split offsets follow the period-4 `full,s,s,s` layer list.
-
 - **Packing** — isolated: the layers are plain full/sliding attention (no conv or linear-attention mixers) and the forward feeds `position_ids` into both mask constructions, verified bit-exact through dense layers on SDPA and eager; through MoE layers doc-B drift is expert-summation reduction noise (~1e-7 fp32).
 
     The isolation holds on the training path only (`use_cache=False`; a live cache suppresses the packed mask, as DeepSeek-V4). See [Collators](../data/collators.md#document-isolation-under-packing).
@@ -111,6 +109,6 @@ Upstream declares `_supports_flash_attn = False`; SDPA is the only fast backend 
 
 | Config | Topology | Notes |
 |---|---|---|
-| `examples/sft/step3p7/step-3.7-flash-ultrachat-ep-lora.yaml` | EP=8, 1×8 | LoRA + expert-LoRA — the single-node shape with headroom (~65 GB static of a 275 GB Blackwell card, expected); full FT at ep8 is ~190 GB of experts at 8 B/param, ~213 GB static — marginal and unmeasured |
+| `examples/sft/step3p7/step-3.7-flash-ultrachat-ep-lora.yaml` | EP=8, 1×8 | LoRA + expert-LoRA — the single-node shape with headroom (~65 GB static of a 288 GB Blackwell card, expected); full FT at ep8 is ~190 GB of experts at 8 B/param, ~213 GB static — marginal and unmeasured |
 
 The config points `model_name_or_path` at the hub repo directly (bf16 release). Full fine-tuning takes cross-node EP (`ep_scope: global`, e.g. EP=16 across 2×8), where the Gin dispatch ceiling caps `per_device_train_batch_size × max_length` at 8192 tokens/rank ([DeepEP](../infrastructure/deepep.md#expert-parallelism-over-aws-efa)).

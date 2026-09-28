@@ -78,12 +78,12 @@ A rejection test asserts the *reason*, not just that something raised:
 
 ```python
 import pytest
-with pytest.raises(ValueError, match="not supported"):   # CPU: ParallelismConfig(...)
+with pytest.raises(ValueError, match="is not a supported parallelism combination"):   # CPU: ParallelismConfig(...)
     ...
 ```
 
 For trainer-init rejections (`_supports_cp=False`), a pure class-attribute check can live in
-a CPU test (see `tests/gpu/parallelism/cp/test_cp_rejection.py` for the existing
+a CPU test (see `tests/cpu/parallelism/test_cp_support_declared.py` for the existing
 attribute-inspection pattern, and `tests/cpu/parallelism/test_parallelism_config.py` for
 config-level rejections).
 

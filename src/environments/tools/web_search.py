@@ -157,6 +157,7 @@ def _http_backend(spec: HttpSearchSpec) -> SearchBackend:
     return SearchBackend(sync=partial(_sync_call, spec), async_=partial(_async_call, spec), env_key=spec.env_key)
 
 
+# Insertion order is the auto-select priority; the keyless last entry always qualifies.
 _BACKENDS: dict[str, SearchBackend] = {
     "serper": _http_backend(_SERPER),
     "brave": _http_backend(_BRAVE),
@@ -164,10 +165,8 @@ _BACKENDS: dict[str, SearchBackend] = {
     "duckduckgo": SearchBackend(sync=_search_duckduckgo, async_=_async_search_duckduckgo),
 }
 
-_BACKEND_PRIORITY = ["serper", "brave", "tavily", "duckduckgo"]
-
-# Fabricated snippets score ``tool_success_reward`` like a real search, so this backend is not
-# selectable from a training YAML; the demo playground opts in through the flag below.
+# Fabricated snippets score ``tool_success_reward`` like a real search, so naming this backend
+# requires the flag below (read per call); tests and smoke runs set it.
 _MOCK_BACKEND = SearchBackend(sync=_search_mock, async_=_async_search_mock)
 _ALLOW_MOCK_SEARCH_FLAG = "HALO_ALLOW_MOCK_SEARCH"
 
@@ -181,15 +180,8 @@ def _selectable_backends() -> dict[str, SearchBackend]:
 
 
 def _auto_select_backend() -> str:
-    """The first backend in priority order this environment can reach (keyless, or key present)."""
-    for name in _BACKEND_PRIORITY:
-        env_key = _BACKENDS[name].env_key
-        if env_key is None or env_str(env_key):
-            return name
-    raise RuntimeError(
-        f"No search backend is selectable: every entry in {_BACKEND_PRIORITY} requires an API key "
-        f"and none is set. Set one of their env vars, or restore a keyless backend to the priority list."
-    )
+    """The first backend in :data:`_BACKENDS` order this environment can reach (keyless, or key present)."""
+    return next(name for name, spec in _BACKENDS.items() if spec.env_key is None or env_str(spec.env_key))
 
 
 def validate_search_backend(backend: str | None) -> None:

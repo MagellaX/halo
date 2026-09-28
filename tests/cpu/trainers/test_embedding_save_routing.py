@@ -17,14 +17,25 @@ import torch
 import torch.nn as nn
 from peft import LoraConfig, inject_adapter_in_model
 
+from src.distributed.expert_parallel.base_layer import find_ep_layers
 from src.trainers.embedding import trainer as embedding_module
 from src.trainers.embedding.trainer import EmbeddingTrainer
+from tests.common.ep_stubs import StubEPLayerBase
+from tests.common.peft_helpers import randomize_adapters
 
 
 class _Backbone(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(4, 4, bias=False)
+
+
+class _SharedExpertEPLayer(StubEPLayerBase):
+    """An EP layer holding the block's shared experts, which the EP layers adopt as a child."""
+
+    def __init__(self):
+        super().__init__()
+        self.shared_experts = nn.Linear(4, 4, bias=False)
 
 
 class _SentenceTransformerLike(nn.Module):
@@ -38,11 +49,8 @@ class _SentenceTransformerLike(nn.Module):
 def _host(*, has_lora: bool = False, is_save_rank: bool = True, max_shard_size: str = "3GB"):
     backbone = _Backbone()
     if has_lora:
-        # inject_adapter_in_model's in-place layout: "<module>.lora_A.<adapter>.weight".
-        adapters = nn.Module()
-        adapters.lora_A = nn.ModuleDict({"default": nn.Linear(4, 2, bias=False)})
-        adapters.lora_B = nn.ModuleDict({"default": nn.Linear(2, 4, bias=False)})
-        backbone.add_module("q_proj", adapters)
+        inject_adapter_in_model(LoraConfig(r=2, lora_alpha=8, target_modules=["linear"]), backbone)
+        randomize_adapters(backbone, lora_b_only=True)
     top = _SentenceTransformerLike(backbone)
 
     host = object.__new__(EmbeddingTrainer)
@@ -124,7 +132,7 @@ def test_gathered_lora_save_retains_only_on_the_writer(monkeypatch, tmp_path):
     ctx = _context(host, monkeypatch)
     seen = {}
 
-    def _gather(model, retain: bool = True):
+    def _gather(model, retain: bool = True, items=None):
         seen["retain"] = retain
         return {}
 
@@ -137,28 +145,23 @@ def test_gathered_lora_save_retains_only_on_the_writer(monkeypatch, tmp_path):
     assert "wrote" not in seen  # a non-writer rank runs the collective and nothing else
 
 
-def test_gathered_lora_save_writes_through_the_shared_writer(monkeypatch, tmp_path):
-    """The merged dict must go through ``write_gathered_checkpoint``.
+def test_gathered_lora_save_writes_the_fold_through_the_shared_writer(monkeypatch, tmp_path):
+    """The folded tensors must go through ``write_gathered_checkpoint``, under the plain names.
 
-    Writing it straight to ``save_sharded_state_dict`` skips ``normalize_gathered_state_dict``, so an
+    Writing them straight to ``save_sharded_state_dict`` skips ``normalize_gathered_state_dict``, so an
     fp32-master run exports fp32 while the same model under EP/TP exports the save dtype, a MoE
     backbone exports module-fused expert keys vLLM rejects, and there is no ``.bin`` recovery.
     """
     host, backbone, _ = _host(has_lora=True, is_save_rank=True)
-    # The fixture's adapters are plain modules, not LoraLayers; the fold factor is not under test here.
-    host._lora_scaling = lambda backbone: 1.0
     ctx = _context(host, monkeypatch)
+    layer = backbone.linear
+    expected = layer.base_layer.weight + layer.get_delta_weight("default")
+    assert not torch.equal(expected, layer.base_layer.weight), "premise: the adapter moves its base"
     written = {}
-
-    monkeypatch.setattr(
-        embedding_module,
-        "gather_saveable_tensors",
-        lambda model, retain=True: {"linear.base_layer.weight": torch.zeros(4, 4)},
-    )
 
     def _write(model, state_dict, output_dir, max_shard_size=None):
         written["model"] = model
-        written["keys"] = sorted(state_dict)
+        written["state_dict"] = state_dict
         written["max_shard_size"] = max_shard_size
 
     monkeypatch.setattr(embedding_module, "write_gathered_checkpoint", _write)
@@ -167,19 +170,22 @@ def test_gathered_lora_save_writes_through_the_shared_writer(monkeypatch, tmp_pa
 
     assert written["model"] is backbone
     assert written["max_shard_size"] == ctx.max_shard_size
-    assert written["keys"] == ["linear.weight"]  # adapters folded, base_layer spelling gone
+    assert sorted(written["state_dict"]) == ["linear.weight"]  # adapters folded, base_layer spelling gone
+    assert torch.equal(written["state_dict"]["linear.weight"], expected.detach())
     assert host.processing_class.saved_to == str(tmp_path)
 
 
-def test_lora_fold_factor_is_the_live_adapter_scaling_or_a_raise():
-    """The fold multiplies ``B @ A`` by the adapter's ``lora_alpha / r``; a guessed 1.0 would export
-    wrong merged weights whenever the two differ, so a backbone with no LoraLayer scaling raises."""
-    backbone = inject_adapter_in_model(LoraConfig(r=2, lora_alpha=8, target_modules=["linear"]), _Backbone())
-    assert EmbeddingTrainer._lora_scaling(None, backbone) == 4.0
+def test_injected_lora_on_a_module_an_ep_layer_adopted_still_counts():
+    """An EP layer adopts the block's shared experts as children, so a target list that reaches only
+    those puts every adapter inside it. The run still trains injected LoRA: it must be folded on save
+    and refused under EP, which an EP-excluding scan would miss."""
+    layer = _SharedExpertEPLayer()
+    backbone = _Backbone()
+    backbone.add_module("moe", layer)
+    inject_adapter_in_model(LoraConfig(r=2, lora_alpha=4, target_modules=["shared_experts"]), backbone)
+    assert find_ep_layers(backbone) == [("moe", layer)], "premise: the adapters sit inside an EP layer"
 
-    unscaled, _, _ = _host(has_lora=True)
-    with pytest.raises(RuntimeError, match="no LoraLayer with an adapter scaling"):
-        EmbeddingTrainer._lora_scaling(None, unscaled._get_unwrapped_model())
+    assert EmbeddingTrainer._has_injected_lora(None, backbone)
 
 
 def test_save_model_runs_every_writer_under_pristine_model_max_length(monkeypatch, tmp_path):
@@ -211,6 +217,4 @@ def test_save_model_runs_every_writer_under_pristine_model_max_length(monkeypatc
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -13,7 +13,9 @@ cross-domain expert-replica groups. It exercises the membership math in
 EP group, i.e. only in multi-node.
 
 Validates, on GptOss-20B (32 experts):
-1. Topology: 2 node-local EP groups, ``needs_expert_grad_sync`` True (multi-group).
+1. Topology: 2 node-local EP groups with a deferred cross-replica sync (asserted on the config before
+   the load), the experts split ``ep_size``-way on the model, and the non-expert params FSDP-sharded
+   over the EP group.
 2. The cross-domain replica grad-sync actually runs and converges: expert weights are bit-identical
    across the two domains' replica ranks after training (a malformed replica/dispatch group from a
    rank-math bug would diverge or hang instead).
@@ -27,31 +29,23 @@ Run with 4 or 8 GPUs (simulates 2 domains of world//2):
         tests/gpu/trainers/sft/test_sft_ep_multinode_sim.py
 """
 
-import math
-import sys
-import traceback
-
 import torch
 import torch.distributed as dist
-from accelerate import PartialState
 from torch.distributed.tensor import DTensor
 from transformers import AutoTokenizer
 from trl import SFTConfig
 
-from src.distributed.expert_parallel.base_layer import EPMoELayerBase, has_grouped_mm
+from src.distributed.expert_parallel.base_layer import has_grouped_mm
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
 from src.trainers.sft import DistributedSFTTrainer
 from tests.common.datasets import create_sft_dataset
-from tests.common.distributed import (
-    cleanup_dirs,
-    ensure_model_downloaded,
-    init_distributed,
-    setup_cache_dirs,
-    teardown_distributed,
-)
+from tests.common.distributed import ensure_model_downloaded, group_max_abs_diff
+from tests.common.ep_reference import ep_layers
+from tests.common.harness import gpu_test_main
 from tests.common.models import GPT_OSS_20B
-from tests.common.utils import cleanup_memory, log
+from tests.common.parallel_shape import parallel_shape_checks
+from tests.common.utils import log, max_or_nan, training_run_checks
 
 MODEL_NAME = GPT_OSS_20B
 NUM_TRAIN_SAMPLES = 32
@@ -94,15 +88,16 @@ def _install_sweep_divisor_probe(trainer, ep_config, verdict: dict) -> None:
         named = [(n, p) for n, p in trainer._top_level_model().named_parameters() if id(p) in expert_ids]
         before = [(n, p, p.grad.detach().clone()) for n, p in named if p.grad is not None]
         original()
-        worst, scale = 0.0, 0.0
+        diffs, scale = [], 0.0
         for name, param, pre in before:
             expected = pre.float()
             if ep_config.expert_replica_group is not None:
                 dist.all_reduce(expected, op=dist.ReduceOp.SUM, group=ep_config.expert_replica_group)
             expected /= divisor
             actual = param.grad.float()
-            worst = max(worst, (actual - expected).abs().max().item())
+            diffs.append((actual - expected).abs().max().item())
             scale = max(scale, expected.abs().max().item())
+        worst = max_or_nan(diffs, default=0.0)
         # Anti-vacuity: a zero pre-image would make any divisor look right.
         verdict["sweep_pre_image_nonzero"] = scale > 0.0
         verdict["sweep_divisor"] = scale > 0.0 and worst <= SWEEP_DIVISOR_REL_TOL * scale
@@ -127,167 +122,135 @@ def _check_replica_consistency(model, ep_config) -> bool:
         log(f"  Replica consistency: FAIL (no cross-domain replica group; got {replica_group!r})")
         return False
 
-    ep_layers = [m for m in model.modules() if isinstance(m, EPMoELayerBase)]
-    if not ep_layers:
+    layers = ep_layers(model)
+    if not layers:
         log("  Replica consistency: FAIL (no EP layers found — expert parallelism did not engage)")
         return False
 
     # Probe the first expert parameter of the first EP layer.
-    named = list(ep_layers[0].expert_named_params())
+    named = list(layers[0].expert_named_params())
     if not named:
         log("  Replica consistency: FAIL (EP layer exposes no expert params)")
         return False
     _, weight = named[0]
-    local = weight.detach().contiguous()
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(replica_group))]
-    dist.all_gather(gathered, local, group=replica_group)
-    max_diff = max((g - gathered[0]).abs().max().item() for g in gathered)
+    max_diff = group_max_abs_diff(weight, replica_group)
     ok = max_diff == 0.0
     log(f"  Replica consistency: {'PASS' if ok else 'FAIL'} (max|Δ| across replicas = {max_diff:.2e})")
     return ok
 
 
-def main() -> int:
-    rank, world_size, local_rank = init_distributed()
-    PartialState()
+@gpu_test_main(min_world_size=4, prefix="sft_ep_multinode_sim")
+def run(ctx):
+    if ctx.world_size % 2 != 0:
+        raise ValueError(f"Need an even world size to simulate 2 domains; got {ctx.world_size}")
 
-    if world_size < 4 or world_size % 2 != 0:
-        log(f"Need an even world size >= 4 to simulate 2 domains; got {world_size}. Skipping.")
-        teardown_distributed()
-        return 0
-
-    simulated_gpus_per_node = world_size // 2  # ep_size per domain
+    simulated_gpus_per_node = ctx.world_size // 2  # ep_size per domain
 
     log(f"\n{'#' * 70}")
     log("  SFT node-local EP across SIMULATED 2 NVLink domains")
-    log(f"  World: {world_size}, simulated domain size: {simulated_gpus_per_node}")
+    log(f"  World: {ctx.world_size}, simulated domain size: {simulated_gpus_per_node}")
     log(f"  → ep_size={simulated_gpus_per_node}, expect 2 node-local EP groups + cross-domain replica sync")
     log(f"{'#' * 70}")
 
-    output_dir, cache_dir = setup_cache_dirs("sft_ep_multinode_sim", rank)
-    success = False
+    ensure_model_downloaded(MODEL_NAME, ctx.rank)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    try:
-        ensure_model_downloaded(MODEL_NAME, rank)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+    train_dataset = create_sft_dataset(NUM_TRAIN_SAMPLES, tokenizer, seed=SEED)
+    eval_dataset = create_sft_dataset(NUM_EVAL_SAMPLES, tokenizer, seed=SEED + 100)
 
-        train_dataset = create_sft_dataset(NUM_TRAIN_SAMPLES, tokenizer, seed=SEED)
-        eval_dataset = create_sft_dataset(NUM_EVAL_SAMPLES, tokenizer, seed=SEED + 100)
+    # Node-local multi-group EP across the two simulated domains: FSDP shards the non-expert
+    # params over each EP group, and the cross-domain replica average is DEFERRED to a
+    # post-backward sweep (is_deferred_dp) — this is the production multi-node MoE shape. HSDP is
+    # deliberately NOT used: for multi-group EP it is a no-op (the deferred sync already shards
+    # within-domain + replicates cross-domain) and ParallelismConfig rejects hsdp+EP.
+    parallelism_config = ParallelismConfig(
+        ep_size=simulated_gpus_per_node,
+        gpus_per_node=simulated_gpus_per_node,
+        ep_scope="node",
+        use_grouped_gemm=has_grouped_mm(),
+    )
+    log(f"Config: {parallelism_config.summary()}")
+    # The whole point — confirm we got the multi-group (multi-node) deferred-DP topology.
+    assert parallelism_config.num_ep_groups == 2, (
+        f"expected 2 node-local EP groups, got {parallelism_config.num_ep_groups}"
+    )
+    assert parallelism_config.create_ep_config().is_deferred_dp, (
+        "expected deferred cross-replica DP sync for multi-group node-local EP across 2 domains"
+    )
 
-        # Node-local multi-group EP across the two simulated domains: FSDP shards the non-expert
-        # params over each EP group, and the cross-domain replica average is DEFERRED to a
-        # post-backward sweep (is_deferred_dp) — this is the production multi-node MoE shape. HSDP is
-        # deliberately NOT used: for multi-group EP it is a no-op (the deferred sync already shards
-        # within-domain + replicates cross-domain) and ParallelismConfig rejects hsdp+EP.
-        parallelism_config = ParallelismConfig(
-            ep_size=simulated_gpus_per_node,
-            gpus_per_node=simulated_gpus_per_node,
-            ep_scope="node",
-            use_grouped_gemm=has_grouped_mm(),
-        )
-        log(f"Config: {parallelism_config.summary()}")
-        # The whole point — confirm we got the multi-group (multi-node) deferred-DP topology.
-        assert parallelism_config.num_ep_groups == 2, (
-            f"expected 2 node-local EP groups, got {parallelism_config.num_ep_groups}"
-        )
-        assert parallelism_config.create_ep_config().is_deferred_dp, (
-            "expected deferred cross-replica DP sync for multi-group node-local EP across 2 domains"
-        )
+    model, _ = load_distributed_model(
+        model_name_or_path=MODEL_NAME,
+        parallelism_config=parallelism_config,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="flex_attention",
+        use_liger_kernel=True,
+    )
 
-        model, _ = load_distributed_model(
-            model_name_or_path=MODEL_NAME,
-            parallelism_config=parallelism_config,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="flex_attention",
-            use_liger_kernel=True,
-        )
+    sft_config = SFTConfig(
+        output_dir=ctx.output_dir,
+        max_steps=NUM_TRAIN_STEPS,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=1,
+        learning_rate=LEARNING_RATE,
+        bf16=True,
+        gradient_checkpointing=True,
+        use_liger_kernel=False,
+        logging_steps=1,
+        save_strategy="no",
+        report_to="none",
+        logging_nan_inf_filter=False,
+        max_length=MAX_SEQ_LENGTH,
+        dataloader_drop_last=True,
+        dataloader_num_workers=0,
+        ddp_find_unused_parameters=True,
+        fsdp="",
+    )
+    trainer = DistributedSFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        parallelism_config=parallelism_config,
+    )
 
-        sft_config = SFTConfig(
-            output_dir=output_dir,
-            max_steps=NUM_TRAIN_STEPS,
-            per_device_train_batch_size=BATCH_SIZE,
-            gradient_accumulation_steps=1,
-            learning_rate=LEARNING_RATE,
-            bf16=True,
-            gradient_checkpointing=True,
-            use_liger_kernel=False,
-            logging_steps=1,
-            save_strategy="no",
-            report_to="none",
-            max_length=MAX_SEQ_LENGTH,
-            dataloader_drop_last=True,
-            dataloader_num_workers=0,
-            ddp_find_unused_parameters=True,
-            fsdp="",
-        )
-        trainer = DistributedSFTTrainer(
-            model=model,
-            args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=tokenizer,
-            parallelism_config=parallelism_config,
-        )
+    ep_config = parallelism_config.create_ep_config()
+    log(f"EP groups={ep_config.num_ep_groups}, needs_expert_grad_sync={ep_config.needs_expert_grad_sync}")
+    shape_checks = parallel_shape_checks(model, parallelism_config)
 
-        ep_config = parallelism_config.create_ep_config()
-        log(f"EP groups={ep_config.num_ep_groups}, needs_expert_grad_sync={ep_config.needs_expert_grad_sync}")
+    sweep_verdict: dict[str, bool] = {}
+    _install_sweep_divisor_probe(trainer, ep_config, sweep_verdict)
 
-        sweep_verdict: dict[str, bool] = {}
-        _install_sweep_divisor_probe(trainer, ep_config, sweep_verdict)
+    train_result = trainer.train()
 
-        train_result = trainer.train()
-        step_losses = [e["loss"] for e in trainer.state.log_history if "loss" in e and "eval_loss" not in e]
-        log(f"\nFinal loss: {train_result.training_loss:.6f}")
-        log(f"Step losses: {[f'{l:.4f}' for l in step_losses]}")
+    # Non-expert params are FSDP-sharded over the EP group (1D mesh of ep_group_size), NOT a 2D
+    # HSDP mesh — the deferred sweep handles the cross-domain replica average. Confirm the
+    # sharding mesh is the expected 1D EP-group shape.
+    ep_group_size = parallelism_config.ep_group_size
+    sharded_over_ep_group = any(
+        isinstance(p.data, DTensor) and p.data.device_mesh.ndim == 1 and p.data.device_mesh.size() == ep_group_size
+        for p in model.parameters()
+    )
+    log(
+        f"  Non-expert params sharded over the EP group (1D mesh={ep_group_size}): "
+        f"{'PASS' if sharded_over_ep_group else 'FAIL'}"
+    )
 
-        # Non-expert params are FSDP-sharded over the EP group (1D mesh of ep_group_size), NOT a 2D
-        # HSDP mesh — the deferred sweep handles the cross-domain replica average. Confirm the
-        # sharding mesh is the expected 1D EP-group shape.
-        ep_group_size = parallelism_config.ep_group_size
-        sharded_over_ep_group = any(
-            isinstance(p.data, DTensor) and p.data.device_mesh.ndim == 1 and p.data.device_mesh.size() == ep_group_size
-            for p in model.parameters()
-        )
-        log(
-            f"  Non-expert params sharded over the EP group (1D mesh={ep_group_size}): "
-            f"{'PASS' if sharded_over_ep_group else 'FAIL'}"
-        )
-
-        checks = {
-            "two_ep_groups": ep_config.num_ep_groups == 2,
-            "needs_expert_grad_sync": bool(ep_config.needs_expert_grad_sync),
-            "is_deferred_dp": ep_config.is_deferred_dp,
-            "sharded_over_ep_group": sharded_over_ep_group,
-            "loss_finite": math.isfinite(train_result.training_loss),
-            "loss_decreased": len(step_losses) >= 2 and step_losses[-1] < step_losses[0],
-            "replica_consistency": _check_replica_consistency(model, ep_config),
-            # Absent keys mean the probe never ran — the sweep did not fire, which is itself the
-            # failure this file exists to catch, so they must not default to True.
-            "sweep_pre_image_nonzero": sweep_verdict.get("sweep_pre_image_nonzero", False),
-            "sweep_divisor": sweep_verdict.get("sweep_divisor", False),
-        }
-        for k, v in checks.items():
-            log(f"  {k}: {'PASS' if v else 'FAIL'}")
-
-        success = all(checks.values())
-        log(f"\n{'#' * 70}")
-        log("  EP MULTI-NODE-SIM TEST PASSED" if success else f"  FAILED: {[k for k, v in checks.items() if not v]}")
-        log(f"{'#' * 70}")
-
-    except Exception as e:
-        log(f"\n  EP MULTI-NODE-SIM TEST FAILED with exception: {e}")
-        traceback.print_exc()
-        success = False
-    finally:
-        cleanup_memory()
-        cleanup_dirs(output_dir, cache_dir)
-        teardown_distributed()
-
-    return 0 if success else 1
+    checks = {
+        **shape_checks,
+        **training_run_checks(train_result, trainer, NUM_TRAIN_STEPS, grad_norms=True, loss_decreased=True),
+        "sharded_over_ep_group": sharded_over_ep_group,
+        "replica_consistency": _check_replica_consistency(model, ep_config),
+        # Absent keys mean the probe never ran — the sweep did not fire, which is itself the
+        # failure this file exists to catch, so they must not default to True.
+        "sweep_pre_image_nonzero": sweep_verdict.get("sweep_pre_image_nonzero", False),
+        "sweep_divisor": sweep_verdict.get("sweep_divisor", False),
+    }
+    return {"checks": checks}
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()

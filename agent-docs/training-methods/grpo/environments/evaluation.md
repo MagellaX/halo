@@ -15,7 +15,7 @@ python scripts/environments/inference/run_env.py --env_type qa_search \
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--dataset` / `--config` / `--split` | — / none / `test` | Hub id or `save_to_disk` dir |
+| `--dataset` / `--config` / `--split` | — / none / `test` | Hub id or `save_to_disk` dir. A coding benchmark that ships one split reads its own (HLCE: `train`) and refuses any other |
 | `--base_url` / `--api_key` / `--model` | local vLLM / `$VLLM_API_KEY`, `$OPENAI_API_KEY`, else a placeholder / — | Endpoint and model name |
 | `--training_config <yaml>` | none | Grade under a run's contract (below) |
 | `--num_examples` / `--num_samples` | 100 (50 coding) / 1 | Rows scored; episodes per row |
@@ -120,7 +120,7 @@ episode recorded with a `generation_error` leaves `n` and is counted in `generat
 `--workers` at or below the core count.
 
 Only `run_code_contests.py` stamps the meta a re-grade needs (`env_type`, `adapter`, `dataset`,
-`model`, `language`); a `run_env.py` dump is refused.
+`split`, `model`, `language`); a `run_env.py` dump is refused.
 
 ## Smoke-testing a config
 

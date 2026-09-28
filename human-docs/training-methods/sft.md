@@ -72,7 +72,8 @@ already carries one — without it your template is dropped without a word. Bund
 for GPT-OSS) when the render must match a rollout server byte for byte.
 
 `assistant_message_template` is separate and must byte-match what that template renders for an
-assistant turn — a marker that does not match masks every row and the loss goes flat.
+assistant turn: a marker it never renders raises at startup, one it renders only for some message
+shapes masks the rows it misses.
 
 ## LoRA and QLoRA
 
@@ -96,9 +97,10 @@ parallelism ([PEFT](../../agent-docs/optimization/peft.md) ↗).
 ## Vision-language
 
 Nothing to switch on. The model class follows the checkpoint — a multimodal config loads through
-`AutoModelForImageTextToText` and its processor, with the same EP/TP wrapping a text model gets —
-while the data path follows the run: the VLM pipeline engages only when the dataset declares images,
-so text-only rows on a multimodal checkpoint train as a plain text run.
+`AutoModelForImageTextToText` and its processor (where the checkpoint ships one), with the same
+EP/TP wrapping a text model gets — while the data path follows the run: the VLM pipeline engages
+only when the dataset declares images, so text-only rows on a multimodal checkpoint train as a plain
+text run.
 
 Images ride inside message content, or in a column named by `images_field`, which is what hub
 datasets like Docmatix and FineVision do:

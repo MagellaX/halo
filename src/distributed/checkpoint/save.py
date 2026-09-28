@@ -15,7 +15,9 @@ artifacts: a family-specific expert gather, and one shard per stage under global
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from functools import partial
 
 import torch
@@ -23,10 +25,16 @@ import torch.nn as nn
 
 from src.checkpoint.adapters import EXPERT_LORA_PEFT_TYPE
 from src.checkpoint.config_export import save_model_config
-from src.checkpoint.format import save_dtype_caster, write_merged_index
+from src.checkpoint.format import (
+    RESUME_ADAPTER_DIR,
+    remove_resume_adapter_marker,
+    save_dtype_caster,
+    write_merged_index,
+    write_resume_adapter_marker,
+)
 from src.checkpoint.shard_writer import StageShardWriter
 from src.distributed.checkpoint.context import CheckpointContext
-from src.distributed.checkpoint.peft import expert_lora_config_fields, find_peft_model
+from src.distributed.checkpoint.peft import PeftAdapterSaver, expert_lora_config_fields, find_peft_model
 from src.distributed.checkpoint.write import (
     chunked_saveable_tensors,
     exchange_shard_index,
@@ -38,13 +46,14 @@ from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.runtime import (
     DeferredRankFailure,
     barrier_on_exit,
+    fs_aware_save_rank,
     is_local_main_process,
     is_output_shared_filesystem,
     resolve_param_tensor,
 )
 from src.distributed.tensor_parallel.checkpoint import save_tp_model
 from src.models.patches.gpt_oss_sinks import neutralized_gpt_oss_sinks
-from src.models.structure import merged_adapters, unwrap_model
+from src.models.structure import lora_fold_targets, unwrap_model
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +102,12 @@ def _save_streamed(
     """
     with barrier_on_exit():
         stream_gathered_checkpoint(
-            model, chunks, output_dir, is_save_rank=ctx.is_save_rank, max_shard_size=ctx.max_shard_size
+            model,
+            chunks,
+            output_dir,
+            is_save_rank=ctx.is_save_rank,
+            max_shard_size=ctx.max_shard_size,
+            keep_live_dtype=ctx.training_checkpoint,
         )
         if ctx.is_save_rank:
             if ctx.tokenizer is not None:
@@ -121,7 +135,13 @@ def save_cp_checkpoint(ctx: CheckpointContext, output_dir: str) -> None:
 
 def save_tp_checkpoint(ctx: CheckpointContext, output_dir: str) -> None:
     """TP-only / TP+DP. ``save_tp_model`` runs the second gather its hand-sliced params need."""
-    save_tp_model(ctx.model, output_dir, tokenizer=ctx.tokenizer, max_shard_size=ctx.max_shard_size)
+    save_tp_model(
+        ctx.model,
+        output_dir,
+        tokenizer=ctx.tokenizer,
+        max_shard_size=ctx.max_shard_size,
+        keep_live_dtype=ctx.training_checkpoint,
+    )
 
 
 def _expert_lora_adapter_config(ctx: CheckpointContext) -> dict | None:
@@ -148,26 +168,86 @@ def save_ep_checkpoint(ctx: CheckpointContext, output_dir: str) -> None:
     With native grouped-LoRA on experts, writes a standalone adapter unless
     ``merge_expert_lora_on_save`` requests a merged checkpoint. That merge covers both halves of a
     mixed run: the expert deltas fold inside each family's gather, and any attention adapters fold
-    into their base weights for the duration of the write.
+    into each base tensor as it is written, out of place (:func:`~src.models.structure.lora_folded`,
+    the weight sync's fold), so the save never writes the trainer's own weights. A training
+    checkpoint also carries the unmerged adapters it resumes from (:func:`save_resume_adapter`).
     """
     if ctx.has_expert_lora and not ctx.merge_expert_lora_on_save:
         save_ep_lora_adapters(
-            ctx.model, output_dir, adapter_config=_expert_lora_adapter_config(ctx), tokenizer=ctx.tokenizer
-        )
-        return
-    # Collective and rank-uniform: merge_adapter is an in-place DTensor op under FSDP2, and the
-    # unmerge on exit leaves the adapters trainable after an intermediate merged save.
-    with merged_adapters(find_peft_model(ctx.model)) as adapters_merged:
-        save_ep_model(
             ctx.model,
             output_dir,
+            adapter_config=_expert_lora_adapter_config(ctx),
             tokenizer=ctx.tokenizer,
-            sharded=ctx.save_sharded_ep,
-            cp_key_remap=ctx.is_cp_mode,
-            max_shard_size=ctx.max_shard_size,
-            merge_lora=ctx.has_expert_lora and ctx.merge_expert_lora_on_save,
-            adapters_merged=adapters_merged,
+            keep_live_dtype=ctx.training_checkpoint,
         )
+        return
+    # Structural, so a layer the fold cannot reproduce raises on every rank before any gather.
+    peft_model = find_peft_model(ctx.model)
+    save_ep_model(
+        ctx.model,
+        output_dir,
+        tokenizer=ctx.tokenizer,
+        sharded=ctx.save_sharded_ep,
+        cp_key_remap=ctx.is_cp_mode,
+        max_shard_size=ctx.max_shard_size,
+        merge_lora=ctx.has_expert_lora and ctx.merge_expert_lora_on_save,
+        lora_folds=lora_fold_targets(peft_model) if peft_model is not None else None,
+        keep_live_dtype=ctx.training_checkpoint,
+    )
+
+
+def save_resume_adapter(ctx: CheckpointContext, checkpoint_dir: str) -> None:
+    """Write a ``merge_expert_lora_on_save`` checkpoint's resume state beside its merged weights.
+
+    The merged weights serve but cannot resume: the bf16 fold loses part of the delta, and the
+    optimizer state belongs to the adapters, not to the fold. The unmerged adapters go to
+    :data:`~src.checkpoint.format.RESUME_ADAPTER_DIR` through the writer the non-merged save uses
+    (:class:`PeftAdapterSaver` when a PeftModel carries an attention half,
+    :func:`save_ep_lora_adapters` for expert-only), at their live dtype as any training checkpoint
+    writes them, so the adapter restore reads them unchanged. Each save rank then writes the marker
+    the resume classifies on, after its own copy is complete. With any older marker removed before
+    the save began (:func:`remove_stale_resume_marker`), a failed adapter write leaves no marker.
+    Collective: every rank enters the adapter gathers.
+    """
+    # Rank-uniform, and a no-op when sharded: a forward's transient unsharded params predate the
+    # last optimizer step, like every writer's.
+    reshard_fsdp2_modules(ctx.model)
+    adapter_dir = os.path.join(checkpoint_dir, RESUME_ADAPTER_DIR)
+    peft_model = find_peft_model(ctx.model)
+    if peft_model is not None:
+        # No tokenizer: the checkpoint root carries it, and nothing loads this directory standalone.
+        PeftAdapterSaver().save(replace(ctx, tokenizer=None, training_checkpoint=True), peft_model, adapter_dir)
+    else:
+        save_ep_lora_adapters(
+            ctx.model, adapter_dir, adapter_config=_expert_lora_adapter_config(ctx), keep_live_dtype=True
+        )
+    mark_resume_adapter_complete(checkpoint_dir, is_save_rank=ctx.is_save_rank)
+
+
+def mark_resume_adapter_complete(checkpoint_dir: str, *, is_save_rank: bool) -> None:
+    """Write the marker a resume classifies ``checkpoint_dir`` on, once its resume adapter is on disk.
+
+    Shared by every writer of a resume adapter, the embedding trainer's included. Fenced: every rank
+    enters, and each save rank marks its own copy only after its own adapter write completed.
+    """
+    with barrier_on_exit():
+        if is_save_rank:
+            write_resume_adapter_marker(checkpoint_dir)
+            logger.info(f"Saved the resume adapter of merged checkpoint {checkpoint_dir}")
+
+
+def remove_stale_resume_marker(checkpoint_dir: str) -> None:
+    """Remove a resume marker an earlier save left in ``checkpoint_dir``, before this save rewrites it.
+
+    A run resumed from an earlier checkpoint saves the same ``checkpoint-N`` again, in place, and
+    whatever marker that directory holds describes the abandoned save: until a new one lands it would
+    vouch for the old adapter beside the new weights and trainer state. Removed first, whatever the
+    run writes next, a save torn before its own marker is refused on resume instead. Fenced: every
+    rank enters, and each FS-aware save rank clears its own copy.
+    """
+    with barrier_on_exit():
+        if fs_aware_save_rank():
+            remove_resume_adapter_marker(checkpoint_dir)
 
 
 def reject_unhandled_pp_axes(config, phase: str) -> None:
@@ -242,9 +322,9 @@ def save_pp_checkpoint(ctx: CheckpointContext, output_dir: str) -> None:
     # gathers below are collective and the writer is a no-op on non-writers.
     name_map = stage.checkpoint_name_map()
     # Same artifact contract as every other writer: save-dtype cast with the norm / balancing /
-    # fp32-pin keep-sets held at trained dtype. Keyed by the live (stage-local / gather) spelling,
-    # which is what the caster's tree-derived keep-sets use.
-    cast = save_dtype_caster(stage)
+    # fp32-pin keep-sets held at trained dtype (nothing cast in a training checkpoint). Keyed by the
+    # live (stage-local / gather) spelling, which is what the caster's tree-derived keep-sets use.
+    cast = save_dtype_caster(stage, keep_live_dtype=ctx.training_checkpoint)
     state_dict = stage.state_dict()
     for key, local_name in name_map.items():
         full = resolve_param_tensor(state_dict[local_name])  # collective: every stage rank participates

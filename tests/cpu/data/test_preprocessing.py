@@ -12,19 +12,24 @@ import json
 import logging
 import os
 import shutil
-import sys
 import tempfile
+from dataclasses import asdict
 
 import pytest
+from accelerate import PartialState
 from datasets import Dataset, load_from_disk
+from huggingface_hub.errors import EntryNotFoundError
 
+from src.data.pipeline import preprocessed_metadata as mod
 from src.data.pipeline.preprocessed_metadata import (
+    _RENDER_CHECKED_FIELDS,
     PreprocessedDatasetMetadata,
     PreprocessingConfig,
     validate_preprocessing_compatibility,
 )
 from src.data.pipeline.preprocessing import _warn_on_shard_count_ceiling, shard_dataset, tokenize_dataset
-from src.data.shard_index import SHARD_INDEX_FILE, ShardIndex, ShardInfo
+from src.data.shard_index import SHARD_INDEX_FILE, IncompatiblePreprocessedDataset, ShardIndex, ShardInfo
+from src.data.sources.paths import hub_repo_id
 from tests.common.tokenizers import load_cached_tokenizer
 
 
@@ -109,12 +114,8 @@ def test_tokenize_dataset():
 
 
 def test_tokenize_dataset_completion_only():
-    """train_on_completions_only must mask prompt tokens to -100 and keep assistant completions.
-
-    Regression: the flag (exposed by PreprocessingConfig + prepare_dataset.py --train-only-on-
-    completions) was a silent no-op — tokenize_dataset always wrote labels = input_ids.copy(), so a
-    preprocessed dataset trained on the full prompt regardless.
-    """
+    """train_on_completions_only (PreprocessingConfig, prepare_dataset.py --train-on-completions-only)
+    must mask prompt tokens to -100 and keep assistant completions, not copy labels from input_ids."""
     print("Testing tokenize_dataset completion-only...")
 
     dataset = Dataset.from_dict(
@@ -430,8 +431,6 @@ class _RenderArgs:
 
 
 def _metadata_with_recorded_config(**config_overrides) -> PreprocessedDatasetMetadata:
-    from dataclasses import asdict
-
     config = PreprocessingConfig(model_name_or_path="Qwen/Qwen3-8B", max_length=4096, **config_overrides)
     return PreprocessedDatasetMetadata(
         model_name="Qwen/Qwen3-8B",
@@ -525,8 +524,6 @@ def test_render_check_set_is_derived_from_the_config_dataclass():
     """The checked set is read off each field's own ``render_check`` metadata, so a new render knob
     is compared by default and an exemption has to be declared where the field is defined. Pinned
     against an independent literal: a knob that silently stops being compared fails here."""
-    from src.data.pipeline.preprocessed_metadata import _RENDER_CHECKED_FIELDS
-
     assert set(_RENDER_CHECKED_FIELDS) == {
         "conversation_field",
         "system_prompt",
@@ -571,8 +568,6 @@ def test_tokenizer_override_mismatch_raises():
 def test_chat_template_compared_as_resolved_text_not_as_a_path(tmp_path):
     """The config records the RESOLVED template; the run may spell the same template as a file path.
     Comparing the raw values would report every path-spelled template as a mismatch."""
-    from accelerate import PartialState
-
     # The shared path→text resolver logs through accelerate's rank-aware logger; every caller of this
     # check runs after the toolkit has initialized the state.
     PartialState()
@@ -622,8 +617,6 @@ def test_metadata_version_mismatch_raises_a_version_message():
     """The stamp was written and never compared: a diverged schema surfaced as a bare TypeError
     from cls(**data), and the detection probe swallowed it into a silent raw-path downgrade that
     re-tokenizes pre-tokenized rows."""
-    from src.data.shard_index import IncompatiblePreprocessedDataset
-
     payload = PreprocessedDatasetMetadata(max_length=4096).to_dict()
     payload["version"] = "0.9"
     with pytest.raises(IncompatiblePreprocessedDataset, match="version"):
@@ -640,8 +633,6 @@ def test_metadata_written_before_the_render_knob_renames_is_refused_by_name():
     recorded when nothing verified it — the artifact's labels were baked under the OLD semantics.
     The message has to carry the offending key and the re-prep command, because a preprocessed
     dataset is an expensive S3/Hub artifact and the only fix is re-running the prep script."""
-    from src.data.shard_index import IncompatiblePreprocessedDataset
-
     payload = PreprocessedDatasetMetadata(max_length=4096, train_on_completions_only=True).to_dict()
     # Re-spell the top-level key the way a pre-rename writer stamped it.
     payload["train_only_on_completions"] = payload.pop("train_on_completions_only")
@@ -659,8 +650,6 @@ def test_metadata_written_before_the_render_knob_renames_is_refused_by_name():
 
 def test_hub_repo_id_strips_config_and_split_suffixes():
     """Hub file APIs address the repo; the loader's `org/name:config@split` spelling does not."""
-    from src.data.sources.paths import hub_repo_id
-
     assert hub_repo_id("org/name") == "org/name"
     assert hub_repo_id("org/name@train_sft") == "org/name"
     assert hub_repo_id("org/name:subset") == "org/name"
@@ -671,8 +660,6 @@ def test_hub_preprocessed_dataset_is_detected_and_its_metadata_loads(tmp_path, m
     """An `hf://`-published preprocessed dataset could NEVER be detected (the Hub branch returned
     False unconditionally) and its metadata load raised outright — so training took the raw path and
     KeyError'd on pre-tokenized rows."""
-    from src.data.pipeline import preprocessed_metadata as mod
-
     payload = PreprocessedDatasetMetadata(max_length=4096, model_name="Qwen/Qwen3-8B").to_dict()
     metadata_file = tmp_path / "metadata.json"
     metadata_file.write_text(json.dumps(payload))
@@ -693,9 +680,6 @@ def test_hub_preprocessed_dataset_is_detected_and_its_metadata_loads(tmp_path, m
 def test_hub_dataset_without_metadata_is_raw_not_an_error(monkeypatch):
     """Anti-over-rejection: the overwhelmingly common case is a RAW hub dataset, which must probe to
     False silently rather than warn or raise on every run."""
-    from huggingface_hub.errors import EntryNotFoundError
-
-    from src.data.pipeline import preprocessed_metadata as mod
 
     def _missing(repo_id, filename, repo_type=None, **kwargs):
         raise EntryNotFoundError("no metadata.json")
@@ -705,4 +689,4 @@ def test_hub_dataset_without_metadata_is_raw_not_an_error(monkeypatch):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

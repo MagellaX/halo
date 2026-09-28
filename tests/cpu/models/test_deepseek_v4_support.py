@@ -6,7 +6,6 @@ the per-rope-type inv_freq buffer fix, and the moe_balancing auto resolution.
     python tests/cpu/models/test_deepseek_v4_support.py
 """
 
-import sys
 import tempfile
 from functools import partial
 
@@ -25,8 +24,9 @@ from src.distributed.expert_parallel.patching import MOE_LAYER_MAP
 from src.kernels.fused_glu import clamped_silu_mul_eager, fused_clamped_silu_mul
 from src.models.moe_balancing import resolve_balancing_mode
 from src.models.patches.attention import _model_is_deepseek_v4
-from src.models.patches.buffer_fixes import fix_rotary_inv_freq
+from src.models.patches.buffer_fixes import finalize_loaded_model
 from tests.common.models import TINY_DSV4_CONFIG
+from tests.common.tiny_models import randomize_tid2eid
 
 SEED = 1234
 
@@ -38,20 +38,8 @@ def _tiny_config(**overrides) -> DeepseekV4Config:
 def _tiny_model(config: DeepseekV4Config | None = None):
     torch.manual_seed(SEED)
     model = AutoModelForCausalLM.from_config(config or _tiny_config())
-    randomize_tid2eid(model)
+    randomize_tid2eid(model, seed=SEED)
     return model.eval()
-
-
-def randomize_tid2eid(model, seed: int = SEED) -> None:
-    """Fill hash-layer tid2eid with DISTINCT experts per token id (random-init leaves it all-zero;
-    DeepEP dispatch and the wrapper's init guard both require distinct top-k experts per token)."""
-    gen = torch.Generator().manual_seed(seed)
-    num_experts = model.config.n_routed_experts
-    for layer in model.model.layers:
-        if layer.mlp.is_hash:
-            table = layer.mlp.gate.tid2eid
-            perm = torch.rand(table.shape[0], num_experts, generator=gen).argsort(dim=-1)
-            table.copy_(perm[:, : table.shape[1]])
 
 
 def _bare_ep_layer(**attrs) -> EPDeepseekV4MoELayer:
@@ -257,7 +245,7 @@ def test_topk_layer_selects_biased_but_gates_unbiased():
 # Per-rope-type inv_freq buffer fix
 
 
-def test_fix_rotary_inv_freq_covers_all_rotary_instances():
+def test_finalize_covers_all_rotary_instances():
     """Every DeepseekV4RotaryEmbedding (model-level + CSA/HCA compressors + indexer) must get its
     {main,compress}_inv_freq recomputed — a missed instance keeps garbage frequencies silently."""
     model = _tiny_model()
@@ -270,7 +258,7 @@ def test_fix_rotary_inv_freq_covers_all_rotary_instances():
             references[(i, lt)] = getattr(rot, f"{lt}_inv_freq").clone()
             getattr(rot, f"{lt}_inv_freq").fill_(-1.0)  # corrupt (as a bf16/meta load would)
 
-    fix_rotary_inv_freq(model)
+    finalize_loaded_model(model)
 
     for (i, lt), ref in references.items():
         fixed = getattr(rotaries[i], f"{lt}_inv_freq")
@@ -298,4 +286,4 @@ def test_moe_balancing_auto_resolves_bias_update_for_v4_ep():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

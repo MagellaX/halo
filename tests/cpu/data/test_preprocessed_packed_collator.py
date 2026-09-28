@@ -12,7 +12,6 @@ Usage:
 import json
 import os
 import shutil
-import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -24,6 +23,7 @@ from datasets import Dataset, DatasetDict
 
 PartialState()
 
+from scripts.training.sft import _prepare_text_data
 from src.data.collators.packing import DataCollatorForCompletionOnlyLMWithPacking, DataCollatorWithPacking
 
 PAD = 0
@@ -101,8 +101,6 @@ def _write_metadata(dataset_dir: str, packed: bool, max_length: int = 64) -> Non
 
 def _prepare_preprocessed(packed: bool, train_on_completions_only: bool = False):
     """Drive sft.py's _prepare_text_data over a fake preprocessed dataset; returns the collator."""
-    from scripts.training.sft import _prepare_text_data
-
     tmp = tempfile.mkdtemp()
     try:
         _write_metadata(tmp, packed=packed)
@@ -159,4 +157,4 @@ def test_preprocessed_baked_labels_are_authoritative():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

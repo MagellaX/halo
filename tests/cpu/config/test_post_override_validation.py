@@ -31,6 +31,7 @@ from src.configs.environment_config import EnvironmentConfig
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.configs.smpo_config import SmoothMarginPOConfig
 from src.distributed.parallelism_config import PP_SCHEDULES
+from src.env import DEFAULT_NCCL_TIMEOUT_MINUTES
 from src.environments.base import VALID_REASONING_EFFORTS
 from src.training.parser import H4ArgumentParser, _literal_choices
 from src.training.script_runner import init_training_script
@@ -255,8 +256,6 @@ def test_offline_grpo_max_completion_length_defaults_to_none():
 
 def test_async_episode_timeout_default_clears_the_watchdog_warning():
     """The shipped default must not trip AsyncTrainingConfig's own >= 0.8 * NCCL-watchdog warning."""
-    from src.env import DEFAULT_NCCL_TIMEOUT_MINUTES
-
     assert AsyncTrainingConfig.episode_timeout < 0.8 * DEFAULT_NCCL_TIMEOUT_MINUTES * 60
 
 
@@ -295,4 +294,4 @@ def test_unknown_reasoning_effort_is_rejected_at_parse_time(tmp_path):
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

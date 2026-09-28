@@ -58,13 +58,14 @@ _CTOR_POSITIONS = ctor_positions(KTOTrainer, "model", "args", "ref_model")
 _REF_LOGPS_COLUMN = "ref_logps"
 
 
-class DistributedKTOTrainer(DistributedTrainerMixin, PrecomputeRefLogpsRankConsistentMixin, KTOTrainer):
+class DistributedKTOTrainer(PrecomputeRefLogpsRankConsistentMixin, DistributedTrainerMixin, KTOTrainer):
     """TRL's KTOTrainer plus EP/TP/PP via DistributedTrainerMixin. CP unsupported (see module docstring).
 
-    ``PrecomputeRefLogpsRankConsistentMixin`` keeps ``precompute_ref_log_probs`` (the EP/TP
-    full-finetune reference path) from deadlocking on its rank-divergent disk cache. PP is
-    ``apo_zero_unpaired``-only and precompute-only with the reference log-probs shipped as a
-    dataset column; the PP contract is in ``_pp_loss_adapter``.
+    ``PrecomputeRefLogpsRankConsistentMixin`` runs ``precompute_ref_log_probs`` (the EP/TP
+    full-finetune reference path) on the DP axis, attaches its columns in memory on every rank and
+    carries them across a resume; it precedes ``DistributedTrainerMixin`` so its checkpoint hook
+    wins. PP is ``apo_zero_unpaired``-only and precompute-only with the reference log-probs shipped
+    as a dataset column; the PP contract is in ``_pp_loss_adapter``.
     """
 
     _tag_names = ["trl", "kto"]
@@ -83,6 +84,7 @@ class DistributedKTOTrainer(DistributedTrainerMixin, PrecomputeRefLogpsRankConsi
             "load_distributed_model.",
         )
 
+        self._init_reference_resume(kwargs)
         kwargs = self._init_distributed_config(kwargs, ctor_args=args, ctor_positions=_CTOR_POSITIONS)
         self._validate_reference_model(ctor_value(args, kwargs, "ref_model", _CTOR_POSITIONS))
         super().__init__(*args, **kwargs)
@@ -139,6 +141,10 @@ class DistributedKTOTrainer(DistributedTrainerMixin, PrecomputeRefLogpsRankConsi
         """Columns TRL's KTO sweep would write; ``ref_KL_logps`` only when the loss carries a KL
         term (``calculate_KL``, never under PP)."""
         return (_REF_LOGPS_COLUMN, "ref_KL_logps") if self.calculate_KL else (_REF_LOGPS_COLUMN,)
+
+    def _reference_settings(self) -> dict:
+        """The collator's truncation, which keeps the start of each assembled sequence."""
+        return {"max_length": self.args.max_length}
 
     def _pp_loss_adapter(self) -> PPLossAdapter:
         """KTO's pipeline-loss contract: unpaired rows + dataset-precomputed reference log-probs.

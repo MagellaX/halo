@@ -68,9 +68,11 @@ class CPConfig:
                 "pass ParallelismConfig.nvlink_domain_size."
             )
         if cp_size > gpus_per_node:
-            raise ValueError(f"CP size ({cp_size}) cannot exceed the NVLink-domain size ({gpus_per_node})")
+            raise ValueError(
+                f"context_parallel_size ({cp_size}) cannot exceed the NVLink-domain size ({gpus_per_node})"
+            )
         if gpus_per_node % cp_size != 0:
-            raise ValueError(f"CP size ({cp_size}) must divide the NVLink-domain size ({gpus_per_node})")
+            raise ValueError(f"context_parallel_size ({cp_size}) must divide the NVLink-domain size ({gpus_per_node})")
         self._create_cp_groups(gpus_per_node)
 
         # Logged, not stored: ``ParallelismConfig`` computes data_parallel_size (its divisor also
@@ -90,9 +92,10 @@ class CPConfig:
             return False
         if self.cp_size > 1:
             raise RuntimeError(
-                f"CPConfig(cp_size={self.cp_size}) needs an initialized torch.distributed process "
-                f"group: without one Ulysses has no all-to-all, so this process would attend over "
-                f"sequence chunk 0 alone. Launch with torchrun, or set cp_size=1."
+                f"context_parallel_size={self.cp_size} needs an initialized torch.distributed "
+                f"process group: without one Ulysses has no all-to-all, so this process would "
+                f"attend over sequence chunk 0 alone. Launch with torchrun, or set "
+                f"context_parallel_size=1."
             )
         self.process_group = None
         self.cp_rank = 0
@@ -144,6 +147,14 @@ class CPConfig:
         logger.debug(f"CP rank {global_rank}: group_idx={self.cp_group_idx}, cp_rank={self.cp_rank}")
 
 
+def cp_chunk_bounds(seq_len: int, cp_rank: int, cp_size: int) -> tuple[int, int]:
+    """``[start, end)`` of CP rank ``cp_rank``'s contiguous chunk of a ``seq_len``-token sequence."""
+    if seq_len % cp_size != 0:
+        raise ValueError(f"Sequence length {seq_len} must be divisible by context_parallel_size {cp_size}")
+    chunk_size = seq_len // cp_size
+    return cp_rank * chunk_size, (cp_rank + 1) * chunk_size
+
+
 def cp_boundary_shift(
     logits: torch.Tensor,
     local_labels: torch.Tensor,
@@ -163,20 +174,21 @@ def cp_boundary_shift(
     return logits, torch.cat([local_labels[:, 1:], boundary_labels], dim=1)
 
 
-def split_sequence_for_cp(
-    tensor: torch.Tensor,
-    cp_config: CPConfig,
-    seq_dim: int = 1,
-) -> torch.Tensor:
-    """Split a tensor's sequence dimension for context parallelism."""
+def cp_shift_against_full_labels(
+    logits: torch.Tensor, labels: torch.Tensor, cp_rank: int, cp_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`cp_boundary_shift` of CP rank ``cp_rank``'s local logits against the full pre-split
+    ``[batch, seq_len]`` labels: its own label chunk, plus the next chunk's first label (the token
+    its last logit predicts) on every rank but the last."""
+    start, end = cp_chunk_bounds(labels.size(1), cp_rank, cp_size)
+    is_last_rank = cp_rank == cp_size - 1
+    boundary_labels = None if is_last_rank else labels[:, end : end + 1]
+    return cp_boundary_shift(logits, labels[:, start:end], boundary_labels, is_last_rank)
+
+
+def split_sequence_for_cp(tensor: torch.Tensor, cp_config: CPConfig) -> torch.Tensor:
+    """Split a ``[batch, seq, ...]`` tensor's sequence dimension for context parallelism."""
     if cp_config.cp_size == 1:
         return tensor
-
-    seq_len = tensor.shape[seq_dim]
-    if seq_len % cp_config.cp_size != 0:
-        raise ValueError(f"Sequence length {seq_len} must be divisible by cp_size {cp_config.cp_size}")
-
-    chunk_size = seq_len // cp_config.cp_size
-    start = cp_config.cp_rank * chunk_size
-
-    return tensor.narrow(seq_dim, start, chunk_size).contiguous()
+    start, end = cp_chunk_bounds(tensor.shape[1], cp_config.cp_rank, cp_config.cp_size)
+    return tensor.narrow(1, start, end - start).contiguous()

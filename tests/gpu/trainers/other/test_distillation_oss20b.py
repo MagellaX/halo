@@ -28,13 +28,11 @@ Requirements:
 
 import argparse
 import math
+import os
 import random
-import sys
 import traceback
 
 import torch
-import torch.distributed as dist
-from accelerate import PartialState
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 
@@ -44,15 +42,10 @@ from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.runtime import barrier
 from src.trainers.distillation.teacher_distillation import DistributedDistillationTrainer
-from tests.common.distributed import (
-    cleanup_dirs,
-    ensure_model_downloaded,
-    init_distributed,
-    setup_cache_dirs,
-    teardown_distributed,
-)
+from tests.common.distributed import ensure_model_downloaded
+from tests.common.harness import gpu_test_main
 from tests.common.models import GPT_OSS_20B
-from tests.common.utils import cleanup_memory, log
+from tests.common.utils import cleanup_memory, log, step_losses
 
 MODEL_NAME = GPT_OSS_20B
 NUM_TRAIN_SAMPLES = 32
@@ -94,7 +87,7 @@ def create_distillation_dataset(num_samples: int, tokenizer, seed: int = SEED) -
     return Dataset.from_list(data)
 
 
-def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int) -> bool:
+def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int, base_output_dir: str) -> bool:
     """Run a single distillation test with the given parallelism mode."""
     use_gmm = has_grouped_mm()
     if mode == "fsdp":
@@ -123,8 +116,9 @@ def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int
     log(f"  World: {world_size}, GPU: {torch.cuda.get_device_name(local_rank)}")
     log(f"{'#' * 70}")
 
-    output_dir, cache_dir = setup_cache_dirs(f"distill_oss20b_{mode}", rank)
+    output_dir = os.path.join(base_output_dir, mode)
 
+    trainer = None
     try:
         log("\nEnsuring model is downloaded...")
         ensure_model_downloaded(MODEL_NAME, rank)
@@ -183,6 +177,7 @@ def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int
             logging_steps=1,
             save_strategy="no",
             report_to="none",
+            logging_nan_inf_filter=False,
             max_length=MAX_SEQ_LENGTH,
             dataloader_drop_last=True,
             dataloader_num_workers=0,
@@ -224,14 +219,14 @@ def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int
 
         training_loss = train_result.training_loss
         log_history = trainer.state.log_history
-        step_losses = [e["loss"] for e in log_history if "loss" in e and "eval_loss" not in e]
+        losses = step_losses(trainer)
         grad_norms = [e["grad_norm"] for e in log_history if "grad_norm" in e]
         distill_losses = [e["distillation_loss"] for e in log_history if "distillation_loss" in e]
         sft_losses = [e["sft_loss"] for e in log_history if "sft_loss" in e]
 
         log("\n--- Metrics ---")
         log(f"Final loss: {training_loss:.6f}")
-        log(f"Step losses: {[f'{l:.4f}' for l in step_losses]}")
+        log(f"Step losses: {[f'{l:.4f}' for l in losses]}")
         if grad_norms:
             log(f"Grad norms: {[f'{g:.2f}' for g in grad_norms]}")
         if distill_losses:
@@ -242,10 +237,10 @@ def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int
         log("\n--- Checks ---")
         checks = {}
 
-        checks["training_completed"] = len(step_losses) == NUM_TRAIN_STEPS
+        checks["training_completed"] = len(losses) == NUM_TRAIN_STEPS
         log(f"Training completed: {'PASS' if checks['training_completed'] else 'FAIL'}")
 
-        loss_finite = math.isfinite(training_loss) and all(math.isfinite(l) for l in step_losses)
+        loss_finite = math.isfinite(training_loss) and all(math.isfinite(l) for l in losses)
         checks["loss_finite"] = loss_finite
         log(f"Loss finite: {'PASS' if loss_finite else 'FAIL'}")
 
@@ -263,77 +258,44 @@ def run_distillation_test(mode: str, rank: int, world_size: int, local_rank: int
         checks["teacher_frozen"] = teacher_trainable_after == 0
         log(f"Teacher frozen after training: {'PASS' if checks['teacher_frozen'] else 'FAIL'}")
 
-        loss_tensor = torch.tensor([training_loss], device=f"cuda:{local_rank}")
-        all_losses = [torch.zeros_like(loss_tensor) for _ in range(world_size)]
-        dist.all_gather(all_losses, loss_tensor)
-        if rank == 0:
-            losses_list = [l.item() for l in all_losses]
-            spread = max(losses_list) - min(losses_list)
-            checks["loss_consistent"] = spread < 0.01
-            log(f"Loss consistent (spread={spread:.6f}): {'PASS' if checks['loss_consistent'] else 'FAIL'}")
-        else:
-            checks["loss_consistent"] = True
-
         all_passed = all(checks.values())
         log(f"\n{'#' * 70}")
         log(f"  DISTILLATION {mode_label} TEST {'PASSED' if all_passed else 'FAILED'}")
         if not all_passed:
             log(f"  Failed: {[k for k, v in checks.items() if not v]}")
         log(f"{'#' * 70}\n")
-
-        if hasattr(trainer, "cleanup_ep"):
-            trainer.cleanup_ep()
-        del trainer, student_model, teacher_model
-        cleanup_memory()
-        cleanup_dirs(output_dir, cache_dir)
-        barrier()
         return all_passed
 
     except Exception as e:
         log(f"\nFATAL ERROR: {e}")
         if rank == 0:
             traceback.print_exc()
-        cleanup_memory()
-        cleanup_dirs(output_dir, cache_dir)
         return False
 
+    finally:
+        # DeepEP buffers outlive the trainer object: a mode that raised mid-run still releases them
+        # before the next mode builds its own.
+        if trainer is not None:
+            trainer.cleanup_ep()
 
-def main():
+
+@gpu_test_main(min_world_size=2, prefix="distill_oss20b")
+def run(ctx) -> dict:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="all", choices=["fsdp", "ep", "tp", "ep_tp", "all"])
     args, _ = parser.parse_known_args()  # tolerate torchrun's own argv
 
-    rank, world_size, local_rank = init_distributed()
-    PartialState()
-
-    if world_size < 2:
-        log("ERROR: Need at least 2 GPUs")
-        teardown_distributed()
-        return 1
-
     modes = ["fsdp", "ep", "tp", "ep_tp"] if args.mode == "all" else [args.mode]
-    results = {}
+    checks = {}
 
     for mode in modes:
-        passed = run_distillation_test(mode, rank, world_size, local_rank)
-        results[mode] = passed
+        checks[mode] = run_distillation_test(mode, ctx.rank, ctx.world_size, ctx.local_rank, ctx.output_dir)
 
         cleanup_memory()
         barrier()
 
-    log(f"\n{'=' * 70}")
-    log("  DISTILLATION TEST SUMMARY (GptOss-20B)")
-    log(f"{'=' * 70}")
-    for mode, passed in results.items():
-        log(f"  {mode:8s}: {'PASSED' if passed else 'FAILED'}")
-    all_passed = all(results.values())
-    log(f"{'=' * 70}")
-    log(f"  OVERALL: {'PASSED' if all_passed else 'FAILED'}")
-    log(f"{'=' * 70}\n")
-
-    teardown_distributed()
-    return 0 if all_passed else 1
+    return {"checks": checks}
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()

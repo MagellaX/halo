@@ -10,7 +10,7 @@ The unconditional low-precision win is **inference memory**: convert the checkpo
 
 | Path | What it is | Speed | When used |
 |------|-----------|-------|-----------|
-| **bf16** | `torch._grouped_mm` (MoE) / `F.linear` (dense) | At the roofline | Default; all production training |
+| **bf16** | `F.grouped_mm` (MoE) / `F.linear` (dense) | At the roofline | Default; all production training |
 | **Simulated** (fake-quant) | block-scale quantize→dequantize→bf16 matmul, straight-through gradient | Slower than bf16 (mxfp8 ≈8× a bf16 step, fp4 ≈17–19×) | QAT numerics oracle: `lowp_precision: fp8\|fp4\|mxfp4`. Any GPU. |
 | **DeepGEMM native** (fp8/fp4) | DeepSeek's on-device-`m_indices` grouped kernel, real fp8/fp4 tensor cores | Net-slower than bf16 at every training shape (0.05–0.17× at production shapes) | Opt-in (`HALO_DEEPGEMM_NATIVE=1`); never auto-selected |
 
@@ -24,7 +24,7 @@ It must not construct a replacement: HF-native tensor parallelism carries its se
 
 At production MoE shapes — EP degree 8, 256–512 tokens per local expert, expert width N ≤ 4096 (gpt-oss-120B N=2880, qwen3.6 down N=512 / gate_up N=1024) — the per-expert GEMM is weight-bandwidth-bound and sits at the bf16 roofline. There is nothing for a low-precision compute kernel to take. Three independent confirmations:
 
-1. **Roofline.** On B300 (HBM ≈ 6.6 TB/s, bf16 ridge AI ≈ 275 FLOP/byte) bf16 `torch._grouped_mm` runs near peak (≈80% of bf16 tensor-core peak at compute-bound shapes) with zero host overhead.
+1. **Roofline.** On B300 (HBM ≈ 6.6 TB/s, bf16 ridge AI ≈ 275 FLOP/byte) bf16 `F.grouped_mm` runs near peak (≈80% of bf16 tensor-core peak at compute-bound shapes) with zero host overhead.
 
     The per-expert ridge sits at ≈256–512 tokens/expert, so at the toolkit's 256–512 tok/e there is no compute headroom for fp8, and the weight bytes (constant in M) dominate.
 
@@ -83,9 +83,9 @@ Even with the host wall removed, **DeepGEMM is net-slower than bf16 at every tra
 
 Only `fp8` (mxfp8) and `fp4` (nvfp4) have a native path; `mxfp4` is simulated-only, and a shape the kernel rejects falls back to bf16 with a one-time warning. What it gives, opted in:
 
-- **fp8** — DeepGEMM's fp8 grouped kernel, DeepSeek's 1×128 UE8M0 recipe (forward rel ≈ 0.038 vs bf16).
+- **fp8** — DeepGEMM's fp8 grouped kernel, DeepSeek's UE8M0 recipe: 1×128 groups for the activation, 128×128 blocks for the weight (forward rel ≈ 0.038 vs bf16).
 - **fp4** — fp8-activation × fp4-weight kernel on Blackwell fp4 tensor cores (forward rel ≈ 0.12 vs bf16). fp4 packs two e2m1 per byte, so K/2 must be ÷128 → the adapter zero-pads K to ÷256 (gpt-oss K=2880 → 3072; matmul unchanged), letting K-not-÷256 experts run native fp4.
-- **backward is always bf16** (Wgrad-in-HP via `torch._grouped_mm`, measured bf16-exact); the master dtype (bf16 or fp32) is preserved and both fp8 and fp4 converge.
+- **backward is always bf16** (Wgrad-in-HP via `F.grouped_mm`, measured bf16-exact); the master dtype (bf16 or fp32) is preserved and both fp8 and fp4 converge.
 
     DeepGEMM ships fp8 weight-gradient kernels (`k_grouped_fp8_gemm_*`) but the adapter keeps the backward in bf16: the 4-bit-training literature finds gradients are the precision-sensitive path (NVFP4 applies stochastic rounding to gradients only, [arXiv 2509.25149](https://arxiv.org/abs/2509.25149)).
 
@@ -110,12 +110,12 @@ That bit-identity holds for any block whose amax is within `2^-16` of the tensor
 | **mxfp8** (OCP MX) | e4m3 | e8m0 (pow-2) | 1×32 | best (fp8) | compiled |
 | **mxfp4** (OCP MX) | e2m1 | e8m0 (pow-2) | 1×32 | coarsest fp4 | compiled |
 | **nvfp4** (NVIDIA) | e2m1 | e4m3 + per-tensor fp32 | 1×16 | best fp4 | eager |
-| DeepGEMM native fp8 | e4m3 | UE8M0 (pow-2) | 1×128 | — | (native kernel) |
+| DeepGEMM native fp8 | e4m3 | UE8M0 (pow-2) | act 1×128, weight 128×128 | — | (native kernel) |
 | DeepGEMM native fp4 | e2m1 (act fp8) | UE8M0 | weight 1×32 | — | (native kernel) |
 
 `lowp_precision` exposes three formats: **`fp8`** = mxfp8; **`fp4`** = nvfp4 (the accurate fp4; validate an nvfp4 deployment); **`mxfp4`** = OCP fp4, whose power-of-two scale lets its cached weight quant compile bit-identically (~6× cheaper than nvfp4's eager weight quant, helps at low gradient-accumulation). All three converge; pick by deployment target.
 
-In the cache-hit steady state both fp4 formats are bounded by the eager activation quant, so their per-microbatch cost is similar; fp8 is cheaper because its activation quant is lighter. DeepGEMM's native recipes (UE8M0 1×128) are coarser still; use the simulated path when you need exact mx/nv numerics.
+In the cache-hit steady state both fp4 formats are bounded by the eager activation quant, so their per-microbatch cost is similar; fp8 is cheaper because its activation quant is lighter. DeepGEMM's native recipes (UE8M0 scales over 1×128 activation groups, and 128×128 blocks for the fp8 weight) are coarser still; use the simulated path when you need exact mx/nv numerics.
 
 The literature agrees: published fp8 wins on fine-grained MoE are single-digit-% e2e at these widths (N ≤ 4096), the larger ones landing at N ≥ 8192 or folding in precision-orthogonal communication speedups, and NVFP4 pretraining reports no e2e speedup plus a late-training quality gap needing a bf16 tail.
 
@@ -160,7 +160,7 @@ Fused 3-D expert banks take their contraction axis from the resolved layer class
 
 A weight whose contraction axis is not block-divisible is copied through in high precision rather than silently mis-blocked. `--verify` reports the max round-trip dequant relerr, which is how a wrong axis shows up: past the format's own error (mxfp8 0.08, nvfp4 0.25, mxfp4 0.35) it raises naming the worst tensor, before the index and `config.json` are written, so the rejected export does not load.
 
-`--include`/`--exclude` override both fences. `--output_dir` must differ from `--input_dir`.
+`--include` only narrows that set; `--exclude` replaces the vision-tower/norm fence. `--output_dir` must differ from `--input_dir`.
 
 Consuming the result — per quantized weight `<name>`:
 

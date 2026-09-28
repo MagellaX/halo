@@ -1,6 +1,6 @@
 # Scripts Reference
 
-Catalog of toolkit scripts by category. For config fields see [Configuration](configuration-reference.md); for parallelism flags see [Expert Parallelism](../parallelism/expert-parallelism.md).
+Catalog of toolkit scripts by category. For config fields see [Configuration](configuration-reference.md); for parallelism flags see [ParallelismConfig](configuration-reference.md#parallelismconfig).
 
 Every entry script answers `python <script> --help` with its full flag list, including the CLI overrides for any YAML field.
 
@@ -14,12 +14,12 @@ Those helpers are the shared flag surfaces:
 
 | Helper | Flags |
 |---|---|
-| `scripts/_common.py` | The shard cap, the Hub source block and `--trust_remote_code`; taken by the checkpoint tools across `after_training/`, `before_training/` and `inference/reward_model/` |
-| `scripts/inference/_common.py` | The OpenAI endpoint, resume and Gradio blocks |
+| `scripts/_common.py` | The shard cap, the Hub source block, `--dtype`, `--device_map` and `--trust_remote_code`, each taken by the `before_training/` and `after_training/` tools that need it (`quantize_to_lowp.py` and `s3_datasets.py` take none, `prepare_dataset.py` only `--trust_remote_code`); `--trust_remote_code` and the dtype flag, spelled `--rm_dtype`, by the reward-model scorers `rm_scoring.py` and `rm_rejection_sampling.py` (their device flag is their own `--rm_device`); `--trust_remote_code` by `inference/generation/dataset_deduplication.py`; the OpenAI-compatible endpoint block (`--base_url`, `--api_key`), taken by every CLI that drives a served model — `openai_batched_generation.py`, the two reward-model scorers, `run_env.py`, `run_code_contests.py` and the two Gradio playgrounds — with a required `--model` on all but the playgrounds (the chatbot declares its own optional `--model`; the environment playground takes the name in its UI) |
+| `scripts/inference/_common.py` | The generation block (`--n_parallel`, `--temperature`, `--max_gen_tokens`) and the prompt-row fields (`--id_field`, `--prompt_field`, `--local_system_prompt_field`, `--global_system_prompt`), shared by the S3 generation CLI and the reward-model scorers; the S3 dataset block (`--input_path`, `--output_path`, `--subfolder`) and `--checkpoint_interval` of the S3 generation CLI; the Gradio server block (`--host`, `--port`, `--share`) of the two playgrounds |
 | `scripts/inference/reward_model/_common.py` | The reward-model scoring block, on top of the previous two |
 | `scripts/environments/_common.py` | The env-eval dataset/endpoint/trajectory flags, `--training_config`, and the output writer |
 
-Flag spelling is per script and stable: the Gradio apps, `scripts/profiling/**`, `before_training/prepare_dataset.py` and `before_training/s3_datasets.py` spell their own multi-word flags with dashes (`--api-key`); every other script uses underscores (`--api_key`), matching the YAML field names a training flag overrides. The shared `--trust_remote_code` keeps its one spelling everywhere, `prepare_dataset.py` included.
+Flag spelling is per script and stable: `scripts/profiling/**`, `before_training/prepare_dataset.py` and `before_training/s3_datasets.py` spell their own multi-word flags with dashes (`--server-url`); every other script uses underscores (`--base_url`), matching the YAML field names a training flag overrides. The shared `--trust_remote_code` keeps its one spelling everywhere, `prepare_dataset.py` included.
 
 The checkpoint tools under `after_training/` and `before_training/` take one source/destination pair: `--input_dir` → `--output_dir` for a local checkpoint directory, `--model_id` → `--output_dir` where the source may also be a Hub repo (`patch_vocab.py`, `convert_deepseek_v4_bf16.py`, `convert_mistral4_bf16.py`, `convert_glm5_bf16.py`, `reset_sinks.py`). `reattach_vision_tower.py` takes both: `--input_dir` for the text-only export, `--model_id` for the multimodal base.
 
@@ -27,7 +27,7 @@ Three tools keep a differently-shaped source because it is a different thing: `m
 
 `merge_peft_adapters.py` selects the head with `--task {causal_lm,classification}`.
 
-Launcher: `torchrun` for all multi-GPU work — every parallel axis **and** plain FSDP2 data parallelism; `python` for single-GPU and LoRA. `accelerate launch` with the `launcher-configs/accelerate/*.yaml` configs stays supported for plain data parallelism only.
+Launcher choice: [Launcher selection](../getting-started/configuration.md#launcher-selection).
 
 ## Training scripts
 
@@ -117,11 +117,11 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 torchrun --nproc_per_node=7 \
 |--------|-------------|
 | `scripts/inference/generation/openai_batched_generation.py` | Async batched generation with OpenAI-compatible API. Every request goes out as plain text, so rows carrying a structured `response_format` (any `type` but `text`) are refused before generation; the reward-model scripts honor one |
 | `scripts/inference/generation/dataset_deduplication.py` | FAISS-based semantic deduplication. Keyed on `--text_field` alone: two rows with the same text collapse to one however they differ elsewhere, so an images column does **not** make them distinct — deduplicate a VLM dataset before pairing its images, or on a field that carries the difference |
-| `scripts/inference/reward_model/rm_rejection_sampling.py` | vLLM + reward model preference dataset generation. A hypothesis the endpoint cut at `--max_gen_tokens` is dropped rather than scored as if it had finished, and a row left with fewer than two usable hypotheses is skipped; both counts are in the run summary |
+| `scripts/inference/reward_model/rm_rejection_sampling.py` | Rejection-sampled preference (or offline-GRPO) dataset generation: hypotheses from any OpenAI-compatible endpoint, scored by a local reward model. A hypothesis the endpoint cut at `--max_gen_tokens` is dropped rather than scored as if it had finished, and a row left with fewer than two usable hypotheses is skipped; both counts are in the run summary |
 | `scripts/inference/reward_model/rm_scoring.py` | Score datasets using reward models. A response cut at `--max_gen_tokens` is dropped and counted (`truncated=`) rather than scored as if it had finished |
-| `scripts/inference/playground/gradio_openai_chatbot.py` | Chatbot UI (Gradio + OpenAI API). `--api-key` defaults to `$VLLM_API_KEY`, else `$OPENAI_API_KEY`, else vLLM's `EMPTY` placeholder |
-| `scripts/inference/playground/gradio_environment_playground.py` | Environment playground (Gradio) for testing GRPO environments against a rollout server. Episodes run through the shared eval driver (`run_episode` in `src/environments/eval_runner.py`), so a turn the engine cut off at its token cap, or one the model ended on nothing, is recovered here exactly as in training. `--vllm-url` prefills the rollout server base URL; `--api-key` defaults to `$VLLM_API_KEY`, else `$OPENAI_API_KEY`, else vLLM's `EMPTY` placeholder, and stays server-side; `--host` binds loopback (`127.0.0.1`), so publishing the UI — and that key's spend — takes an explicit `--host 0.0.0.0` |
-| `scripts/environments/inference/run_code_contests.py` | Evaluate on competitive programming: dataset adapter (every `CODE_DATASET_ADAPTERS` entry that scores raw rows: `codeforces`, `deepcoder`, `livecodebench`, `icpc`, `hlce`; `hardtests` is scored from its prepared pool) + language (python/cpp/c, or a comma-separated list the model chooses from per program) + success@k bucketed by adapter group field (rating/difficulty/contest), against vLLM or OpenRouter. `--env_type` picks `codeforces` or `code_contests`, falling back to `codeforces`. `--reasoning_effort` (low/medium/high, or `none` for no level; falls back to the training config's, where a `null` is `none`, else `medium`) sets the template effort and, unless `--max_tokens` or `--training_config` is given, the generation budget: the effort's thinking budget (4096/8192/16384) plus 4096 tokens of solution headroom → 8192/12288/20480, and 32768 at `none`. `--max_turns` falls back to 15. `--eval_protocol` (`harness` or `leaderboard`: one submission, no scratchpad; falls back to the training config's value, else `harness`) names the scoring contract ([what `success@k` counts](../training-methods/grpo/environments/evaluation.md#running-an-evaluation)). `--start_date` / `--end_date` (inclusive `YYYY-MM-DD`) and `--platform` select the problems of an adapter that stamps contest dates (`livecodebench`). `--env_kwargs` carries the env/grading knobs without a flag (`max_turns`, `language`, `eval_protocol` and `reasoning_effort` go through their flags); `--save_trajectories <path>` / `--trajectory_dir <folder>` record JSONL |
+| `scripts/inference/playground/gradio_openai_chatbot.py` | Chatbot UI (Gradio + OpenAI API). `--api_key` defaults to `$VLLM_API_KEY`, else `$OPENAI_API_KEY`, else vLLM's `EMPTY` placeholder |
+| `scripts/inference/playground/gradio_environment_playground.py` | Environment playground (Gradio) for testing GRPO environments against a rollout server. Episodes run through the shared eval driver (`run_episode` in `src/environments/eval_runner.py`), so a turn the engine cut off at its token cap, or one the model ended on nothing, is recovered here exactly as in training. `--base_url` prefills the rollout server base URL; `--api_key` defaults to `$VLLM_API_KEY`, else `$OPENAI_API_KEY`, else vLLM's `EMPTY` placeholder, and stays server-side; `--host` binds loopback (`127.0.0.1`), so publishing the UI — and that key's spend — takes an explicit `--host 0.0.0.0` |
+| `scripts/environments/inference/run_code_contests.py` | Evaluate on competitive programming: dataset adapter (every `CODE_DATASET_ADAPTERS` entry that scores raw rows: `codeforces`, `deepcoder`, `livecodebench`, `icpc`, `hlce`; `hardtests` is scored from its prepared pool) + language (python/cpp/c, or a comma-separated list the model chooses from per program) + success@k bucketed by adapter group field (rating/difficulty/contest), against vLLM or OpenRouter. `--env_type` picks `codeforces` or `code_contests`, falling back to the training config's `environment_type`, else `codeforces`. `--reasoning_effort` (low/medium/high, or `none` for no level; falls back to the training config's, where a `null` is `none`, else `medium`) sets the template effort and, unless `--max_tokens` or `--training_config` is given, the generation budget: the effort's thinking budget (4096/8192/16384) plus 4096 tokens of solution headroom → 8192/12288/20480, and 32768 at `none`. `--max_turns` falls back to the training config's, else the environment's default (15). `--eval_protocol` (`harness` or `leaderboard`: one submission, no scratchpad; falls back to the training config's value, else `harness`) names the scoring contract ([what `success@k` counts](../training-methods/grpo/environments/evaluation.md#running-an-evaluation)). `--start_date` / `--end_date` (inclusive `YYYY-MM-DD`) and `--platform` select the problems of an adapter that stamps contest dates (`livecodebench`). `--env_kwargs` carries the env/grading knobs without a flag (`max_turns`, `language`, `eval_protocol` and `reasoning_effort` go through their flags); `--save_trajectories <path>` / `--trajectory_dir <folder>` record JSONL |
 | `scripts/environments/inference/run_env.py` | Generic eval runner for every other env (`--env_type qa_search`, `exam_qa`, `swe`, `mcp`, …; optional when `--training_config` names an `environment_type`) over an OpenAI endpoint; reads `--prompt_field` / `--answer_field` / `--context_fields` columns, names examples by `--id_field` (default `id`), exits on a field naming no column (the default answer and id columns may be absent), reports reward and success@k bucketed by `--group_by`; `--env_kwargs` merges per-env settings; `--save_trajectories` / `--trajectory_dir` record JSONL |
 | `scripts/environments/inference/regrade_trajectories.py` | Offline re-grader: replays saved JSONL (`<jsonl...> --workers --output`) through grading only, decoupled from generation. Needs the code-contest meta `run_code_contests.py` stamps (`adapter`/`language` on top of the generic eval meta); a `run_env.py` trajectory is rejected up front. Re-applies the recorded contest selection and protocol, and leaves an episode recorded with a `generation_error` out of `n`, counted in `generation_errors` |
 
@@ -136,9 +136,9 @@ run it is judging unless a flag says otherwise. A `rollout_stop_tokens` entry th
 tokenizer does not know raises here, where the trainer warns and skips a partially unresolved set.
 
 In `openai_batched_generation.py`, `--input_path` / `--output_path` are S3 **keys**, not URIs:
-`build_s3_uri` joins them under `HALO_S3_DEFAULT_BUCKET` (default `my-bucket` — set it to your own
-bucket) and `--subfolder` (default `datasets`, `None` to skip). The same flag names on
-`dataset_deduplication.py` are ordinary local paths.
+`build_s3_uri` joins them under `HALO_S3_DEFAULT_BUCKET` (required; unset raises) and `--subfolder`
+(default `datasets`, `None` to skip). On `dataset_deduplication.py`, `--input_path` is a
+local file or a Hub dataset id and `--output_path` a local path.
 
 The three async CLIs — `openai_batched_generation.py`, `rm_rejection_sampling.py`, `rm_scoring.py`
 — run under a shared SIGINT/SIGTERM handler
@@ -147,21 +147,21 @@ Progress is checkpointed, so re-running resumes; the non-zero exit is what stops
 `&&` chain from consuming a partial output dataset as a finished one.
 
 A run that produced no usable row raises rather than writing an empty result (`reject_empty_results`), so a dead endpoint or a
-wrong `--model_name` cannot republish the resumed rows as a finished job. Each CLI's summary line
+wrong `--model` cannot republish the resumed rows as a finished job. Each CLI's summary line
 names its per-reason drop counts (first-response failures, degenerate skips).
 
-Every endpoint these CLIs talk to is OpenAI-compatible (`--openai_base_url` / `--openai_api_key`),
+Every endpoint these CLIs talk to is OpenAI-compatible (`--base_url` / `--api_key`),
 reached through the one shared client (`create_openai_client`) with the toolkit's retry policy. There
-is no separate Azure mode — point `--openai_base_url` at the deployment's OpenAI-compatible route like
+is no separate Azure mode — point `--base_url` at the deployment's OpenAI-compatible route like
 any other endpoint.
 
 ```bash
 HALO_S3_DEFAULT_BUCKET=your-bucket \
 python scripts/inference/generation/openai_batched_generation.py \
-    --model_name my-model --input_path prompts --output_path responses
+    --model my-model --input_path prompts --output_path responses
 
 python scripts/inference/reward_model/rm_scoring.py \
-    --model_name my-model --prompts_source data/prompts.jsonl --rm_model_path path/to/reward-model
+    --model my-model --prompts_source data/prompts.jsonl --rm_model_path path/to/reward-model
 ```
 
 ## Post-training scripts
@@ -170,7 +170,7 @@ python scripts/inference/reward_model/rm_scoring.py \
 |--------|-------------|
 | `scripts/after_training/merge_peft_adapters.py` | Merge LoRA/PEFT adapters into the base model, loaded through the class the adapter's keys address (the text-only class after a `text_only_model` run); refuses a native EP expert-LoRA directory and an adapter whose keys name no module of the base — PEFT would merge nothing there and the tool would write the bare base |
 | `scripts/after_training/merge_models.py` | Merge same-architecture checkpoints in weight space (linear / slerp / task_arithmetic / ties). Streams one tensor at a time across the inputs (each key loaded from every model, merged, written), so peak host memory scales with the largest tensor, never the merged model ([Model Merging](model-merging.md#memory-and-output)) |
-| `scripts/after_training/merge_ep_shards.py` | Merge EP sharded checkpoints into a single model (`--max_shard_size` caps the output shards, default `5GB`). `--delete_input_shards` frees the per-rank inputs once the merged checkpoint is complete — until then peak disk holds both. Refuses an input holding a PEFT adapter beside the shards: the aux copy carries `adapter_config.json` but no weight file, so the merged directory would claim an adapter it does not hold |
+| `scripts/after_training/merge_ep_shards.py` | Merge EP sharded checkpoints into a single model (`--max_shard_size` caps the output shards, default `5GB`). `--delete_input_shards` frees the per-rank inputs once the merged checkpoint is complete — until then peak disk holds both. Refuses an input holding a PEFT adapter beside the shards ([why](checkpoints.md#expert-parallelism-ep-eptp-epcp)) |
 | `scripts/after_training/convert_to_bf16.py` | Convert model weights to BF16, norm leaves kept fp32. Re-applies the source's training sidecars to a full model before saving (neutralized GptOss sinks, balancing tensors re-read from the source shards at their trained fp32) and carries `router_balancing_biases.pt` / `training_provenance.json` into the output either way, so an unmerged adapter conversion still hands them to the later merge; `--merge_adapter` without `--peft` is refused. Both `--peft` paths load the base through the class the adapter's keys address, as `merge_peft_adapters.py` does. `--model_type` (`causal_lm` default, `classifier`, `base`) picks the class the checkpoint loads with and gates the PEFT refusal. `--verify` asserts the STORED dtypes read from the saved safetensors headers — never a `from_pretrained` reload, which casts on the way in and so can never fail — weighted by parameter count, not tensor count. An unmerged PEFT save is exempt: PEFT restores LoRA A/B to fp32 as it writes them. `--check_inference` is the separate diagnostic: it reloads the saved checkpoint and prints what it generates, returning no verdict — `--verify` is the gate that raises |
 | `scripts/after_training/quantize_to_lowp.py` | Quantize a bf16/fp32 checkpoint to block-scaled mxfp8/mxfp4/nvfp4 (pairs with QAT — see [Mixed-Precision Training](../optimization/low-precision-moe-kernels.md)). `--format {mxfp8,mxfp4,nvfp4}` is required — the checkpoint names no target. The training run's lowp **scope** is not recorded in the checkpoint either, so four more flags restate it under the `ParallelismConfig` names and defaults — a config's values transfer verbatim: `--lowp_apply_dense_mlp` / `--lowp_apply_moe_experts` (both on; `--no-` prefix to disable) and `--lowp_keep_first_blocks` / `--lowp_keep_last_blocks` (both `0`) |
 | `scripts/after_training/reset_sinks.py` | Reset attention sink tokens in `--model_id` (a local checkpoint directory or a Hub repo id). `--dry_run` prints every sink tensor without writing. `--output_dir` is required for a write unless `--in_place` is given (the two are mutually exclusive; `--in_place` takes a local directory only); a `--dry_run` only reads and needs neither. Both branches stage the write — a sibling temp file for a single-file checkpoint, a sibling staging directory for a sharded one — verify every sink tensor sits at its dtype min, and only then replace the target, so a write that kept live sinks raises with the target untouched. It writes no `training_provenance.json` — both branches carry the source's record over verbatim, so a checkpoint whose sinks it just neutralized can still claim `live` to the merge tools that trust that record. Only `PeftAdapterSaver` writes the file |
@@ -229,8 +229,9 @@ Every tool here refuses an input it cannot express, rather than writing a plausi
   takes one `--trust_remote_code`, spelled once (`add_trust_remote_code_arg` in
   `scripts/_common.py`): `merge_peft_adapters.py`, `merge_models.py`,
   `convert_to_bf16.py`, `reset_sinks.py`, `reattach_vision_tower.py`, `patch_vocab.py`,
-  `prepare_dataset.py`, `convert_deepseek_v4_bf16.py`, and the reward-model scoring CLIs
-  (`rm_scoring.py`, `rm_rejection_sampling.py`) through `scripts/inference/reward_model/_common.py`.
+  `prepare_dataset.py`, `convert_deepseek_v4_bf16.py`, the reward-model scoring CLIs
+  (`rm_scoring.py`, `rm_rejection_sampling.py`) through `scripts/inference/reward_model/_common.py`,
+  and `dataset_deduplication.py`.
 
     **The default follows the input source.** A local checkpoint or adapter (`--input_dir`,
     `--adapter_dir`, `--models`, `--rm_model_path`, or the tokenizer of the run being prepared) defaults **on**: the
@@ -238,7 +239,8 @@ Every tool here refuses an input it cannot express, rather than writing a plausi
     already produced that artifact.
 
     A Hub-capable `--model_id` source (`patch_vocab.py`, `convert_deepseek_v4_bf16.py`,
-    `reattach_vision_tower.py`, `reset_sinks.py`) defaults **off**: a freshly downloaded
+    `reattach_vision_tower.py`, `reset_sinks.py`), like `dataset_deduplication.py`'s Hub-capable
+    `--model_name`, defaults **off**: a freshly downloaded
     third-party repo must not execute its own code merely because a tool was pointed at it. Either
     way the opposite is one flag away (`--trust_remote_code` / `--no-trust_remote_code`).
 
@@ -276,23 +278,14 @@ Every tool here refuses an input it cannot express, rather than writing a plausi
     Both checks run after the sharded-input refusal and after the already-per-expert copy-through,
     so those keep their own diagnosis.
 
-- **Asymmetric key sets.** `merge_models.py` refuses models whose tensor key sets differ — a key present
-  in only one model would otherwise be dropped from the merge (typically one checkpoint saved untied,
-  carrying `lm_head.weight`, and another tied).
-
-- **Tokenizer-less source.** `merge_models.py` refuses a `--tokenizer_source` (default: the base model,
-  else the first input) that ships no tokenizer files, since every `from_pretrained`-based consumer of
-  the merged checkpoint would fail to build a tokenizer.
-
-    This one raises *after* the merged weights are written (the source is only read at the aux-file
-    copy). Re-point `--tokenizer_source` at a directory or Hub id that carries one, or pass
-    `--allow_missing_tokenizer` if a tokenizer-less artifact is intended.
+- **`merge_models.py` inputs.** Asymmetric key sets and a tokenizer-less `--tokenizer_source` are
+  refused ([Model Merging](model-merging.md)).
 
 ## Preparation scripts
 
 | Script | Description |
 |--------|-------------|
-| `scripts/before_training/prepare_dataset.py` | Pre-process SFT or raw-text datasets: tokenization, packing, sharding. `--mode chat` (default) applies the chat template; `--mode text` tokenizes `--text-field` directly and appends EOS per document — the (continued) pre-training path |
+| `scripts/before_training/prepare_dataset.py` | Pre-process SFT or raw-text datasets: tokenization, packing, sharding. `--mode chat` (default) applies the chat template; `--mode text` tokenizes `--text-field` directly and appends EOS per document — the (continued) pre-training path. The output holds `train` and `test` (an input with no `test` bakes its `validation` split as `test`); any other input split is left out with a warning |
 | `scripts/before_training/s3_datasets.py` | CLI over the S3 transport: `push`, `download`, `list`, `exists`, `delete` a folder under `--bucket` (default `HALO_S3_DEFAULT_BUCKET`). `delete` removes ONE object; `--recursive/-r` is opt-in for a whole prefix. See [S3 Utilities](../data/s3-utilities.md) |
 | `scripts/before_training/patch_vocab.py` | Patch vocabulary with new tokens, reset attention sinks |
 | `scripts/before_training/convert_deepseek_v4_bf16.py` | Dequantize a FineGrained-FP8 DeepSeek-V4 checkpoint to uniform bf16 for training; `--max_shard_size` sizes the output shards (default `5GB`; see [DeepSeek-V4](../models/deepseek-v4.md)) |
@@ -304,8 +297,8 @@ Every tool here refuses an input it cannot express, rather than writing a plausi
 ```bash
 python scripts/before_training/prepare_dataset.py \
     --input "s3://bucket/raw/dataset" --output "s3://bucket/preprocessed/dataset" \
-    --model-name "Qwen/Qwen3-8B" --max-length 8192 --num-shards 64 --pack-sequences \
-    --assistant-message-template $'<|im_start|>assistant\n'
+    --model-name "Qwen/Qwen3-8B" --max-length 8192 --test-size 0.01 --num-shards 64 \
+    --pack-sequences --assistant-message-template $'<|im_start|>assistant\n'
 
 python scripts/before_training/patch_vocab.py \
     --model_id Zyphra/ZAYA1-8B --output_dir /mnt/models/ZAYA1-8B-patched \
@@ -314,7 +307,7 @@ python scripts/before_training/patch_vocab.py \
 # remote-code family (Bailing/Ling, Laguna): add --trust_remote_code — a Hub source is opt-in here
 ```
 
-`patch_vocab.py` only **grows** the embedding (added tokens reuse existing padding rows), never shrinks it: models like GPT-OSS ship a vocab padded past `len(tokenizer)`, and shrinking would drop the high special tokens (harmony `<|return|>`/EOS, …) and break generation. A vocab-patched checkpoint is a **training base** — serve the original full-vocab model, not the patched one.
+`patch_vocab.py` only **grows** the embedding (added tokens reuse existing padding rows), never shrinks it: models like GPT-OSS ship a vocab padded past `len(tokenizer)`, and shrinking would drop the high special tokens (harmony `<|return|>`/EOS, …) and break generation. A patched checkpoint therefore serves like its base, except a GPT-OSS patched with `--reset_sinks`: served sinks-off, the pretrained model degenerates ([GPT-OSS](../models/gpt-oss.md#serving-for-grpo-vllm)). The added tokens start at the mean embedding and mean nothing until trained.
 
 ## Profiling & benchmarks
 
@@ -338,7 +331,7 @@ Shell runners in the same directory: `run_all_benchmarks.sh`, `run_mfu_benchmark
 
 ```bash
 ./tests/gpu/profiling/run_ep_tp_benchmarks.sh --quick
-torchrun --nproc_per_node=8 tests/gpu/profiling/benchmark_smpo_ep.py
+torchrun --nproc_per_node=8 tests/gpu/profiling/benchmark_smpo_ep.py --ep 8
 ```
 
 The docs' own figures are generated by the standalone matplotlib scripts in `scripts/diagrams/`

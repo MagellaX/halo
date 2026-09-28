@@ -23,6 +23,7 @@ from safetensors import safe_open
 from src.checkpoint.format import has_whole_model_weight_file, resolve_checkpoint_weights
 from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.checkpoint_coverage import verify_checkpoint_coverage
+from src.models.loading.dtype import reject_fp8_tensor
 from src.models.loading.lazy_safetensors.conversion import Concat, Convert, Rename, convert_disk_keys
 
 logger = logging.getLogger(__name__)
@@ -205,12 +206,16 @@ class SafetensorsWeightLoader:
         model: nn.Module,
         plans: list[WeightPlan],
         dtype: torch.dtype | None = None,
+        keep_fp32: frozenset[str] = frozenset(),
     ):
         """Materialize weights and assign to the model's parameters.
 
         EXPERT_SHARD: only the local expert slice is read from disk.
         REPLICATE: full tensor is read.
         IGNORE: skipped.
+
+        Every float parameter takes ``dtype``, except the ``keep_fp32`` model keys, which take fp32:
+        the parameters an eager load keeps fp32 for a run that holds fp32 masters.
 
         Every materialized tensor is shape-checked against the live target before assignment, since
         this path bypasses ``from_pretrained``'s own size-mismatch check.
@@ -232,16 +237,13 @@ class SafetensorsWeightLoader:
                     shard_dim=plan.shard_dim if sharded else None,
                     shard_len=plan.shard_end - plan.shard_start if sharded else None,
                 )
-                # Every float parameter, overriding the class's _keep_in_fp32_modules[_strict]:
-                # FSDP2 rejects mixed dtypes in one shard group, and the EP from_pretrained fallback
-                # re-casts to match. Parameters only: a float buffer may be fp32 by design (Zaya's
-                # balancing biases).
-                if (
-                    dtype is not None
-                    and tensor.is_floating_point()
-                    and isinstance(_target_tensor(model, plan.model_key), nn.Parameter)
-                ):
-                    tensor = tensor.to(dtype)
+                # Every float parameter takes the run dtype, as the eager loaders cast (FSDP2 rejects
+                # mixed dtypes in one shard group); keep_fp32 holds the fp32-masters exceptions.
+                # Parameters only: a float buffer may be fp32 by design (Zaya's balancing biases).
+                if tensor.is_floating_point() and isinstance(_target_tensor(model, plan.model_key), nn.Parameter):
+                    reject_fp8_tensor(plan.model_key, tensor, dtype)
+                    if dtype is not None:
+                        tensor = tensor.to(torch.float32 if plan.model_key in keep_fp32 else dtype)
 
                 assign_tensor_to_model(model, plan.model_key, tensor)
                 loaded += 1
@@ -348,7 +350,7 @@ def verify_loaded_shape(
     raise RuntimeError(
         f"Lazy load: tensor from {source} has shape {tuple(tensor.shape)} but model tensor "
         f"{model_key!r} expects {tuple(expected)}{sliced}. The checkpoint does not match the "
-        f"config.json the model was built from (e.g. a patch_vocab-shrunk checkpoint paired with "
+        f"config.json the model was built from (e.g. a patch_vocab-grown checkpoint paired with "
         f"the base config, or a changed intermediate_size / expert count)."
     )
 

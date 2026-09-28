@@ -44,13 +44,13 @@ Gemma 4 attention uses two patterns that need bespoke wrappers:
 
 No Gemma 4 attention class appears in `TP_SHARDABLE_ATTENTION_CLASSES` (`src/distributed/tensor_parallel/module_types.py`) or in the CP wrapper registry (`src/distributed/context_parallel/layers/`), so neither mode patches Gemma 4 attention.
 
-Pipeline parallelism is refused for the same two patterns: `Gemma4PPSpec` declares `SUPPORTS_PP = False` because the per-layer embeddings are indexed by enumerate position — which a sliced layer list silently re-bases — and the KV-shared layers read an earlier layer's K/V through a forward-threaded dict a stage boundary breaks ([Pipeline Parallelism](../parallelism/pipeline-parallelism.md)).
+Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 ETP only shards the expert FFN weights (gate/up/down), leaving attention untouched and the sibling `Gemma4TextRouter` FSDP-managed and replicated across ETP ranks. The fused-GLU `gate_up_proj` is split into separate `gate_proj`/`up_proj` shards at init so each rank holds matching gate/up positions on the intermediate dim. See [Expert Tensor Parallelism](../parallelism/expert-tensor-parallelism.md).
 
 ## Buffer fixes
 
-`src/models/patches/buffer_fixes.py` restores two buffers that meta-device init drops: `fix_non_persistent_buffers()` restores `embed_scale` (the `sqrt(hidden_dim)` scaled-word-embedding factor); `fix_rotary_inv_freq()` recomputes the per-layer-type RoPE `inv_freq` buffers (`full_attention_inv_freq` + `sliding_attention_inv_freq`) in FP32.
+`finalize_loaded_model()` (`src/models/patches/buffer_fixes.py`), run by every load path, restores two buffers that meta-device init drops: a `_NON_PERSISTENT_FIXERS` fixer restores `embed_scale` (the `sqrt(hidden_dim)` scaled-word-embedding factor); the `_ROTARY_FIXERS` chain recomputes the per-layer-type RoPE `inv_freq` buffers (`full_attention_inv_freq` + `sliding_attention_inv_freq`) in FP32.
 
 ## Export
 
@@ -82,7 +82,7 @@ the towers too.
 
 **Long-context attention**: Gemma 4's full-attention layers run at `global_head_dim=512`, which every FlashAttention kernel and cuDNN SDPA reject (FA2 caps at 256; FA4's SM100 kernel overflows tensor memory).
 
-`load_distributed_model` redirects any FlashAttention impl to SDPA for Gemma 4, then `patch_sdpa_for_gemma4_long_seq()` forces the mem-efficient SDPA kernel, the only backend handling this head dim, with manual KV repeat (`use_gqa_in_sdpa → False`). That avoids the math kernel's `[B, heads, S, S]` score matrix, which OOMs at seq 32k. Set `attn_implementation: sdpa` to skip the warning.
+`load_distributed_model` redirects any FlashAttention impl to SDPA for Gemma 4, then `patch_sdpa_for_wide_heads()` forces the mem-efficient SDPA kernel, the only backend handling this head dim, with manual KV repeat (`use_gqa_in_sdpa → False`). That avoids the math kernel's `[B, heads, S, S]` score matrix, which OOMs at seq 32k. Set `attn_implementation: sdpa` to skip the warning.
 
 The KV-repeat override is not what makes the global layers legal — transformers 5.16 disables GQA above head_dim 256 itself. It stays because the patch pins mem-efficient as the *only* enabled backend process-wide, where native `enable_gqa` for the 256-dim sliding layers is unverified; the manual repeat is the one measured path. See [Flash Attention](../optimization/flash-attention.md#model-specific-handling).
 

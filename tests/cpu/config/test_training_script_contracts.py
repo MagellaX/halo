@@ -32,6 +32,7 @@ import pytest
 
 from src.cli import training_methods
 from src.data.collators import completions_only
+from src.data.pipeline.preprocessed_metadata import PreprocessedDatasetMetadata, validate_preprocessing_compatibility
 from tests.common.utils import load_script_module
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -126,9 +127,12 @@ def test_training_script_index_is_nonempty():
 
 # Modality detection must read the SAME commit the weights load from
 
+# script_runner.py holds the scripts' ``resolve_vlm_run``, whose ``is_vlm_run`` call is where their
+# pin is threaded.
 _VLM_PROBE_CALL_SITES = [
     *_TRAINING_SCRIPTS,
     _REPO_ROOT / "src" / "distributed" / "loading" / "vlm_setup.py",
+    _REPO_ROOT / "src" / "training" / "script_runner.py",
 ]
 
 
@@ -170,19 +174,59 @@ def test_is_vlm_model_probe_is_revision_pinned(path: Path):
         )
 
 
+@pytest.mark.parametrize(
+    "path",
+    _VLM_PROBE_CALL_SITES,
+    ids=[str(p.relative_to(_REPO_ROOT)) for p in _VLM_PROBE_CALL_SITES],
+)
+def test_is_vlm_model_probe_threads_trust_remote_code(path: Path):
+    """A probe that fetches the config must pass the run's ``trust_remote_code``: left at its
+    default it refuses a remote-code config the run trusted, and forced on it would execute code the
+    run never trusted, on the run's first hub contact."""
+    calls = _vlm_probe_calls(path)
+    if not calls:
+        pytest.skip("module does not probe the modality")
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "config" in kwargs or "trust_remote_code" in kwargs, (
+            f"{path}: modality probe fetches a config without the run's trust_remote_code="
+        )
+
+
+def _forced_remote_code_lines(path: Path) -> list[int]:
+    """Lines where ``path`` passes a literal ``trust_remote_code=True``."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and any(
+            kw.arg == "trust_remote_code" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+            for kw in node.keywords
+        )
+    ]
+
+
+def test_no_src_load_forces_trust_remote_code():
+    """Every load in ``src/`` takes the run's ``trust_remote_code``. Forced on, it runs a
+    checkpoint's remote modules the run never trusted, and on a repo that ships a native class
+    beside an ``auto_map`` it swaps the native config or processor for the remote one."""
+    src_files = sorted((_REPO_ROOT / "src").rglob("*.py"))
+    assert len(src_files) > 100, f"the src/ sweep collapsed to {len(src_files)} files"
+    forced = [
+        f"{path.relative_to(_REPO_ROOT)}:{line}" for path in src_files for line in _forced_remote_code_lines(path)
+    ]
+    assert not forced, f"trust_remote_code=True hardcoded at {forced}; pass the run's model_config.trust_remote_code"
+
+
 # sft.py: preprocessed completion-masking mismatch
 
 
 @pytest.fixture(scope="module")
 def metadata_cls():
-    from src.data.pipeline.preprocessed_metadata import PreprocessedDatasetMetadata
-
     return PreprocessedDatasetMetadata
 
 
 def _validate_masking(metadata_cls, baked: bool | None, runtime: bool):
-    from src.data.pipeline.preprocessed_metadata import validate_preprocessing_compatibility
-
     config = {} if baked is None else {"train_on_completions_only": baked}
     metadata = metadata_cls(max_length=4096, train_on_completions_only=bool(baked), config=config)
     validate_preprocessing_compatibility(

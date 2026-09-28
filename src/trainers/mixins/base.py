@@ -11,7 +11,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import fields
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -37,6 +37,8 @@ from src.distributed.expert_parallel.dispatcher import (
 from src.distributed.expert_parallel.expert_weights import has_ep_lora
 from src.distributed.expert_parallel.saving import validate_ep_sharded_save
 from src.distributed.fsdp import (
+    IdentityParamSet,
+    make_disable_adapter_fsdp2_safe,
     reshard_fsdp2_modules,
     reshard_label,
     setup_fsdp2_for_dp,
@@ -47,12 +49,14 @@ from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.pipeline_parallel.losses import PPLossAdapter, causal_lm_token_loss
 from src.distributed.runtime import (
     barrier,
+    collective_device,
     get_global_rank,
     get_global_world_size,
     is_global_main_process,
     is_output_shared_filesystem,
     nccl_safe_broadcast,
     rank_consensus,
+    reject_across_ranks,
 )
 from src.env import is_accelerate_fsdp_launch, is_accelerate_launch
 from src.kernels.liger.orchestrator import (
@@ -60,9 +64,11 @@ from src.kernels.liger.orchestrator import (
     trl_reapplication_config,
     warn_if_flce_unreachable,
 )
+from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.config_levels import config_sources, snapshot_special_token_ids
+from src.models.loading.dtype import resolve_training_dtype
 from src.models.moe_balancing import ep_wraps_experts
-from src.models.structure import model_has_quantized_params, unwrap_framework_wrappers
+from src.models.structure import lora_fold_targets, model_has_quantized_params, unwrap_framework_wrappers
 from src.optimizers.adamw_bf16 import build_bf16_optimizer
 from src.optimizers.param_groups import build_tensor_type_grouped_optimizer
 from src.optimizers.registry import (
@@ -90,7 +96,12 @@ logger = get_logger(__name__, log_level="info")
 # FSDP2 shaping knobs the mixin's own wrap implements; names only. Each knob's "not requested"
 # value is its own ParallelismConfig dataclass default, read at call time so a flipped default
 # cannot leave a stale copy here gating on the wrong value.
-_FSDP_SHAPING_KNOBS = ("use_hsdp", "fsdp_reshard_after_forward", "fsdp_reshard_after_backward")
+_FSDP_SHAPING_KNOBS = (
+    "use_hsdp",
+    "fsdp_reshard_after_forward",
+    "fsdp_reshard_after_backward",
+    "fsdp_defer_grad_sync",
+)
 
 # ParallelismConfig knobs only the mixin-managed (torchrun) FSDP2 wrap implements.
 _ACCELERATE_UNSUPPORTED_KNOBS = (*_FSDP_SHAPING_KNOBS, "fp32_grad_reduce")
@@ -101,6 +112,21 @@ _TRL_LIGER_LOSS_ATTRS = ("liger_loss_fn", "liger_grpo_loss", "liger_loss")
 # Peak-allocated fraction of device memory above which the post-first-step margin warning fires.
 # A rank this close to full after the first optimizer step OOMs on a later backward.
 _MEMORY_MARGIN_WARN_RATIO = 0.92
+
+
+class FsdpExclusions(NamedTuple):
+    """What an FSDP2 wrap leaves out of its shard groups.
+
+    ``ep_modules`` sync their own gradients (EP hooks or the deferred sweep) and are left out whole,
+    except under ``experts_fsdp_managed``, where FSDP2's reduce-scatter is their only sync.
+    ``dtype_params`` are frozen parameters whose dtype no trainable parameter shares (a base under
+    differently typed adapters); they are taken one by one, so a trainable child of the module that owns
+    one stays in its shard group. ``params`` is both, deduplicated by identity.
+    """
+
+    ep_modules: list[nn.Module]
+    dtype_params: list[nn.Parameter]
+    params: list[nn.Parameter]
 
 
 def thin_memory_margin_message(peak_bytes: int, total_bytes: int, rank: int) -> str | None:
@@ -290,8 +316,8 @@ class DistributedTrainerMixin(
         self._ep_config = None
         self._device_mesh = None
         self._fsdp_wrapped = False
-        self._backward_reshard_modules = []
-        self._backward_reshard_armed = True
+        self._window_modules = []
+        self._window_end_armed = True
         self._warned_empty_labels = False
         self._memory_margin_checked = False
 
@@ -383,11 +409,6 @@ class DistributedTrainerMixin(
         """Whether accelerate manages DDP (MULTI_GPU, no custom parallelism): accelerate launcher
         detected without FSDP enabled."""
         return is_accelerate_launch() and not is_accelerate_fsdp_launch() and self._no_custom_parallelism()
-
-    def _enable_input_require_grads(self, model: nn.Module) -> None:
-        """Make embedding outputs require grad so gradient checkpointing keeps a grad path when the
-        embeddings are frozen (PEFT)."""
-        model.enable_input_require_grads()
 
     def _disable_dropout_for_onpolicy(self):
         """Force dropout off for on-policy RL. Must be called after ``_setup_distributed_modes`` so
@@ -538,7 +559,11 @@ class DistributedTrainerMixin(
                 register_forward_generation_hook(self.model)
             # modules_to_save swaps in a router copy the ctor-time DP-sync hook never saw.
             self._reattach_ep_router_grad_sync_for_peft()
-            self._validate_ep_peft_trainable_params_synced()
+        # Every run, wrapped or not, and never gated on the model: under PP a stage may hold no EP layer,
+        # and the check is collective. Only an EP module leaves a trainable parameter out of the shard
+        # groups (the dtype exclusions are frozen), and a model can carry EP layers its config does not
+        # declare.
+        self._reject_unsynced_trainable_params(self.model, self._fsdp_exclusions().params)
         self._validate_expert_lora_realized()
         # After the wrap and after TRL's dropout disabling, so they read what the run will actually use.
         self._validate_expert_lora_peft_config()
@@ -548,15 +573,17 @@ class DistributedTrainerMixin(
         self._invalidate_param_id_caches()
 
         # After every wrap, for the same reason: only fully_shard makes a module an FSDPModule.
-        self._setup_backward_reshard_window()
+        self._setup_grad_accum_window()
 
         self._setup_ep_gradient_checkpointing()
 
-        # Make peft's disable_adapter() drop native expert adapters too, so KL references see a frozen base.
-        if has_ep_lora(self.model):
-            peft_model = find_peft_model(self.model)
-            if peft_model is not None:
+        # The reference passes run under peft's disable_adapter(): it must drop the native expert
+        # adapters too, so they see a frozen base, and restore trainability on the sharded params.
+        peft_model = find_peft_model(self.model)
+        if peft_model is not None:
+            if has_ep_lora(self.model):
                 make_disable_adapter_ep_aware(peft_model)
+            make_disable_adapter_fsdp2_safe(peft_model, self.model)
 
         self._validate_merge_expert_lora_save()
 
@@ -621,12 +648,10 @@ class DistributedTrainerMixin(
         """
         if self.parallelism_config.fp32_non_ep_params:
             target_dtype = torch.float32
-        elif getattr(self.args, "bf16", False):
-            target_dtype = torch.bfloat16
-        elif getattr(self.args, "fp16", False):
-            target_dtype = torch.float16
         else:
-            return
+            target_dtype = resolve_training_dtype(self.args)
+            if target_dtype == torch.float32:
+                return
         peft_model = find_peft_model(self.model)
         if peft_model is None:
             return
@@ -655,45 +680,11 @@ class DistributedTrainerMixin(
         if attached and is_global_main_process():
             logger.info(f"  Re-attached EP router DP-sync hook to {attached} trainable modules_to_save params")
 
-    def _validate_ep_peft_trainable_params_synced(self):
-        """Raise if a trainable param inside an EP module has no gradient sync (any EP run).
-
-        EP modules are FSDP-ignored; their grads stay DP-consistent only via the EP layer's own hooks
-        and deferred sweep, which cover exactly the params each family declares (experts + LoRA,
-        router, replicated submodules). A trainable param outside that set would drift across DP
-        ranks.
-        """
-        offenders = []
-        for module in self._find_ep_modules():
-            synced = module.synced_trainable_param_ids()
-            offenders += [name for name, p in module.named_parameters() if p.requires_grad and id(p) not in synced]
-        if offenders:
-            shown = "\n".join(f"  - {n}" for n in offenders[:10])
-            more = f"\n  ... and {len(offenders) - 10} more" if len(offenders) > 10 else ""
-            if find_peft_model(self.model) is not None:
-                remedy = (
-                    "EP experts are trained via native grouped-LoRA (list expert projections in "
-                    "lora_target_modules); the router/gate is trainable via lora_modules_to_save (its "
-                    "DP-sync hook is re-attached automatically). modules_to_save on any other EP-internal "
-                    "submodule is unsupported — remove it or target it through the native EP-LoRA path."
-                )
-            else:
-                remedy = (
-                    "The EP family wrapper must declare every trainable weight it owns: expert shards in "
-                    "expert_named_params() (via _EXPERT_WEIGHT_ATTR_ROOTS) and replicated submodules in "
-                    "replicated_named_params(), so the layer's grad-sync hooks cover it."
-                )
-            raise RuntimeError(
-                f"{len(offenders)} trainable param(s) inside EP-wrapped modules have no gradient "
-                f"sync — they would drift across DP ranks and silently corrupt the run:\n"
-                f"{shown}{more}\n\n{remedy}"
-            )
-
     def _validate_merge_expert_lora_save(self):
         """Fail fast where ``merge_expert_lora_on_save`` cannot produce the merged checkpoint.
 
         The flag folds both adapter halves into a gathered base checkpoint written by the EP
-        strategy. Two shapes cannot deliver that, both read off the live model rather than a mode
+        strategy. Three shapes cannot deliver that, all read off the live model rather than a mode
         list:
 
         - **No native expert adapters built** (dense models, MoE runs with no expert projection in
@@ -701,6 +692,10 @@ class DistributedTrainerMixin(
           attention-only run saves adapters via :class:`PeftAdapterSaver`, which never merges.
         - **Accelerate-managed FSDP v1.** Params are flat-param shards the base Trainer's save
           serializes, so the gather would write shard views.
+        - **A PEFT layer the out-of-place fold cannot reproduce** (trainable tokens, LoRA on
+          ``nn.MultiheadAttention``; :func:`~src.models.structure.lora_fold_targets`). The save
+          builds its fold map with the same call and would raise at the first checkpoint; the check
+          is structural, so every rank raises here before training.
         """
         if not self.parallelism_config.merge_expert_lora_on_save:
             return
@@ -720,6 +715,9 @@ class DistributedTrainerMixin(
                 "so the merged gather would write shard views. Launch with torchrun (mixin-managed "
                 "FSDP2), or drop merge_expert_lora_on_save and keep adapter checkpoints."
             )
+        peft_model = find_peft_model(self.model)
+        if peft_model is not None:
+            lora_fold_targets(peft_model)
 
     def _setup_ep_only(self):
         """Setup Expert Parallelism mode."""
@@ -782,25 +780,66 @@ class DistributedTrainerMixin(
         if self._device_mesh is not None:
             return
         raise RuntimeError(
-            f"Tensor parallelism is active (tp_size={self.parallelism_config.tp_size}) but no device "
-            "mesh reached the trainer: FSDP did not build one (pure TP) and the model carries no "
-            "`_device_mesh` from the loader. Without it the TP group is unknown, so replicated "
-            "gradients are never averaged and the TP gradient-norm bucket is never reduced. Load the "
-            "model through load_distributed_model, which attaches the mesh."
+            f"Tensor parallelism is active (tensor_parallel_size={self.parallelism_config.tp_size}) "
+            "but no device mesh reached the trainer: FSDP did not build one (pure TP) and the model "
+            "carries no `_device_mesh` from the loader. Without it the TP group is unknown, so "
+            "replicated gradients are never averaged and the TP gradient-norm bucket is never "
+            "reduced. Load the model through load_distributed_model, which attaches the mesh."
         )
 
-    @staticmethod
-    def _ignored_params(modules: Iterable[nn.Module]) -> list[nn.Parameter] | None:
-        """Flatten modules into the ``ignored_params`` list FSDP2 takes, or None when there are none."""
-        params = [p for module in modules for p in module.parameters()]
-        return params or None
+    def _reject_unsynced_trainable_params(self, model: nn.Module, candidates: Iterable[nn.Parameter]) -> None:
+        """Raise on every rank if a trainable parameter in ``candidates`` has no gradient sync.
+
+        ``candidates`` is what every FSDP2 wrap leaves out (:meth:`_fsdp_exclusions`): frozen dtype
+        exclusions and the parameters of the EP modules that sync their own gradients. Such a parameter
+        keeps its local gradient unless its EP layer's hooks (``synced_trainable_param_ids``: experts +
+        LoRA, router, replicated submodules) or the deferred post-backward sweep average it; without
+        either it trains on this rank's batch only and drifts across DP ranks while every loss stays
+        finite. Collective: every rank must call it.
+        """
+        candidate_set = IdentityParamSet(candidates)
+        # The deferred sweep averages every trainable non-DTensor parameter, and a parameter outside the
+        # shard groups is never a DTensor.
+        deferred = self._ep_config is not None and self._ep_config.defer_grad_sync
+        covered: set[int] = set()
+        for module in self._find_ep_modules():
+            if not module.ep_config.experts_fsdp_managed:
+                covered |= module.synced_trainable_param_ids()
+        unsynced = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and param in candidate_set and not deferred and id(param) not in covered
+        ]
+        reason = None
+        if unsynced:
+            shown = "\n".join(f"  - {name}" for name in unsynced[:KEY_PREVIEW_COUNT])
+            hidden = len(unsynced) - KEY_PREVIEW_COUNT
+            more = f"\n  ... and {hidden} more" if hidden > 0 else ""
+            if find_peft_model(model) is not None:
+                remedy = (
+                    "EP experts are trained via native grouped-LoRA (list expert projections in "
+                    "lora_target_modules); the router/gate is trainable via lora_modules_to_save (its "
+                    "DP-sync hook is re-attached automatically). modules_to_save on any other EP-internal "
+                    "submodule is unsupported — remove it or target it through the native EP-LoRA path."
+                )
+            else:
+                remedy = (
+                    "The EP family wrapper must declare every trainable weight it owns: expert shards in "
+                    "expert_named_params() (via _EXPERT_WEIGHT_ATTR_ROOTS) and replicated submodules in "
+                    "replicated_named_params(), so the layer's grad-sync hooks cover it."
+                )
+            reason = (
+                f"{len(unsynced)} trainable parameter(s) outside FSDP2's shard groups have no other gradient "
+                f"sync — they would drift across DP ranks and silently corrupt the run:\n{shown}{more}\n\n{remedy}"
+            )
+        reject_across_ranks(reason, "unsynced trainable parameters")
 
     def _apply_dp_fsdp2(
         self,
         model: nn.Module,
         dp_size: int,
         *,
-        ignored_modules: Iterable[nn.Module] = (),
+        excluded_params: Iterable[nn.Parameter] = (),
         dp_group: dist.ProcessGroup | None = None,
         dp_replicate_size: int = 1,
         topo: str = "",
@@ -813,11 +852,12 @@ class DistributedTrainerMixin(
         from the others on either. ``topo``/``detail`` carry only the mode-specific log text.
         """
         config = self.parallelism_config
+        excluded_params = list(excluded_params)
         applied = setup_fsdp2_for_dp(
             model,
             dp_size,
             self.args,
-            ignored_params=self._ignored_params(ignored_modules),
+            ignored_params=excluded_params or None,
             dp_group=dp_group,
             reshard_after_forward=config.fsdp_reshard_after_forward,
             fp32_master_weights=config.fp32_non_ep_params,
@@ -833,7 +873,8 @@ class DistributedTrainerMixin(
     def _setup_standard_data_parallel(self):
         """Setup standard data parallel gradient sync (no EP/CP/TP) via FSDP v2.
 
-        PEFT/QLoRA models with mixed/quantized dtypes pass incompatible params as ignored_params.
+        A frozen base whose dtype differs from its adapters' stays out of the shard groups
+        (:meth:`_fsdp_exclusions`); QLoRA skips FSDP2 altogether.
         """
         # Rank-block width, not the global world: a PP stage's FSDP must never span other stages.
         world_size = self.parallelism_config.stage_world_size
@@ -848,9 +889,9 @@ class DistributedTrainerMixin(
             logger.info("✓ QLoRA gradient sync (FSDP2 skipped: quantized 4-bit base weights)")
             return
 
-        incompatible_modules = self._find_fsdp_incompatible_modules()
+        excluded = self._fsdp_exclusions().params
         dp_replicate_size = self.parallelism_config.dp_replicate_size
-        extra = f", {len(incompatible_modules)} incompatible modules ignored" if incompatible_modules else ""
+        extra = f", {len(excluded)} dtype-excluded params" if excluded else ""
         topo = (
             f", HSDP {dp_replicate_size}×{world_size // dp_replicate_size}"
             if dp_replicate_size > 1
@@ -859,36 +900,21 @@ class DistributedTrainerMixin(
         self._apply_dp_fsdp2(
             self.model,
             world_size,
-            ignored_modules=incompatible_modules,
+            excluded_params=excluded,
             dp_replicate_size=dp_replicate_size,
             topo=topo,
             detail=f"applied for data parallel gradient sync ({world_size} ranks{extra})",
         )
 
-    def _find_fsdp_incompatible_modules(self) -> list[nn.Module]:
-        """Modules whose params differ from the trainable dtype (frozen bf16 base under fp32 adapters,
-        or uint8 quantized layers). Passed as ignored_params so only trainable-dtype modules sync.
-        """
-        trainable_dtypes = {p.dtype for p in self.model.parameters() if p.requires_grad}
-        all_dtypes = {p.dtype for p in self.model.parameters()}
-
-        if len(all_dtypes) <= 1:
-            return []
-
+    def _dtype_excluded_params(self) -> list[nn.Parameter]:
+        """Frozen parameters whose dtype no trainable parameter shares (a frozen bf16 base under fp32
+        adapters, uint8 quantized weights). Taken per parameter: excluding the module that owns one
+        would take that module's trainable children out of the shard groups with it."""
+        params = list(self.model.parameters())
+        trainable_dtypes = {p.dtype for p in params if p.requires_grad}
         if not trainable_dtypes:
             return []
-
-        incompatible = []
-        for module in self.model.modules():
-            module_params = list(module.parameters(recurse=False))
-            if not module_params:
-                continue
-
-            module_dtypes = {p.dtype for p in module_params}
-            if not module_dtypes.issubset(trainable_dtypes):
-                incompatible.append(module)
-
-        return incompatible
+        return [p for p in params if not p.requires_grad and p.dtype not in trainable_dtypes]
 
     def _reject_fsdp_knobs_under_qlora(self) -> None:
         """QLoRA skips FSDP2 entirely (``fully_shard`` cannot wrap bnb's non-float Params4bit), so
@@ -941,12 +967,11 @@ class DistributedTrainerMixin(
 
         return None
 
-    def _ep_fsdp_ignored_modules(self) -> tuple[list[nn.Module], list[nn.Module], list[nn.Module]]:
-        """``(ep_modules, dtype_incompatible, merged)``: the FSDP ignored-module inputs shared by
-        every EP-aware wrap (EP/EP+TP modes and the PP stage wrap).
+    def _fsdp_exclusions(self) -> FsdpExclusions:
+        """The parameters every FSDP2 wrap leaves out (see :class:`FsdpExclusions`).
 
         fsdp_shard_ep1_experts: only when experts are truly replicated (ep_group_size==1). Drop
-        them from ignored_params so FSDP shards them; the EP layer skips its own grad hooks so
+        them from the exclusions so FSDP shards them; the EP layer skips its own grad hooks so
         FSDP reduce-scatter is the sole expert sync. No effect when ep_group_size>1 (incl pure ETP).
         """
         config = self.parallelism_config
@@ -954,15 +979,16 @@ class DistributedTrainerMixin(
         if config.experts_fsdp_managed:
             # The fp32_non_ep_params × managed-experts clash is refused at config time, rank-symmetrically.
             ep_modules = []
-        dtype_incompatible = self._find_fsdp_incompatible_modules()
-        merged = list({id(m): m for m in ep_modules + dtype_incompatible}.values())
-        return ep_modules, dtype_incompatible, merged
+        dtype_params = self._dtype_excluded_params()
+        ep_params = [p for module in ep_modules for p in module.parameters()]
+        params = list({id(p): p for p in ep_params + dtype_params}.values())
+        return FsdpExclusions(ep_modules, dtype_params, params)
 
     def _apply_ep_aware_dp_fsdp2(
         self,
         model: nn.Module,
         *,
-        ignored: tuple[list[nn.Module], list[nn.Module], list[nn.Module]],
+        exclusions: FsdpExclusions,
         fallback_dp_size: int,
         fallback_dp_group: dist.ProcessGroup | None = None,
         dp_replicate_size: int = 1,
@@ -970,15 +996,15 @@ class DistributedTrainerMixin(
     ) -> None:
         """FSDP2 wrap for a model carrying EP wrappers, shared by the EP mode and the PP stage wrap.
 
-        ``ignored`` is :meth:`_ep_fsdp_ignored_modules`' triple, passed in rather than re-derived
-        (that derivation walks every parameter's dtype).
+        ``exclusions`` is :meth:`_fsdp_exclusions`, passed in rather than re-derived (that derivation
+        walks every parameter's dtype).
 
         Deferred-DP topologies (``is_deferred_dp``) shard the non-expert params over the EP group,
         since the reduce-scatter must share the DeepEP combine's membership, with the cross-replica
         DP average deferred to :meth:`_sync_deferred_expert_grads`. Everything else shards over the
         caller's DP scope (the world without PP, the stage group under PP).
         """
-        ep_modules, dtype_incompatible, all_ignored_modules = ignored
+        ep_modules, dtype_params, excluded_params = exclusions
         ep_cfg = require_ep_config(self._ep_config)
         if ep_cfg.is_deferred_dp:
             # Sharded over the EP group, not the stage: non-expert memory per rank is `replicas`x
@@ -994,7 +1020,7 @@ class DistributedTrainerMixin(
             self._apply_dp_fsdp2(
                 model,
                 ep_cfg.ep_group_size,
-                ignored_modules=all_ignored_modules,
+                excluded_params=excluded_params,
                 dp_group=ep_cfg.process_group,
                 topo=f", EP-group {ep_cfg.ep_group_size}-way{topo}",
                 detail=(
@@ -1003,11 +1029,11 @@ class DistributedTrainerMixin(
                 ),
             )
         else:
-            extra = f", {len(dtype_incompatible)} dtype-incompatible" if dtype_incompatible else ""
+            extra = f", {len(dtype_params)} dtype-excluded params" if dtype_params else ""
             self._apply_dp_fsdp2(
                 model,
                 fallback_dp_size,
-                ignored_modules=all_ignored_modules,
+                excluded_params=excluded_params,
                 dp_group=fallback_dp_group,
                 dp_replicate_size=dp_replicate_size,
                 topo=topo,
@@ -1183,8 +1209,8 @@ class DistributedTrainerMixin(
                 f"meta device, so they hold no values at all: {meta_buffer_names[:20]}. Allocating "
                 f"them would run on uninitialized memory that also differs across ranks. The load "
                 f"path skipped finalize_loaded_model, or this buffer belongs to a family its fixes "
-                f"do not recompute — extend fix_rotary_inv_freq / fix_non_persistent_buffers "
-                f"(src/models/patches/buffer_fixes.py)."
+                f"do not recompute — extend the _ROTARY_FIXERS / _NON_PERSISTENT_FIXERS chains that "
+                f"finalize_loaded_model runs (src/models/patches/buffer_fixes.py)."
             )
 
         model.to(device)
@@ -1307,8 +1333,8 @@ class DistributedTrainerMixin(
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Count loss-contributing tokens (accumulated as ``num_unmasked_output_tokens_seen``) and the
-        batch's attention-score work, and arm FSDP2's per-window backward reshard, before delegating
-        the actual step."""
+        batch's attention-score work, and arm FSDP2's per-window post-backward toggles, before
+        delegating the actual step."""
         self._accumulate_unmasked_output_tokens(self._extract_output_token_count(inputs))
         self._accumulate_attention_flops(inputs)
         if self._pp_runtime is not None:
@@ -1316,7 +1342,7 @@ class DistributedTrainerMixin(
             return self._pp_training_step(inputs)
         self._warn_once_on_thin_memory_margin()
         # HF sets sync_gradients before every training_step, so this is the window's last microbatch.
-        self._set_backward_reshard(self.accelerator.sync_gradients)
+        self._set_window_end(self.accelerator.sync_gradients)
         try:
             return super().training_step(model, inputs, num_items_in_batch)
         except torch.OutOfMemoryError as e:
@@ -1515,12 +1541,14 @@ class DistributedTrainerMixin(
             return
         raise ValueError(
             f"optim={optim!r} cannot mix the plain-tensor expert FFN params (EP rank-local experts, "
-            f"or the grouped-GEMM gate_proj_gmm/up_proj_gmm split at ep_size=1) with the FSDP2 "
-            f"DTensor non-expert params: aten._fused_adamw_ raises 'mixed torch.Tensor and DTensor' "
+            f"or the grouped-GEMM gate_proj_gmm/up_proj_gmm split at expert_parallel_size=1) with the "
+            f"FSDP2 DTensor non-expert params: aten._fused_adamw_ raises 'mixed torch.Tensor and DTensor' "
             f"at the first step. Use AdamWBF16 (bf16=true, the production default, or "
             f"bf16_optimizer=true — its per-parameter path is DTensor-aware), or "
             f"fp32_non_ep_params=true for fp32 masters on the non-expert params only (experts stay "
-            f"bf16). Full fp32 master weights are supported on dense (non-MoE) models."
+            f"bf16). The stock AdamW runs where the parameters are uniform (dense models, and "
+            f"expert_parallel_size=1 MoE without expert TP at the default fsdp_shard_ep1_experts), over "
+            f"the parameters at the run's dtype: bf16 masters under bf16=true, not fp32."
         )
 
     def evaluation_loop(self, *args, **kwargs):
@@ -1597,8 +1625,7 @@ class DistributedTrainerMixin(
         if not rank_consensus(measurable)[0]:
             return True
 
-        device = getattr(self.args, "device", None) or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        count = torch.tensor([local_batches], device=device, dtype=torch.long)
+        count = torch.tensor([local_batches], device=collective_device(), dtype=torch.long)
         cmin = count.clone()
         cmax = count.clone()
         dist.all_reduce(cmin, op=dist.ReduceOp.MIN)

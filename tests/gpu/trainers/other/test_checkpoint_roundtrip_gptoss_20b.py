@@ -35,11 +35,13 @@ Run examples (2 GPUs, one mode at a time to manage memory):
 import argparse
 import math
 import os
+import shutil
 import sys
 import traceback
 
 import torch
 import torch.distributed as dist
+from accelerate import PartialState
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig
 
@@ -55,7 +57,7 @@ from tests.common.distributed import (
     teardown_distributed,
 )
 from tests.common.models import GPT_OSS_20B
-from tests.common.utils import cleanup_memory, log
+from tests.common.utils import cleanup_memory, log, step_losses
 
 MODEL_NAME = GPT_OSS_20B
 MAX_STEPS = 3
@@ -110,6 +112,7 @@ def train_and_save(
             logging_steps=1,
             save_strategy="no",
             report_to="none",
+            logging_nan_inf_filter=False,
             max_length=MAX_SEQ_LENGTH,
             dataloader_drop_last=True,
             dataloader_num_workers=0,
@@ -133,16 +136,16 @@ def train_and_save(
 
         train_result = trainer.train()
         training_loss = train_result.training_loss
-        step_losses = [e["loss"] for e in trainer.state.log_history if "loss" in e and "eval_loss" not in e]
+        losses = step_losses(trainer)
         log(f"  Training loss: {training_loss:.6f}")
-        log(f"  Step losses: {[f'{l:.4f}' for l in step_losses]}")
+        log(f"  Step losses: {[f'{l:.4f}' for l in losses]}")
 
         log(f"  [3/3] Saving checkpoint to {save_dir}...")
         trainer.save_model(save_dir)
         dist.barrier()
         log("  Checkpoint saved")
 
-        return True, training_loss, step_losses
+        return True, training_loss, losses
 
     except Exception as e:
         log(f"  Train/save FAILED: {e}")
@@ -367,7 +370,6 @@ def verify_checkpoint_on_rank0(
         details.append(f"    Max diff: {max_diff:.2e} ({max_diff_param})")
 
         del roundtrip_model, roundtrip_sd
-        import shutil
 
         shutil.rmtree(roundtrip_dir, ignore_errors=True)
 
@@ -398,7 +400,7 @@ def run_mode_test(
     all_checks: dict[str, bool] = {}
 
     log(f"\n  -- Phase 1: Train + Save ({mode_name}) --")
-    train_ok, training_loss, step_losses = train_and_save(
+    train_ok, training_loss, _ = train_and_save(
         mode_name=mode_name,
         parallelism_config=parallelism_config,
         tokenizer=tokenizer,
@@ -480,8 +482,6 @@ def main() -> int:
     args, _ = parser.parse_known_args()
 
     rank, world_size, local_rank = init_distributed()
-
-    from accelerate import PartialState
 
     PartialState()
 

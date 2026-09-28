@@ -6,7 +6,7 @@
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | GLM-4 MoE Lite | Yes | Yes (MLA path) | Yes (selective) | Yes | — ¹ | Yes | Yes |
 
-¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md). The layer stack is uniform, so the shipped PP split contract carries no constraint of its own.
+¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 Its MLA-style attention (256-wide qk/v, 64-dim rope split) triggers the FlashAttention-4 backward NaN on Blackwell, so the loader falls back from FA4 to SDPA (`model_fa4_backward_nan_prone`). See [Flash Attention](../optimization/flash-attention.md#model-specific-handling).
 
@@ -63,7 +63,7 @@ GLM-4 MoE Lite's router is DeepSeek-V3 aux-loss-free (sigmoid + a static `e_scor
 
 [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback) sign-updates the gate's own `e_score_correction_bias` — the native slot the family's selection arithmetic already consults, adopted whole rather than stacked with a side buffer — so the final bias exports with every checkpoint and a served copy routes as training did. To freeze the router instead, use `freeze_layers_patterns: ["*.mlp.gate.weight"]`.
 
-Router precision comes from `fp32_router`, and `fp32_non_ep_params` (dense attention/embeddings/lm_head) turns it on regardless: that upcast skips the EP-owned router, and a bf16 router beside fp32 dense params would trip FSDP2's uniform-dtype check. The example config sets both.
+Router precision comes from `fp32_router`, and `fp32_non_ep_params` (dense attention/embeddings/lm_head) turns it on regardless, since that upcast skips the EP-owned router. The example config sets both.
 
 ## Chat templates
 

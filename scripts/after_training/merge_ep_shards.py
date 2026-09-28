@@ -124,7 +124,7 @@ def _resolve_merge_transform(
         raise ValueError(
             f"merge_ep_shards cannot resolve model_type '{model_type}' to an EP layer class, so it has "
             f"no HF-layout transform; merging would produce an unloadable checkpoint. Supported: "
-            f"{', '.join(supported_ep_merge_model_types())}. Save with save_sharded_ep=False (gathered, "
+            f"{', '.join(supported_ep_merge_model_types())}. Save with save_sharded_ep: false (gathered, "
             "the default) — that writes a directly loadable checkpoint via each layer's "
             "gather_expert_state_dict()."
         )
@@ -164,7 +164,7 @@ def merge_ep_shards(
         raise ValueError(
             f"{input_dir} is not a per-rank EP-sharded checkpoint: no index there declares the "
             f"EP save's format marker and ep_size (index metadata {metadata!r}). Only a directory "
-            f"written by save_ep_model(sharded=True) can be merged — a gathered EP save, a "
+            f"written by a run with save_sharded_ep: true can be merged — a gathered EP save, a "
             f"pipeline-stage save, or an already-merged checkpoint is loadable as it stands, and "
             f"merging it would rewrite its expert weights into an unloadable layout."
         )
@@ -216,7 +216,7 @@ def merge_ep_shards(
                     f"are present in "
                     f"'{input_dir}'. On a non-shared multi-node filesystem the shards are scattered "
                     f"across nodes' local disks and must be gathered into one directory first — or "
-                    f"save gathered (save_sharded_ep=False) instead."
+                    f"save gathered (save_sharded_ep: false) instead."
                 )
 
         # Logical output tensors in the reference order: passthrough keys first, concatenated shard
@@ -274,8 +274,9 @@ def merge_ep_shards(
             """Rename to hub spelling and stage, at the dtype the shards store.
 
             The sharded writer already applied ``save_dtype_caster`` (the module-tree keep-set of
-            norms, balancing tensors and the family's fp32 pins that the gathered save uses), so the
-            stored dtype is the export dtype. A second, name-only cast here has no model tree to
+            norms, balancing tensors and the family's fp32 pins that the gathered save uses; nothing
+            cast in a training checkpoint, whose fp32 masters the merge keeps so it still resumes), so
+            the stored dtype is the one to write. A second, name-only cast here has no model tree to
             derive the pins from and would fold them to bf16 (GLM-5 Next's linear-attention
             ``A_log``/``dt_bias``, Inkling's short convolutions, DeepSeek-V4's ``attn_hc``), so
             merged-from-sharded would no longer match a gathered save.
@@ -313,7 +314,6 @@ def merge_ep_shards(
         input_dir,
         output_dir,
         shard_files,
-        kind="EP",
         verbose=verbose,
         delete_input_shards=delete_input_shards,
     )
@@ -324,15 +324,8 @@ def main():
         description="Merge EP-sharded checkpoint into standard HuggingFace format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This script is REQUIRED after saving with save_ep_model(sharded=True).
-Sharded checkpoints cannot be loaded directly - they must be merged first.
-
-Workflow:
-    1. Training: save_ep_model(model, output_dir, sharded=True)  # Fast parallel I/O
-    2. Merge: python scripts/after_training/merge_ep_shards.py --input_dir ... --output_dir ...
-    3. Load: load_ep_model(merged_dir, ep_config)  # Works with any EP size
-
-Alternative: Use save_ep_model(sharded=False) to skip the merge step.
+Required after a run with save_sharded_ep: true, whose per-rank shards load only once merged.
+A run with save_sharded_ep: false writes a gathered checkpoint that needs no merge.
 
 Examples:
     # Merge Qwen3 MoE EP checkpoint
@@ -344,10 +337,6 @@ Examples:
     python scripts/after_training/merge_ep_shards.py \\
         --input_dir checkpoints/gpt-oss-ep \\
         --output_dir checkpoints/gpt-oss-merged
-
-    # Then load the merged checkpoint
-    from src.distributed.expert_parallel.loading import load_ep_model
-    model = load_ep_model('checkpoints/gpt-oss-merged', ep_config)
         """,
     )
     parser.add_argument("--input_dir", required=True, help="Path to the per-rank sharded checkpoint")

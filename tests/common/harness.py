@@ -1,6 +1,6 @@
 """``gpu_test_main``: the shared lifecycle for torchrun-native GPU tests.
 
-Covers the lifecycle every torchrun test needs: ``init_distributed`` →
+Covers the lifecycle every torchrun test needs: deterministic kernel env → ``init_distributed`` →
 ``PartialState`` → validate world size → ``setup_cache_dirs`` → ``try`` body →
 ``finally`` (``cleanup_ep`` → ``cleanup_memory`` → ``cleanup_dirs`` → ``barrier``
 → ``teardown_distributed``) → ``sys.exit``. Hand-rolled copies drift (a skipped
@@ -37,7 +37,7 @@ it is handled here via ``ctx``.
 """
 
 import functools
-import random
+import os
 import sys
 import traceback
 from collections.abc import Callable
@@ -53,18 +53,25 @@ from tests.common.distributed import (
     setup_cache_dirs,
     teardown_distributed,
 )
-from tests.common.reporting import (
-    emit_result,
-    extract_efficiency_callback,
-    format_table,
-    snapshot_efficiency,
-)
+from tests.common.reporting import emit_result, format_table, snapshot_efficiency
 from tests.common.utils import cleanup_memory, log, log_all
 
 # Exit codes the launcher keys on.
 _EXIT_PASS = 0
 _EXIT_FAIL = 1
 _EXIT_BAD_LAUNCH = 2
+# causal_conv1d's default backward sums the conv weight gradient with atomics, so two identical steps
+# can round a weight differently and an exact replay (a resume against the uninterrupted run) diverges.
+# Set unless the caller exported its own value.
+_DETERMINISTIC_KERNEL_ENV = {"CAUSAL_CONV1D_DETERMINISTIC": "1"}
+
+
+def _efficiency_callback(trainer) -> EfficiencyCallback | None:
+    """The first ``EfficiencyCallback`` attached to ``trainer``, or None."""
+    handler = getattr(trainer, "callback_handler", None)
+    if handler is None:
+        return None
+    return next((cb for cb in handler.callbacks if isinstance(cb, EfficiencyCallback)), None)
 
 
 class Ctx:
@@ -86,21 +93,6 @@ class Ctx:
     def barrier(self) -> None:
         if dist.is_initialized():
             dist.barrier()
-
-    def broadcast_seed(self, seed: int = 42) -> int:
-        """Seed torch/random identically on all ranks (rank-0 value wins).
-
-        Use when every rank must generate the same data (a parallel-mode run
-        compared against a single-GPU reference). Returns the shared seed.
-        """
-        t = torch.tensor([seed], device=self.device)
-        if dist.is_initialized():
-            dist.broadcast(t, src=0)
-        shared = int(t.item())
-        torch.manual_seed(shared)
-        torch.cuda.manual_seed_all(shared)
-        random.seed(shared)
-        return shared
 
     def broadcast_checks(self, checks: dict[str, bool]) -> dict[str, bool]:
         """Share rank 0's verdict with every rank, without masking another rank's own failure.
@@ -126,11 +118,7 @@ class Ctx:
         Returns ``{}`` if no ``EfficiencyCallback`` is attached; metrics are
         optional and correctness tests can omit them.
         """
-        cb = (
-            trainer_or_cb
-            if isinstance(trainer_or_cb, EfficiencyCallback)
-            else extract_efficiency_callback(trainer_or_cb)
-        )
+        cb = trainer_or_cb if isinstance(trainer_or_cb, EfficiencyCallback) else _efficiency_callback(trainer_or_cb)
         return snapshot_efficiency(cb) if cb is not None else {}
 
     def _run_finalizers(self) -> None:
@@ -151,9 +139,10 @@ def record_check(checks: dict[str, bool], name: str, fn: Callable[[], None]) -> 
     the first failure and the harness would report a single error, hiding every later property.
     Recording keeps each verdict in the dict ``gpu_test_main`` reports and exits on.
 
-    Every ``fn`` therefore has to be rank-symmetric and collective-free: continuing past a failure is
-    only safe while no later check enters a collective the failed rank's peers would be misaligned on,
-    which is why ``gpu_test_main`` skips its own barrier for a body that raised.
+    Continuing past a failure is only safe while no rank is left misaligned on a later collective, so
+    every raise inside ``fn`` has to be rank-symmetric (every rank raises together, e.g. after an
+    agreed verdict) or come after ``fn``'s last collective. That is also why ``gpu_test_main`` skips its
+    own barrier for a body that raised.
     """
     try:
         fn()
@@ -164,6 +153,17 @@ def record_check(checks: dict[str, bool], name: str, fn: Callable[[], None]) -> 
     else:
         checks[name] = True
         log(f"  PASS: {name}")
+
+
+def skip_unless_local_checkpoint(path: str, env_var: str) -> None:
+    """Decline to run, before the harness starts, when a suite's local checkpoint directory is absent.
+
+    The launcher reads an exit-0 run that printed a ``SKIP:`` line and no result line as a skip.
+    ``env_var`` is the knob that points the suite at a checkpoint that is present.
+    """
+    if not os.path.isdir(path):
+        log(f"SKIP: local model path missing: {path} (set {env_var} to a present checkpoint)")
+        sys.exit(0)
 
 
 def gpu_test_main(
@@ -187,6 +187,8 @@ def gpu_test_main(
     def decorator(run: Callable[["Ctx"], dict]) -> Callable[[], int]:
         @functools.wraps(run)
         def wrapper() -> int:
+            for name, value in _DETERMINISTIC_KERNEL_ENV.items():
+                os.environ.setdefault(name, value)
             rank, world_size, local_rank = init_distributed()
 
             if partial_state:
@@ -227,7 +229,16 @@ def gpu_test_main(
                 traceback.print_exc()
             finally:
                 ctx._run_finalizers()
-                cleanup_memory()
+                try:
+                    cleanup_memory()
+                except Exception:
+                    # A body that faulted the device faults this too, and raising here would drop the
+                    # failed verdict, which the launcher then reads as an infra error. Only a pass must
+                    # not survive it.
+                    if status == "pass":
+                        raise
+                    log_all("cleanup_memory raised after the body failed")
+                    traceback.print_exc()
                 cleanup_dirs(output_dir, cache_dir)
                 # Clean path only. A rank whose body raised has abandoned a collective its peers are
                 # still inside, so both the barrier and the NCCL group teardown block until the

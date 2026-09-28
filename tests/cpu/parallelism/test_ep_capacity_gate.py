@@ -225,8 +225,8 @@ def test_a_null_max_length_is_judged_against_the_models_own_context_window():
         config.validate_against_model_config(_wide(max_position_embeddings=_WIDE_INDEX_CEILING))
     text = str(err.value)
     assert "32-bit wire-index limit" in text, text
-    assert f"max_length={_WIDE_INDEX_CEILING}" in text, "the refusal must name the length it resolved"
-    assert "max_length: null" in text, "and say the number came from the model, not from the config"
+    assert f"{_WIDE_INDEX_CEILING} tokens/row" in text, "the refusal must name the length it resolved"
+    assert "no length cap" in text, "and say the number came from the model, not from the config"
 
 
 def test_a_null_max_length_under_the_ceiling_still_passes():
@@ -258,7 +258,7 @@ def test_the_paired_row_count_multiplies_the_resolved_window_too():
         _config(**shape, ep_rows_per_device=2, ep_declared_max_length=0).validate_against_model_config(model)
 
 
-class _PairedTrainer:
+class _PairedTrainer(DistributedTrainerMixin):
     """Stands in for SMPO / DPO / the BT reward trainer: one concatenated chosen+rejected forward."""
 
 
@@ -286,8 +286,6 @@ def _built(trainer_cls, training_config) -> ParallelismConfig:
         DistributedArguments(),
         training_config=training_config,
         trainer_cls=trainer_cls,
-        supports_cp=False,
-        supports_pp=False,
     )
 
 
@@ -306,11 +304,13 @@ def test_a_concatenated_preference_forward_declares_twice_the_rows():
     preference run that wedges at step 1 — the failure this gate exists to pre-empt.
     """
     batch_size, max_length = 2, GIN_MAX_TOKENS_PER_RANK // 2
-    assert _budget(None, batch_size, max_length) == GIN_MAX_TOKENS_PER_RANK
+    assert _budget(DistributedTrainerMixin, batch_size, max_length) == GIN_MAX_TOKENS_PER_RANK
     assert _budget(_PairedTrainer, batch_size, max_length) == 2 * GIN_MAX_TOKENS_PER_RANK
 
     shape = {"world_size": 32, "gpus_per_node": 8, "ep_size": 32, "ep_scope": "global"}
-    _config(**shape, budget=_budget(None, batch_size, max_length)).validate_against_model_config(_Cfg(128, **_GPTOSS))
+    _config(**shape, budget=_budget(DistributedTrainerMixin, batch_size, max_length)).validate_against_model_config(
+        _Cfg(128, **_GPTOSS)
+    )
     with pytest.raises(ValueError, match="proxy-GIN ceiling"):
         _config(**shape, budget=_budget(_PairedTrainer, batch_size, max_length)).validate_against_model_config(
             _Cfg(128, **_GPTOSS)

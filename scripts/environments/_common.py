@@ -16,13 +16,13 @@ from typing import Any
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from trl import ModelConfig
 
+from scripts._common import add_openai_endpoint_args
 from src.configs.async_training_config import AsyncTrainingConfig
 from src.configs.environment_config import EnvironmentConfig
 from src.configs.rollout_config import DEFAULT_ROLLOUT_TOP_P, THINKING_SCOPE_EPISODE, RolloutConfig
 from src.environments.base import BaseEnvironment
 from src.environments.episode import resolve_reasoning_end_token_id
 from src.environments.eval_runner import DEFAULT_REQUEST_TIMEOUT_S, trajectory_path, write_trajectories_jsonl
-from src.inference.openai_client import DEFAULT_LOCAL_BASE_URL, resolve_local_api_key
 from src.training.parser import H4ArgumentParser
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,8 @@ TRAINING_CONTRACT_CLASSES = (EnvironmentConfig, AsyncTrainingConfig, ModelConfig
 
 # The sampling flags an explicit CLI value lays over the training config, by ``RolloutConfig`` field.
 _SAMPLING_FLAGS = ("temperature", "top_p", "max_tokens", "request_timeout")
+# The split an eval reads when --split is omitted, unless its dataset ships a single split of its own.
+DEFAULT_SPLIT = "test"
 
 
 def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
@@ -42,19 +44,13 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     Task-specific flags (env type, adapter, language, sampling budgets, concurrency) stay on the
     script's own parser; only flags whose meaning and defaults are identical across the eval scripts
     live here. The sampling flags default to ``None`` so :func:`rollout_config_from_args` can tell an
-    explicit value from an omitted one: explicit CLI > ``--training_config`` > default.
+    explicit value from an omitted one: explicit CLI > ``--training_config`` > default. ``--split`` is
+    the runner's own: its default and help depend on whether the runner's datasets can ship a single
+    split of their own.
     """
     parser.add_argument("--dataset", required=True, help="HF Hub id or local save_to_disk dir.")
     parser.add_argument("--config", default=None, help="Dataset config (e.g. 'all', 'verifiable', 'taco').")
-    parser.add_argument("--split", default="test", help="Dataset split.")
-    parser.add_argument("--base_url", default=DEFAULT_LOCAL_BASE_URL, help="OpenAI-compatible base URL.")
-    parser.add_argument(
-        "--api_key",
-        default=resolve_local_api_key(),
-        help="API key (default: $VLLM_API_KEY, else $OPENAI_API_KEY, else the placeholder a keyless local "
-        "server accepts; OpenRouter requires a real key).",
-    )
-    parser.add_argument("--model", required=True, help="Served/model name.")
+    add_openai_endpoint_args(parser, model_help="Served/model name.")
     parser.add_argument(
         "--training_config",
         default=None,
@@ -231,6 +227,7 @@ def write_eval_outputs(
     env: BaseEnvironment,
     traj_path: str | None,
     env_type: str,
+    split: str,
     max_turns: int | None,
     rollout: RolloutConfig,
     num_samples: int,
@@ -264,7 +261,7 @@ def write_eval_outputs(
         "env_type": env_type,
         "dataset": args.dataset,
         "config": args.config,
-        "split": args.split,
+        "split": split,
         # The effective cap rather than the flag: an omitted --max_turns leaves the env's own value,
         # and a null here would leave a trajectory with no record of the budget it ran under.
         "max_turns": max_turns if max_turns is not None else env.max_turns,

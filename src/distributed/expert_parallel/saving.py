@@ -58,7 +58,13 @@ from src.distributed.runtime import (
 )
 from src.distributed.tensor_parallel.state_dict import gather_tp_sharded_non_dtensor_params
 from src.models.patches.gpt_oss_sinks import neutralized_gpt_oss_sinks
-from src.models.structure import normalize_peft_param_name, persistent_buffers, unwrap_model
+from src.models.structure import (
+    LoraFolds,
+    lora_folded_data,
+    normalize_peft_param_name,
+    persistent_buffers,
+    unwrap_model,
+)
 
 logger = get_logger(__name__)
 
@@ -68,9 +74,8 @@ def _save_key_remap(*, cp_key_remap: bool, peft_prefix: str | None) -> Callable[
 
     Composes the CP attention-prefix strip with the PEFT base-name normalization, so a checkpoint
     written off a CP-wrapped and/or PEFT-wrapped module tree still loads with ``from_pretrained``.
-    ``peft_prefix`` is set only on the merged-adapter save path, where the caller holds
-    :func:`~src.models.structure.merged_adapters` open: every adapter param's delta is already inside
-    its base weight and the adapter tensors are dropped.
+    ``peft_prefix`` is set only on the merged-adapter save path, which folds every adapter's delta
+    into its base tensor as it is written, so the adapter tensors are dropped.
 
     Name-based and therefore rank-uniform: the drop decision gates a ``full_tensor()`` collective.
     """
@@ -120,7 +125,8 @@ def save_ep_model(
     cp_key_remap: bool = False,
     max_shard_size: str = DEFAULT_MAX_SHARD_SIZE,
     merge_lora: bool = False,
-    adapters_merged: bool = False,
+    lora_folds: LoraFolds | None = None,
+    keep_live_dtype: bool = False,
 ):
     """Save an EP model to a HuggingFace-compatible safetensors checkpoint.
 
@@ -131,18 +137,20 @@ def save_ep_model(
     (default) gathers an HF-standard checkpoint. ``cp_key_remap`` rewrites CP attention keys
     (required for EP+CP). ``merge_lora=True`` folds native grouped-LoRA deltas into the gathered base.
 
-    ``adapters_merged`` asserts the caller holds :func:`~src.models.structure.merged_adapters` open
-    over this call, which puts the attention deltas into the base weights being written.
+    ``lora_folds`` (:func:`~src.models.structure.lora_fold_targets` of the PeftModel) folds the PEFT
+    adapters' deltas into the non-EP base tensors as they are written, out of place; no LoRA layer
+    sits inside an EP layer (the trainer's ``_validate_lora_ep_compatibility`` refuses one).
+    ``keep_live_dtype`` (a training checkpoint) is :func:`~src.checkpoint.format.save_dtype_caster`'s.
     """
     model = unwrap_model(model)
     peft_prefix = None
     if is_peft_model(model):
-        if not adapters_merged:
+        if lora_folds is None:
             raise ValueError(
-                "save_ep_model received a PeftModel without adapters_merged=True. The gathered base "
-                "weights would not carry the LoRA delta, so the checkpoint would be base-quality "
-                "while looking trained. Wrap the call in merged_adapters(peft_model), or route "
-                "adapter-only saves through PeftAdapterSaver."
+                "save_ep_model received a PeftModel without lora_folds. The gathered base weights "
+                "would not carry the LoRA delta, so the checkpoint would be base-quality while looking "
+                "trained. Pass lora_fold_targets(peft_model), or route adapter-only saves through "
+                "PeftAdapterSaver."
             )
         peft_prefix = model.prefix
         # A PeftModel wraps outside the CP wrapper and unwrap_model stops at it, so under EP+CP every
@@ -155,7 +163,7 @@ def save_ep_model(
     if sharded and world_size > 1:
         if merge_lora or peft_prefix is not None:
             raise ValueError("Adapter merging is only supported with a gathered EP save (sharded=False).")
-        _save_ep_sharded(model, output_dir, tokenizer, max_shard_size=max_shard_size)
+        _save_ep_sharded(model, output_dir, tokenizer, max_shard_size=max_shard_size, keep_live_dtype=keep_live_dtype)
     else:
         _save_ep_gathered(
             model,
@@ -165,6 +173,8 @@ def save_ep_model(
             max_shard_size=max_shard_size,
             merge_lora=merge_lora,
             peft_prefix=peft_prefix,
+            lora_folds=lora_folds,
+            keep_live_dtype=keep_live_dtype,
         )
 
 
@@ -176,6 +186,8 @@ def _save_ep_gathered(
     max_shard_size: str = DEFAULT_MAX_SHARD_SIZE,
     merge_lora: bool = False,
     peft_prefix: str | None = None,
+    lora_folds: LoraFolds | None = None,
+    keep_live_dtype: bool = False,
 ):
     """Save EP model by gathering expert weights, in HuggingFace-standard layout.
 
@@ -193,7 +205,7 @@ def _save_ep_gathered(
     ep_layers = find_ep_layers(model)
     ep_layer_names = {name for name, _ in ep_layers}
 
-    cast = save_dtype_caster(model)  # norm params keep trained dtype (module-tree derived)
+    cast = save_dtype_caster(model, keep_live_dtype=keep_live_dtype)
 
     if is_save_rank:
         logger.info(f"Found {len(ep_layers)} EP layers" if ep_layers else "No EP layers found, saving resolved params")
@@ -213,10 +225,13 @@ def _save_ep_gathered(
         # rank, or savers and non-savers disagree on the collective schedule and the save hangs.
         if remap(name) is None:
             continue
+        # One tensor at a time; a folded DTensor's delta is a collective every rank enters.
+        data = lora_folded_data(param, lora_folds)
         if is_save_rank:
-            state_dict[name] = cast(name, resolve_param_tensor(param.data))
+            state_dict[name] = cast(name, resolve_param_tensor(data))
         else:
-            materialize_dtensor(param.data)
+            materialize_dtensor(data)
+        del data
 
     # Same filter as the params above: a modules_to_save copy duplicates its module's buffers, and
     # the frozen `original_module` side must not reach the checkpoint. Name-based, so every rank
@@ -229,7 +244,7 @@ def _save_ep_gathered(
 
     # EP+TP: attention sinks are TP-sharded as plain tensors, needing this explicit mesh gather.
     # A no-op without TP (nothing to iterate), so it is unconditional.
-    gather_tp_sharded_non_dtensor_params(model, state_dict, retain=is_save_rank)
+    gather_tp_sharded_non_dtensor_params(model, state_dict, retain=is_save_rank, keep_live_dtype=keep_live_dtype)
 
     # Live names → checkpoint names, once per chunk: the LoRA/CP normalization (``remap``) first,
     # then the family's hub-namespace revert. A ``None`` from ``remap`` is a tensor the checkpoint
@@ -305,12 +320,16 @@ def _save_ep_gathered(
         torch.cuda.empty_cache()
 
 
-def save_ep_lora_adapters(model: torch.nn.Module, output_dir: str, *, adapter_config=None, tokenizer=None):
+def save_ep_lora_adapters(
+    model: torch.nn.Module, output_dir: str, *, adapter_config=None, tokenizer=None, keep_live_dtype: bool = False
+):
     """Gather EP grouped-LoRA adapters and write a standalone adapter checkpoint.
 
     Writes ``adapter_model.safetensors`` (the gathered grouped ``A``/``B``) and an optional
     ``adapter_config.json``. The frozen base is not written; reload pairs this with the base
     via :func:`apply_ep_lora_adapters`. The gather is a collective — every rank must call together.
+    The adapters go to the save dtype, or keep their live one under ``keep_live_dtype`` (a training
+    checkpoint, whose fp32 adapters must resume unrounded).
     """
     model = unwrap_model(model)  # a wrapper walk would prefix every adapter key (see save_ep_model)
     is_save_rank = fs_aware_save_rank()
@@ -320,7 +339,7 @@ def save_ep_lora_adapters(model: torch.nn.Module, output_dir: str, *, adapter_co
     adapters = gather_ep_lora_adapters(model, retain=is_save_rank)
     with barrier_on_exit():
         if is_save_rank:
-            state = cast_state_dict_to_save_dtype(adapters)
+            state = adapters if keep_live_dtype else cast_state_dict_to_save_dtype(adapters)
             save_file(state, os.path.join(output_dir, ADAPTER_SAFETENSORS_FILE))
             if adapter_config is not None:
                 with open(os.path.join(output_dir, ADAPTER_CONFIG_FILE), "w") as f:
@@ -370,7 +389,7 @@ def _check_ep_sharded_save_supported(
     if expert_tp_size > 1:
         raise ValueError(
             f"Sharded EP save (save_sharded_ep=True) is not supported with "
-            f"expert_tp_size={expert_tp_size}. Expert TP shards expert FFN weights "
+            f"expert_tensor_parallel_size={expert_tp_size}. Expert TP shards expert FFN weights "
             f"across ranks, which the merge script cannot reconstruct. "
             f"Use save_sharded_ep=False (default) for gathered save instead."
         )
@@ -459,6 +478,7 @@ def _save_ep_sharded(
     output_dir: str,
     tokenizer=None,
     max_shard_size: str = DEFAULT_MAX_SHARD_SIZE,
+    keep_live_dtype: bool = False,
 ):
     """Save an EP model as per-rank expert shards + a weight-map index.
 
@@ -485,7 +505,7 @@ def _save_ep_sharded(
         )
 
     ep_layer_names = [name for name, _ in ep_layers]
-    cast = save_dtype_caster(model)  # norm params keep trained dtype (module-tree derived)
+    cast = save_dtype_caster(model, keep_live_dtype=keep_live_dtype)
 
     # From ``expert_named_params()``, never a substring match — that misclassifies whole families.
     ep_expert_param_names = {
@@ -506,7 +526,7 @@ def _save_ep_sharded(
 
     # The loop above wrote TP-sharded plain tensors (GptOss sinks) as rank 0's head slice under the
     # full-tensor key, a truncated sinks the merge cannot complete.
-    gather_tp_sharded_non_dtensor_params(model, shard, retain=(rank == 0))
+    gather_tp_sharded_non_dtensor_params(model, shard, retain=(rank == 0), keep_live_dtype=keep_live_dtype)
 
     # Anchored prefixes so a sibling can't over-match; persistent-only so rotary caches stay out.
     if rank == 0:
@@ -525,7 +545,7 @@ def _save_ep_sharded(
             if sink_name not in shard:
                 shard[sink_name] = cast(sink_name, sink_tensor)
 
-    # Counted off the tensors this rank writes, not the live params: the cast above folds fp32
+    # Counted off the tensors this rank writes, not the live params: an export's cast folds fp32
     # masters to bf16, so a pre-cast count would overstate the index total_size.
     total_size = sum(t.numel() * t.element_size() for t in shard.values())
 

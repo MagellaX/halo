@@ -9,17 +9,22 @@ from __future__ import annotations
 
 import logging
 import os
+import traceback
 
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from transformers import GenerationConfig
+from transformers import GenerationConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from src.models.loading.lazy_safetensors.weights import resolve_run_dtype
-from src.models.patches.attention import validate_attn_implementation
+from src.models.structure import params_matching_fp32_pins
 
 logger = logging.getLogger(__name__)
+
+# The transformers model-build step that refuses an attention implementation the class does not
+# support, on every load path; a ValueError raised under it is a config choice, not a lazy-load limit.
+_ATTN_IMPLEMENTATION_CHECK = "_check_and_adjust_attn_implementation"
 
 
 def _resolve_remote_code_class(model_class, config, trust_remote_code: bool):
@@ -43,25 +48,6 @@ def _resolve_remote_code_class(model_class, config, trust_remote_code: bool):
         return model_class
 
 
-def _is_attn_dispatch_error(exc: Exception) -> bool:
-    """True when a from_pretrained failure is an attention-impl dispatch rejection.
-
-    Raised at model build when an architecture cannot dispatch the requested implementation (e.g.
-    linear-attention Bailing rejecting FlashAttention-4).
-    """
-    msg = str(exc)
-    return any(
-        marker in msg
-        for marker in (
-            "Flash Attention",
-            "flash_attention",
-            "scaled_dot_product",
-            "does not support",
-            "attn_implementation",
-        )
-    )
-
-
 def _restore_checkpoint_generation_config(model: nn.Module, model_name_or_path: str, revision=None) -> None:
     """Re-read ``generation_config.json`` onto a config-only shell.
 
@@ -78,6 +64,23 @@ def _restore_checkpoint_generation_config(model: nn.Module, model_name_or_path: 
             raise
 
 
+def _apply_fp32_dtype_plan(model: nn.Module, dtype: torch.dtype) -> None:
+    """Give a config-built shell the fp32 pins ``from_pretrained`` loads at ``dtype``.
+
+    ``from_pretrained`` keeps the ``_keep_in_fp32_modules[_strict]`` parameters in fp32 through its
+    dtype plan, which ``from_config`` never applies. The lazy loaders read which parameters load fp32
+    off the shell (a run keeping fp32 masters keeps those as stored), so a config-built shell without
+    the pins would round them through ``dtype``. The plan only ever keeps entries in fp32; matched with
+    transformers' own rule, on meta parameters, so nothing is allocated. A module that is not a
+    transformers model declares no pins.
+    """
+    if not isinstance(model, PreTrainedModel):
+        return
+    for name in params_matching_fp32_pins(model, model._get_dtype_plan(dtype)):
+        param = model.get_parameter(name)
+        param.data = param.data.to(torch.float32)
+
+
 def _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_code: bool, **model_kwargs) -> nn.Module:
     """Build the model shell from the config alone: parameters on meta, buffers real.
 
@@ -89,7 +92,9 @@ def _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_co
 
     ``from_pretrained`` is not used inside the context: it would stream every checkpoint tensor into
     host RAM. Only ``dtype`` / ``attn_implementation`` are forwarded, since ``from_config`` hands
-    anything else straight to ``__init__``, and the rest is already resolved into ``config``.
+    anything else straight to ``__init__``, and the rest is already resolved into ``config``. The
+    fp32 pins ``from_pretrained`` would apply are applied after the build
+    (:func:`_apply_fp32_dtype_plan`), so both shells carry the same parameter dtypes.
     """
     kwargs: dict = {"dtype": dtype}
     if "attn_implementation" in model_kwargs:
@@ -106,8 +111,17 @@ def _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_co
         factory = model_class._from_config
     try:
         with init_empty_weights(include_buffers=False):
-            return factory(config, **kwargs)
+            model = factory(config, **kwargs)
     except Exception as e:
+        if isinstance(e, ValueError) and any(
+            frame.name == _ATTN_IMPLEMENTATION_CHECK for frame in traceback.extract_tb(e.__traceback__)
+        ):
+            raise ValueError(
+                f"{model_class.__name__} refuses attn_implementation={kwargs.get('attn_implementation')!r} "
+                f"at model build ({type(e).__name__}: {e}), on every load path, lazy or not. Set "
+                f"attn_implementation to one the architecture supports: sdpa, or eager where sdpa is the "
+                f"one refused."
+            ) from e
         # On the fallback path the caller's warning has already named the from_pretrained failure;
         # on the config_only path this build is the only attempt, so the message claims no more.
         raise RuntimeError(
@@ -116,6 +130,8 @@ def _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_co
             f"architecture from the checkpoint would materialize every tensor in host RAM. Load it "
             f"with ep_lazy_loading=False (PP: without a lazy stage load)."
         ) from e
+    _apply_fp32_dtype_plan(model, dtype)
+    return model
 
 
 def _materialize_nonpersistent_buffers_from_config_twin(
@@ -183,33 +199,17 @@ def instantiate_on_meta(
         trust_remote_code=trust_remote_code,
         **model_kwargs,
     )
-    effective_kwargs = model_kwargs
     try:
         model = model_class.from_pretrained(model_name_or_path, device_map="meta", **common)
     except (AttributeError, ValueError) as e:
-        # Exotic architectures (e.g. Bailing) reject an auto-detected FA4 at build; retry on SDPA.
-        attn = model_kwargs.get("attn_implementation")
-        if isinstance(e, ValueError) and attn not in (None, "sdpa", "eager") and _is_attn_dispatch_error(e):
-            # Re-validated rather than assumed safe: sdpa drops unreset gpt-oss sinks.
-            retry_impl = validate_attn_implementation(config, "sdpa")
-            logger.warning(
-                f"{model_class.__name__} cannot dispatch attn_implementation={attn!r} ({e}); "
-                f"retrying with {retry_impl!r}."
-            )
-            model = model_class.from_pretrained(
-                model_name_or_path, device_map="meta", **dict(common, attn_implementation=retry_impl)
-            )
-            # The twin must build with the implementation that succeeded, not the one that failed.
-            effective_kwargs = dict(model_kwargs, attn_implementation=retry_impl)
-        else:
-            logger.warning(
-                f"from_pretrained(device_map='meta') failed for {model_class.__name__} "
-                f"({type(e).__name__}: {e}); building the shell from the config alone instead."
-            )
-            model = _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_code, **model_kwargs)
-            _restore_checkpoint_generation_config(model, model_name_or_path, model_kwargs.get("revision"))
-            return model
+        logger.warning(
+            f"from_pretrained(device_map='meta') failed for {model_class.__name__} "
+            f"({type(e).__name__}: {e}); building the shell from the config alone instead."
+        )
+        model = _instantiate_from_config_on_meta(model_class, config, dtype, trust_remote_code, **model_kwargs)
+        _restore_checkpoint_generation_config(model, model_name_or_path, model_kwargs.get("revision"))
+        return model
     _materialize_nonpersistent_buffers_from_config_twin(
-        model, model_class, config, dtype, trust_remote_code, **effective_kwargs
+        model, model_class, config, dtype, trust_remote_code, **model_kwargs
     )
     return model

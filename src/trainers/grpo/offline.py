@@ -63,8 +63,8 @@ from src.callbacks.variable_scheduler import VariableSchedulerCallback
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN, OfflineGRPODataCollatorWithPadding
 from src.data.pipeline.processing import coordinated_map
-from src.data.pipeline.rendered import probe_tokenizer_specials
-from src.data.spans import LABEL_IGNORE_INDEX, ends_with_terminator, resolve_eos_token_ids
+from src.data.pipeline.rendered import lacks_emitted_bos
+from src.data.spans import LABEL_IGNORE_INDEX, lacks_terminator, resolve_eos_token_ids
 from src.distributed.loading.model_loading import load_model_from_pretrained
 from src.distributed.loading.peft_setup import peft_bf16_autocast, prepare_peft_model
 from src.distributed.parallelism_config import ParallelismConfig
@@ -79,7 +79,7 @@ from src.distributed.pipeline_parallel.losses import (
 from src.distributed.runtime import current_device, get_global_world_size
 from src.models.loading.tokenizer_setup import is_bounded_length
 from src.models.modality import config_declares_multimodality
-from src.models.structure import resolve_tokenizer
+from src.models.structure import base_transformers_model, resolve_tokenizer
 from src.trainers.grpo.mixins.chunked_logprobs import ChunkedLogprobsCore, LogitsWidth
 from src.trainers.grpo.mixins.dataloader import MultiGroupSampler
 from src.trainers.grpo.objective.advantages import STD_EPS
@@ -209,30 +209,18 @@ def tokenize_prompt_completion(
         add_special_tokens=False,
     )["input_ids"]
 
-    # BOS only when the tokenizer's own post-processor emits one (gpt-oss/Bailing define one it
-    # never emits), and only within the prompt budget — the caps bound PP's fixed P2P shape.
-    if (
-        bos_token_id is not None
-        and probe_tokenizer_specials(tokenizer).adds_leading_bos
-        and (not prompt_input_ids or prompt_input_ids[0] != bos_token_id)
-        and (not is_bounded_length(max_prompt_length) or len(prompt_input_ids) < max_prompt_length)
+    # Only within the prompt budget: the caps bound PP's fixed P2P shape.
+    if lacks_emitted_bos(prompt_input_ids, tokenizer) and (
+        not is_bounded_length(max_prompt_length) or len(prompt_input_ids) < max_prompt_length
     ):
         prompt_input_ids = [bos_token_id] + prompt_input_ids
 
     if is_encoder_decoder and bos_token_id is not None:
         completion_input_ids = [bos_token_id] + completion_input_ids if completion_input_ids else [bos_token_id]
 
-    # EOS only within the budget: supervising it at a truncation cut teaches premature stopping. Any
-    # declared terminator counts as already-ended, not just tokenizer.eos_token_id — GLM-4 and Gemma
-    # close turns with a role marker the config lists instead, and testing the single id there appends
-    # a second ender the policy never emits.
-    terminators = eos_token_ids or ({eos_token_id} if eos_token_id is not None else set())
-    if eos_token_id is not None and not completion_input_ids:
-        completion_input_ids = [eos_token_id]
-    elif (
-        eos_token_id is not None
-        and not ends_with_terminator(completion_input_ids, tokenizer, terminators)
-        and (not is_bounded_length(max_completion_length) or len(completion_input_ids) < max_completion_length)
+    # EOS only within the budget: supervising it at a truncation cut teaches premature stopping.
+    if lacks_terminator(completion_input_ids, tokenizer, eos_token_ids) and (
+        not is_bounded_length(max_completion_length) or len(completion_input_ids) < max_completion_length
     ):
         completion_input_ids = completion_input_ids + [eos_token_id]
 
@@ -293,6 +281,13 @@ def tokenize_offline_grpo_rows(
                 is_encoder_decoder=is_encoder_decoder,
                 eos_token_ids=eos_token_ids,
             )
+            # Raised here, inside the coordinated map, so every rank aborts: the collator is the one
+            # rank that drew the row, and a raise there strands its peers in the next collective.
+            if not tokenized["prompt_input_ids"]:
+                raise ValueError(
+                    f"Offline GRPO row {idx}: the prompt tokenizes to no tokens, so its completions "
+                    f"would train against no context. Fix or drop the row."
+                )
 
             all_prompt_input_ids.append(tokenized["prompt_input_ids"])
             all_completion_input_ids.append(tokenized["completion_input_ids"])
@@ -418,7 +413,9 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
         self._reject_inert_max_length(args, parallelism_config)
         self._reject_pp_explicit_options(args, parallelism_config, peft_config, compute_metrics)
 
-        model, model_id = load_model_from_pretrained(model, args)
+        model, model_id = load_model_from_pretrained(
+            model, args, keep_fp32=parallelism_config is not None and parallelism_config.fp32_non_ep_params
+        )
 
         # QLoRA's bf16 adapter cast leaves activations fp32, so every adapted linear's forward needs
         # the autocast region compute_loss opens.
@@ -839,9 +836,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
         ``ChunkedLogprobsCore``: forward the backbone (no ``lm_head``), drop the final position (the
         causal next-token shift), keep the last ``logits_to_keep``.
         """
-        if is_peft_model(unwrapped_model):
-            unwrapped_model = unwrapped_model.base_model.model
-        backbone = unwrapped_model.base_model
+        backbone = base_transformers_model(unwrapped_model).base_model
         hidden = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
         return hidden[:, :-1, :][:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
 

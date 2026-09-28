@@ -85,7 +85,7 @@ Import from `src.data.sources.s3_client`. The module surface (see the package fo
 | `load_dataset_from_s3_uri(s3_uri, keep_in_memory=None, use_cache=True)` | Load HF dataset by URI; cached with file locking |
 | `push_dataset_to_s3_uri(dataset, s3_uri, overwrite=True)` | Push HF dataset by URI through the staged protocol: the tree uploads whole to a `.staging-*` sibling prefix, is sealed, then promoted by server-side copy with the load gates (`state.json`/`dataset_dict.json`) deleted first and copied last. A crash leaves either a complete copy at the destination or the sealed staging tree, which `load_dataset_from_s3_uri` falls back to; the next successful push heals and sweeps. One writer per destination at a time |
 | `exists(key, subfolder=None)` | Object/prefix existence under the default bucket. Only an authoritative absence of the key is `False`: a 403, an expired SSO or a throttle raises, and a missing bucket raises naming the bucket |
-| `build_s3_uri(key, subfolder=None)` | Full S3 URI from key (+ optional subfolder) under `DEFAULT_BUCKET`, without constructing a client |
+| `build_s3_uri(key, subfolder=None)` | Full S3 URI from key (+ optional subfolder) under `HALO_S3_DEFAULT_BUCKET` (`default_bucket()`, which raises while it is unset), without constructing a client |
 
 `subfolder` is prepended to `key`; key paths may be nested. Everything else — folder transfers, listings,
 deletes — is an `S3Client` method, called on a client built for the bucket in question.
@@ -135,12 +135,12 @@ python scripts/before_training/s3_datasets.py delete my_folder --recursive --yes
 ```
 
 Commands: `push`, `download`, `list`, `exists`, `delete`. Every command takes `--subfolder/-s`,
-`--bucket/-b`, `--verbose/-v` and `--quiet/-q` (suppresses the transfer progress bar, so it acts on
-push/download only). The other flags are per command:
+`--bucket/-b` and `--verbose/-v`. The other flags are per command:
 
 | Flag | Commands | Notes |
 |---|---|---|
 | `--no-overwrite` | push, download | |
+| `--quiet/-q` | push, download | Suppresses the transfer progress bar |
 | `--recursive/-r` | list, delete | Opt-in on `delete`: removes every object under the prefix. The Python `delete()` above defaults the other way (`recursive=True`) |
 | `--yes/-y` | delete | Skips the confirmation |
 | `--max-keys/-n` | list | Default 100 here, unlike `list_objects`'s 1000 |

@@ -31,7 +31,7 @@ Toolkit-covered families (upstream has none). ✅ = patched, — = left unfused,
 |---|---|:--:|:--:|:--:|:--:|:--:|
 | Mistral 4 | `mistral4` (a `mistral3` wrapper resolves through its text tower: `mistral4` here, `mistral` upstream) | ✅ | ✅ | — interleaved YARN; the llama-4 log scale follows it | ✅ | ✅ text-only checkpoints; [forced off under the wrapper](#fused-loss-under-a-multimodal-wrapper) |
 | Zaya | `zaya` | ✅ | — EP wrapper owns the experts | — partial rotary | ✅ | ✅ **default** |
-| DeepSeek-V4 | `deepseek_v4` | — `_keep_in_fp32_modules_strict` pins the weights to fp32, so the eager norm returns fp32 from bf16 where the kernel stores in the input dtype | — clamped SwiGLU | — interleaved partial | ✅ | ✅ **default** |
+| DeepSeek-V4 | `deepseek_v4` | — no parity test covers the swap; the loaders cast the fp32-pinned weights to the run dtype, where the eager norm matches the kernel's output dtype | — clamped SwiGLU | — interleaved partial | ✅ | ✅ **default** |
 | GLM-4.7-Flash | `glm4_moe_lite` | ✅ | ✅ | — dual interleave/plain MLA | ✅ | ✅ **default** |
 | Laguna | `laguna` | ✅ | ✅ | — half-width on full-attention layers, full on sliding | ✅ | ✅ |
 | GLM-5.3-Flash | `glm5_next`, `glm5_next_text` | ✅ the two plain norms **+ the GDN gated norm** (fla) | — clamped at `swiglu_limit` | — NoPE text tower | ✅ | — no `*ForCausalLM`; the `*ForConditionalGeneration` head adds the router aux loss after the projection |
@@ -290,7 +290,7 @@ lose nothing: its shipped loss seam runs head + cross-entropy together over one 
 (`fused_causal_lm_token_loss`), leaving no full logits plane for FLCE to save.
 
 **The GRPO trainers get a warning, not a force-off.** Their objectives compute per-token log-probs outside
-the model's forward and never pass `labels`, so an applied FLCE (explicit, or Zaya's per-model default) is
+the model's forward and never pass `labels`, so an applied FLCE (explicit, or a [per-model default](#configuration)) is
 numerically neutral yet saves nothing.
 
 The load-time patch site cannot know the trainer and a construction-time re-apply would not unpatch
@@ -317,9 +317,8 @@ its llama-cast norm over GptOss's Gemma-cast one, its GeGLU over Gemma 4's toolk
 `LigerExperts` over the Qwen MoE families' routed experts. A model loaded outside Halo's loaders runs those
 roles eager.
 
-Code loading via `AutoModelForCausalLM.from_pretrained()` instead — the GPU benchmarks — patches through
-`apply_liger_kernel_for_direct_loading()`, which applies the toolkit defaults then sets
-`use_liger_kernel = False`.
+Code loading via `AutoModelForCausalLM.from_pretrained()` instead — the GPU benchmarks — runs
+`apply_liger_kernel` on the config it passes to `from_pretrained`, then `finalize_liger_after_direct_load`.
 
 Under FSDP2, TRL's fused Liger preference/GRPO loss (`liger_loss_fn`, `liger_grpo_loss`, or `liger_loss` in
 later TRL releases) is auto-disabled: it does `input @ weight.t()` against `model.lm_head.weight` outside FSDP2's

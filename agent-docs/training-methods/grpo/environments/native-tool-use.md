@@ -1,6 +1,6 @@
 # Native Tool-Use Environments
 
-`NativeToolUseEnvironment` runs the OpenAI/vLLM function-calling protocol: the environment advertises its tools as schemas, the rollout server's `--tool-call-parser` extracts the model's calls, and each result comes back as a `tool` message the next turn conditions on. Serve the model with the parser its family needs — without one the calls arrive as plain text, which the environment reads as a final answer and every episode ends on its first turn.
+`NativeToolUseEnvironment` runs the OpenAI/vLLM function-calling protocol: the environment advertises its tools as schemas, the rollout server's `--tool-call-parser` extracts the model's calls, and each result comes back as a `tool` message the next turn conditions on. Serve the model with the parser its family needs. Without one vLLM rejects the request (400), and SGLang returns the calls as plain text, which the environment reads as a final answer, so every episode ends on its first turn.
 
 Three registry presets wrap a tool registry directly: `native_math` (`calculate`, `python`), `native_coding` (`python_repl`), `native_combined` (math, python, search, simulated files). `qa_search`, `exam_qa`, `swe`, `code_contests`, `codeforces` and `mcp` are subclasses or factory presets over the same protocol, so everything on this page applies to them.
 
@@ -35,7 +35,7 @@ The knobs every environment shares — turn cap, per-call tool pay, observation 
 - `web_search` — `query` and optional `max_results` (default 5).
 - `read_file`, `write_file`, `list_files` — a simulated per-episode file store, for tests and closed-world demos.
 
-Registries are built by the factories in `src/environments/tools/factories.py` and composed with `NativeToolRegistry.combine(a, b)`. The `create_native_*` set is stateless; `create_session_*` binds the episode's persistent [sandbox session](sandbox.md) so files survive across turns. Pass `sandbox=` a `SandboxExecutor` to run code in a real interpreter with imports, in a subprocess ([confined on `remote` and on `bubblewrap` without `allow_network`, rlimits only on `local`](sandbox.md#choosing-a-backend)), or `allow_imports=True` to lift the ban inside the in-process REPL — safe only when the whole process is already isolated.
+Registries are built by the factories in `src/environments/tools/factories.py` and composed with `NativeToolRegistry.combine(a, b)`. The `create_native_*` set is stateless; `create_session_*` binds the episode's persistent [sandbox session](sandbox.md) so files survive across turns. Pass `sandbox=` a `SandboxExecutor` to run code in a real interpreter with imports, in a subprocess ([confined on `remote` and on `bubblewrap` without `allow_network`, rlimits only on `local`](sandbox.md#choosing-a-backend)).
 
 ## Reward
 

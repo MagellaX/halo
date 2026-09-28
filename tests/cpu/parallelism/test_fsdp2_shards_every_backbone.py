@@ -20,11 +20,11 @@ the layer-less shapes above keep working.
     python tests/cpu/parallelism/test_fsdp2_shards_every_backbone.py
 """
 
-import sys
 from unittest.mock import patch
 
 import pytest
 import torch.nn as nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers import GenerationMixin, PretrainedConfig, PreTrainedModel
 
 import src.distributed.fsdp as fsdp
@@ -96,7 +96,7 @@ def _shard_calls(model):
         count = fsdp.apply_fsdp2_per_layer(
             model,
             dp_mesh=None,
-            mp_policy=None,
+            mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=False,
             ignored_params=IdentityParamSet(),
         )
@@ -170,7 +170,7 @@ def test_the_refusal_fires_before_anything_is_wrapped():
             fsdp.apply_fsdp2_per_layer(
                 _UnreachableLayerListDecoder(),
                 dp_mesh=None,
-                mp_policy=None,
+                mp_policy=MixedPrecisionPolicy(),
                 reshard_after_forward=False,
                 ignored_params=IdentityParamSet(),
             )
@@ -189,4 +189,4 @@ def test_reachable_layer_lists_and_non_decoders_are_never_refused():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

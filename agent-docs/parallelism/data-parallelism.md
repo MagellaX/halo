@@ -38,6 +38,22 @@ over. What gets sharded varies:
 | TP (DP == 1, pure TP) | None | Nothing to sync across DP |
 | Single GPU | None | — |
 
+The plain-DP, CP, EP and EP+TP wraps also leave out the frozen parameters whose dtype no trainable
+parameter shares (a base under differently typed adapters), one parameter at a time, so a trainable child
+of their module stays in its shard group (`_fsdp_exclusions` in `src/trainers/mixins/base.py`). A
+trainable parameter left out of every group has no reduce-scatter, and only an EP layer can leave one out;
+unless its hooks or the deferred sweep average it, trainer construction raises on every rank rather than
+let it drift across DP ranks (`_reject_unsynced_trainable_params`).
+
+FSDP2 asserts one original dtype per shard group at the first forward. A decoder layer whose trainable
+parameters mix dtypes (the fp32 router `fp32_router` keeps at `ep_group_size == 1` under
+`fsdp_shard_ep1_experts`, or its `modules_to_save` copy beside bf16 adapters) first shards the smallest
+submodule holding each set of the other dtype as a nested group. The layer's forward pre-hook unshards
+those groups too: the LFM2, DeepSeek-V4 and Inkling EP layers, and GPT-OSS under `bias_update`, read the
+router's weight without calling the router, and FSDP2's root post-backward callback then reduces its
+gradient. A module that itself owns trainable parameters of two dtypes cannot be split, and the wrap
+raises. A layer whose trainable parameters share one dtype gets no extra group.
+
 FSDP2 shards params, gradients, and optimizer states across the DP ranks, so per-rank optimizer-state
 memory is ~`dp_size` smaller than DDP's full per-rank replication. Setup lives in
 `src/distributed/fsdp.py`; `IdentityParamSet` backs `ignored_params` with `id()`-based
@@ -97,9 +113,13 @@ SHARD_GRAD_OP, FSDP2 reshards each module after its backward and re-all-gathers 
 microstep's forward: one full param re-gather per grad-accum microstep for weights that did not
 change in between.
 
-Over NVLink that traffic is negligible. With the trainer's NCCL on TCP sockets (the no-fabric compose
-recipe, `NCCL_NET=Socket`) it measures ~15 s per re-gather at gpt-oss-20b scale, ~6 minutes of every
-optimizer step at `gradient_accumulation_steps: 24`.
+Over NVLink, turning the re-gathers off gains about 4–10% throughput: on 8× B300, dense Qwen3-8B SFT
+runs +3.7% (packed `sft.py`, batch 2, `gradient_accumulation_steps: 8`) to +9.7% (4k tokens, batch 1,
+GA 8) faster with `false`, and gpt-oss-20b EP8 +3.6%. Under the default ZeRO-2 wrap
+(`reshard_after_forward=False`) the parameters are already unsharded through each forward and backward,
+so the measured peak is unchanged. With the trainer's NCCL on TCP sockets (the no-fabric compose recipe,
+`NCCL_NET=Socket`) it measures ~15 s per re-gather at gpt-oss-20b scale, ~6 minutes of every optimizer
+step at `gradient_accumulation_steps: 24`.
 
 The window's **last** backward still reshards: the trainer arms the flag per microstep from
 `accelerator.sync_gradients` in `src/trainers/mixins/base.py`. That leaves one re-gather per
@@ -111,17 +131,67 @@ before reduce-scattering onto the sharded DTensors, so a module left unsharded
 hands `model.parameters()` grad-less tensors the optimizer never captured (grad norm 0, nothing
 clipped) while `unshard()` no-ops on it, hiding the optimizer's update from the next forward.
 
-The cost is one unsharded bf16 param copy per GPU held for the whole run. Plain-DP/CP/EP torchrun
+The cost is one unsharded bf16 param copy per GPU held for the whole run, the optimizer step
+included; under ZeRO-2 the forward/backward peak already holds it. Plain-DP/CP/EP torchrun
 path only; rejected with `fsdp_reshard_after_forward: true` (contradicts FULL_SHARD's purpose), TP,
 or PP.
+
+### Deferred gradient reduce (`fsdp_defer_grad_sync`)
+
+FSDP2 reduce-scatters every module's gradients after each microstep's backward (HSDP adds the
+cross-domain all-reduce), so a window pays `gradient_accumulation_steps` full-gradient reductions.
+`fsdp_defer_grad_sync: true` turns them off for microsteps 1..n-1 (torch
+`set_requires_gradient_sync`, toggled from `accelerator.sync_gradients` alongside the backward
+reshard): autograd accumulates the unsharded gradients locally and the window's last backward
+reduces them once. The sum is the same, taken in a different order (microsteps before ranks), so
+bf16 runs match the default to rounding: across the DP, HSDP, TP+DP, CP+DP and MoE (ep1, EP,
+multi-group EP) rows of `tests/gpu/trainers/sft/test_sft_fsdp_defer_grad_sync.py`, per-step loss
+stays within about 4e-4 of the default and the final weights within about 2% of their movement,
+under the 1.2e-3 loss spread between DP and HSDP (both correct) on the same data.
+
+Measured with packed `sft.py` (4k tokens, batch 2, gradient checkpointing, B300; tok/s/GPU, mean
+of 3 runs unless noted):
+
+| Run | GA | default | `fsdp_defer_grad_sync` | + `fsdp_reshard_after_backward: false` | peak allocated |
+|---|---|---|---|---|---|
+| Qwen3-8B, 8 GPUs, NVLink | 4 | 16,160 | 16,637 (+3.0%) | 17,015 (+5.3%) | 32.6 → 46.0 GB |
+| Qwen3-8B, 8 GPUs, NVLink | 8 | 16,458 | 16,985 (+3.2%) | 17,673 (+7.4%) | 32.6 → 46.0 GB |
+| Qwen3-8B, 2 nodes × 2 GPUs, EFA | 4 | 14,794 | 16,107 (+8.9%) | — | 40.2 → 51.7 GB |
+| same, `use_hsdp` (1 run) | 4 | 14,945 | 16,910 (+13.1%) | — | 55.5 → 63.1 GB |
+| same, NCCL on TCP sockets (1 run) | 4 | 2,024 | 3,084 (+52%) | — | 40.2 → 51.7 GB |
+| Qwen3-30B-A3B, `ep_size: 1`, 8 GPUs, NVLink | 4 | 11,670 | 13,038 (+11.7%) | — | 95.2 → 145.0 GB |
+
+Over NVLink the dense reduce-scatters mostly overlap the backward, so the gain is a few percent; it
+grows with the gradient bytes per token (an `ep_size==1` MoE reduces every expert for 3B active
+params) and with the fabric's cost, and it pairs with `fsdp_reshard_after_backward: false`, which
+removes the matching per-microstep all-gathers. The three-run spread stays within 2.4% of the mean
+(1.3% on one node).
+
+The cost is one unsharded gradient copy per GPU held across the window, at the reduce dtype: 2
+B/param, or 4 B/param when the reduce runs in fp32 (`fp32_grad_reduce`, `fp32_non_ep_params` or
+`bf16: false`; FSDP2 upcasts the accumulator). The default holds the sharded gradient anyway, so at
+equal dtypes the peak rises by (1 − 1/shard width) of that copy: the table's peaks grow by 7/8 of the
+bf16 gradient on 8 GPUs, 3/4 on 2 × 2, and 1/2 under `use_hsdp`, whose shard width is the 2-GPU node.
+An `ep_size==1` MoE pays it for every expert, since FSDP2 owns them; at `ep_size>1` the experts are
+FSDP-ignored and only the non-expert params pay it. It saves nothing at
+`gradient_accumulation_steps: 1`. Use it when the reduction is a visible share of the step (large DP
+width, slow inter-node fabric, small microbatches) and the memory is there.
+
+The in-backward EP expert and router hooks gate on the same `sync_gradients`, and the deferred EP
+sweep, the TP replicated-gradient sweep and the gradient clip run after the window's last backward,
+so all of them read the same reduced gradients as before. Rejected under PP (the schedule already
+reduces once per step), TP at `data_parallel_size==1` (no FSDP2 wrap to defer) and QLoRA (no wrap;
+its sweep already runs once per step). Under `accelerate launch` it is warned and ignored:
+accelerate's `no_sync` already skips the reduce on non-final microsteps.
 
 ### EP1 expert sharding
 
 At `ep_group_size==1` (`ep_size==1` AND `expert_tp_size==1`) the MoE experts are replicated and the
 DeepEP dispatch is a no-op. By default (`fsdp_shard_ep1_experts: true`) FSDP shards them, with its
-reduce-scatter as their sole gradient sync: throughput-neutral (the expert all-gather overlaps),
-grad-equivalent, and freeing memory that scales with DP (gpt-oss-20b −19% peak at 2 GPU, −37% at
-8 GPU).
+reduce-scatter as their sole gradient sync: grad-equivalent, and freeing memory that scales with DP.
+gpt-oss-20b on 8 GPUs at batch 1 drops from 148.3 to 60.3 GB peak (−59%) for −10.5% throughput, and
+−3.5% at batch 4, where the expert all-gather overlaps better
+([Throughput Benchmarks](../optimization/throughput-benchmarks.md#ep-only-batch-scaling)).
 
 Set it `false` to keep a full replicated copy on every DP rank (EP modules become FSDP
 `ignored_params`), the max-throughput choice when memory is not the bottleneck. No effect when
@@ -156,7 +226,8 @@ order of magnitude below NVLink
 ([bandwidth ladder](../reference/gpu-training-theory.md#interconnect-tiers)).
 
 HSDP shards within each NVLink domain and **replicates** across domains, keeping the bandwidth-heavy
-collectives on NVLink so only one gradient all-reduce crosses RDMA per step.
+collectives on NVLink so only one gradient all-reduce crosses RDMA per backward — per optimizer step
+with [`fsdp_defer_grad_sync`](#deferred-gradient-reduce-fsdp_defer_grad_sync).
 
 Enable with `--use_hsdp`. The layout is derived from topology — no shard-size knob: shard width =
 `nvlink_domain_size`, replica count = `num_nvlink_domains`. `setup_fsdp2_for_dp()` applies FSDP2 over
@@ -258,12 +329,12 @@ FSDP2 shards over what is left. HSDP is the exception with a scope of its own: p
 |---|---|---|
 | `use_grouped_gemm: true` + MoE + `accelerate launch` | rejected — the wrappers need the mixin-managed FSDP2 path. Use `torchrun`, or `use_grouped_gemm: false` | `_validate_gmm_launch_method` |
 | multi-device `device_map` (e.g. `"auto"`) under `torchrun` | rejected — the FSDP2 setup cannot skip a rank-local bail-out before a collective mesh build | `src/distributed/fsdp.py` |
-| `bf16_optimizer: false` on a MoE with `fsdp_shard_ep1_experts: false` | rejected — fused AdamW cannot mix the unsharded plain expert tensors with FSDP2 DTensors. At the default `fsdp_shard_ep1_experts: true` the experts are DTensors too and it is allowed | `mixins/base.py` |
-| `use_hsdp`, `fsdp_reshard_after_forward`, `fsdp_reshard_after_backward`, `fp32_grad_reduce` under `accelerate launch` | warned and ignored — accelerate owns the wrap | `_ACCELERATE_UNSUPPORTED_KNOBS` |
+| `bf16_optimizer: false` with a stock AdamW `optim` on a MoE with `fsdp_shard_ep1_experts: false` | rejected — fused AdamW cannot mix the unsharded plain expert tensors with FSDP2 DTensors. At the default `fsdp_shard_ep1_experts: true` the experts are DTensors too and it is allowed | `mixins/base.py` |
+| `use_hsdp`, `fsdp_reshard_after_forward`, `fsdp_reshard_after_backward`, `fsdp_defer_grad_sync`, `fp32_grad_reduce` under `accelerate launch` | warned and ignored — accelerate owns the wrap | `_ACCELERATE_UNSUPPORTED_KNOBS` |
 | `bf16_optimizer` auto-enable under accelerate DDP | warned and skipped — replicated DDP is outside the validated stochastic-rounding matrix; set it explicitly to override | `mixins/base.py` |
 | accelerate FSDP v1 sharding strategy | warned — a known PyTorch bug can corrupt model state after a save. Use the FSDP2 configs or DDP | `mixins/base.py` |
 | `use_hsdp` on a single NVLink domain | warned — no-op; the replica axis engages once the job spans domains | `_validate_hsdp` |
-| QLoRA / `load_in_4bit` | supported on a **dense** model. On a MoE the grouped-GEMM loader takes over and rejects a quantized base (`use_grouped_gemm` is on by default) — use `use_grouped_gemm: false`, or `accelerate launch` | `model_loading.py` |
+| QLoRA / `load_in_4bit` | supported on a **dense** model. On a MoE the grouped-GEMM loader takes over and rejects a quantized base (`use_grouped_gemm` is on by default) — set `use_grouped_gemm: false`, under either launcher | `model_loading.py` |
 | `use_peft` / LoRA, `packing`, `padding_free`, `torch_compile`, `init_from_scratch`, `gradient_checkpointing` | supported and ungated — plain DP is the mode with the widest knob surface | — |
 | `lowp_precision != "bf16"` | SFT only | `parallelism_config_from_args` |
 

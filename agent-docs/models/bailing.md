@@ -7,11 +7,7 @@
 | Bailing MoE / Ling 2.0 | Yes | Yes | **No** | Yes | — ¹ |
 | Ring-mini-linear-2.0, Ling 3.0 | Yes | **No** | **No** | Yes | — ¹ |
 
-¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md). Only Ling 2.0's layer stack is uniform: Ling 3.0 alternates KDA and MLA attention on a `layer_group_size` period, Ring interleaves 16 linear-attention layers with 4 full-attention ones.
-
-No variant binds a stage boundary. The alternation lives in the layer modules themselves, not in a `layer_types` list that mask selection indexes by position, and a stage is built by slicing the live `ModuleList`, so every layer keeps its own type wherever the cut lands.
-
-The shipped gate is instead multi-token prediction. Ling 2.0 and Ling-3.0-tiny ship `num_nextn_predict_layers: 0`; Ling-3.0-flash ships `1`, which the gate refuses unless set to `0` in `model_init_kwargs`.
+¹ Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 The shipped config trains `inclusionAI/Ling-mini-2.0` (`model_type: bailing_moe`). The sibling `inclusionAI/Ring-mini-linear-2.0` is a **different** architecture (`BailingMoeLinearV2ForCausalLM`, `model_type: bailing_moe_linear`) that swaps softmax attention for Lightning Attention-2. Both share the `BailingMoeV2SparseMoeBlock` the EP wrapper targets.
 
@@ -23,14 +19,14 @@ The MoE block is unchanged from V2 (same per-expert `gate_proj`/`up_proj`/`down_
 
 Attention is what differs: layers alternate in groups of `layer_group_size`, with most layers `BailingMoeV3KimiDeltaAttention` (KDA linear attention through `fla`) and the rest `BailingMoeV3MultiLatentAttention` (MLA).
 
-The KDA kernels accept a `cu_seqlens` kwarg (fla convention) that the toolkit collators do not yet emit, so under packing the recurrence scans the whole row and mixes across document boundaries — an emission gap, not an architectural limit. KDA is the majority of the stack, so that term dominates whatever the MLA layers do ([Document isolation](../data/collators.md#document-isolation-under-packing)).
+The KDA kernels accept a `cu_seqlens` kwarg (fla convention) that the toolkit collators do not emit, so under packing the recurrence scans the whole row and mixes across document boundaries — an emission gap, not an architectural limit. KDA is the majority of the stack, so that term dominates whatever the MLA layers do ([Document isolation](../data/collators.md#document-isolation-under-packing)).
 
 Three consequences for a training config:
 
-- **Pin `attn_implementation: sdpa`.** The modeling file declares only the v4-era `_supports_flash_attn_2`, which transformers v5 ignores in favor of `_supports_flash_attn`, so an auto-selected FA4 is refused at model build. The KDA layers run their own `fla` kernels either way.
-- **Set `fp32_non_ep_params: true`.** The KDA layers hold `A_log` and `dt_bias` in fp32 and `from_pretrained` does not unify them, so the model reaches FSDP2 with mixed parameter dtypes and `fully_shard` asserts one original dtype per shard group.
+- **Pin `attn_implementation: sdpa`.** The modeling file declares only the v4-era `_supports_flash_attn_2`, which transformers v5 ignores in favor of `_supports_flash_attn`, so an auto-selected flash label (FA4 on Blackwell, FA3 on Hopper) is refused at model build. The KDA layers run their own `fla` kernels either way.
+- **`fp32_non_ep_params: true` keeps the KDA state in fp32 (optional).** The modeling file declares `A_log` and `dt_bias` in fp32; without the flag the loaders cast them to the run dtype with every other parameter ([Load precision](README.md#load-precision)). With it they train, with the other non-expert parameters, as fp32 masters from their stored fp32 values (compute stays bf16).
 
-    Upcasting the non-expert parameters to fp32 masters is what makes the wrap legal; compute stays bf16. At `expert_parallel_size: 1` pair it with **`fsdp_shard_ep1_experts: false`**: the upcast skips every EP-wrapper parameter, so FSDP-managed replicated experts would sit bf16 inside the same fp32 shard group and `ParallelismConfig` refuses the combination at config time. Above ep1 the knob has no effect; the experts are FSDP-ignored anyway.
+    At `expert_parallel_size: 1` pair it with **`fsdp_shard_ep1_experts: false`**: the upcast skips every EP-wrapper parameter, so FSDP-managed replicated experts would sit bf16 inside the same fp32 shard group and `ParallelismConfig` refuses the combination at config time. Above ep1 the knob has no effect; the experts are FSDP-ignored anyway.
 
 - **Override `rope_scaling`.** The config ships `rope_scaling: null`, which transformers v5 normalizes into a dict carrying no `"factor"`; the MLA layers then read `config.rope_scaling["factor"]` and raise `KeyError`. Pass the minimal replacement and nothing more:
 
@@ -63,11 +59,11 @@ The shipped label is always `sdpa` — the remote code declares only the v4-era 
 Two settings a CP run needs:
 
 ```yaml
-attn_implementation: sdpa       # the auto-detected FA4 is refused at model build
+attn_implementation: sdpa       # an auto-detected flash label (FA4 / FA3) is refused at model build
 context_parallel_size: 2        # ≤ 4 on Ling-mini-2.0 — cp_size must divide the 4 KV heads
 ```
 
-The EP lazy loader retries SDPA after that refusal on its own; the CP loader does not, so a CP config that leaves the label unset, or pins a flash one, raises `BailingMoeV2ForCausalLM does not support Flash Attention 2 yet`.
+A flash label — pinned, or auto-selected for an unset one — raises `BailingMoeV2ForCausalLM does not support Flash Attention <N> yet` at model build, on every load path; `<N>` is the requested version (4 auto-selected on Blackwell, 3 on Hopper). On the EP lazy-loading path it arrives as a `ValueError` that names `attn_implementation` and includes that transformers message.
 
 `Ring-mini-linear-2.0` is **rejected**, not wrapped: its file reuses Ling 2.0's full-attention class names, so validation matches `BailingMoeV2LinearAttention` by name to avoid wrapping the few full-attention layers while the Lightning-Attention-2 recurrence scans each rank's shard in isolation. (`finalize_loaded_model()` recomputes its slope buffers on every load path.) Ling 3.0 is likewise unavailable — its KDA layers are a linear recurrence and its MLA layers carry no wrapper.
 
@@ -105,13 +101,13 @@ Measured configs persist in the Triton disk cache, which `setup_training_environ
 
 ## Router balancing
 
-Bailing is aux-loss-free by design (`topk_method: noaux_tc`): no modeling variant computes a load-balancing loss and the config carries no `router_aux_loss_coef`. The family's native mechanism is the gate's persistent `expert_bias` buffer, added to the sigmoid scores for **selection only** — combine weights stay unbiased.
+Bailing is aux-loss-free by design (`moe_router_enable_expert_bias: true`; Ling 3.0 also declares `topk_method: noaux_tc`): no modeling variant computes a load-balancing loss and the config carries no `router_aux_loss_coef`. The family's native mechanism is the gate's persistent `expert_bias` buffer, added to the sigmoid scores for **selection only** — combine weights stay unbiased.
 
 `EPBailingMoELayer` hands exactly that buffer to `RouterBiasBalancingCallback`: under `moe_balancing: bias_update` (or `auto`, which resolves there whenever the wrapper is applied) the DeepSeek-V3 sign-updates land in `expert_bias` itself, upcast to fp32 at enable so the 1e-3 steps survive the add.
 
 The wrapper exposes it as a live property, so callback updates and the `router_balancing_biases.pt` resume-restore always reach the buffer the gate reads. Because the buffer is part of the checkpoint, a gathered save exports the **final** bias and a served checkpoint routes exactly as training did.
 
-Most wrapper families adopt a native slot the same way. The exceptions are Qwen3, Qwen3.5/3.6, Mistral4 and Cohere2 MoE, whose routers carry no such slot — strict `bias_update` raises there and only the trainer-only `bias_update_transient` runs, its bias never leaving the run — and Gemma 4, which has no balancing route at all. `moe/*` load metrics come with the callback.
+Most wrapper families adopt a native slot the same way; the per-family slots and the exceptions are in the [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback) table. `moe/*` load metrics come with the callback.
 
 An explicit `aux_loss` warns and stays off (there is no aux term to enable). Without the EP wrapper — `use_grouped_gemm: false` at `expert_parallel_size: 1` — nothing counts expert loads, so `bias_update` raises at setup; freezing the gate is the fallback mitigation there:
 
@@ -132,6 +128,6 @@ The SGLang server needs `SGLANG_TRUST_REMOTE_CODE=1` (the repo ships its modelin
 
 `inclusionAI/Ling-mini-2.0` (16B, 256 experts) trains under EP=8 at 24K max length with `moe_balancing: bias_update`: `examples/sft/ling_mini_2/ling-mini-2-ultrachat-ep.yaml`.
 
-The Ling configs pin the toolkit's own chat templates with `force_chat_template: true` — `jinja-templates/ling/ling-instruct.jinja` / `ling-multiturn.jinja` (Ling-mini-2) and `jinja-templates/ling/ling3-instruct.jinja` (Ling 3.0) — because the hub templates drift across revisions and the training template must match the served one. `ling-native.jinja` is the verbatim upstream `inclusionAI/Ling-mini-2.0` template (system messages + tools) for runs that need the exact hub render.
+The shipped config pins the toolkit's own `jinja-templates/ling/ling-multiturn.jinja` with `force_chat_template: true` (`ling-instruct.jinja` is its single-turn sibling and raises on multi-turn data; `ling3-instruct.jinja` is the Ling 3.0 template), because the hub templates drift across revisions and the training template must match the served one. `ling-native.jinja` is the verbatim upstream `inclusionAI/Ling-mini-2.0` template (system messages + tools) for runs that need the exact hub render.
 
 Ling 3.0 has no shipped example config — start from `ling-mini-2-ultrachat-ep.yaml` and add the three Ling-3.0 settings above. A gathered save of Ling-3.0-flash (~122B) is ~245 GB; check the target volume before launching.

@@ -47,7 +47,7 @@ from src.distributed.parallelism_config import ParallelismConfig
 
 def test_ep_tp_etp_combo_rejected():
     """EP+TP+ETP is unsupported and must raise at config time."""
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError, match="is not a supported parallelism combination"):
         ParallelismConfig(ep_size=2, tp_size=2, expert_tp_size=2)
 
 
@@ -94,16 +94,16 @@ Rules:
 
 - **Behavior, not implementation** — loss is finite *and* decreases over ≥2 real steps
   (a 1-step run that skips the decrease check is a silent pass — require `len(losses) >= 2`).
-- **Deterministic seeded synthetic data** — generate problems from a fixed seed; use
-  `ctx.broadcast_seed()` when every rank must produce the *same* data (e.g. a parallel run
-  compared to a single-GPU reference).
+- **Deterministic seeded synthetic data** — generate problems from a fixed seed, the same one on
+  every rank when every rank must produce the *same* data (e.g. a parallel run compared to a
+  single-GPU reference).
 - **No hot-path downloads** — load from a cached snapshot / tiny local config; never hit the
   Hub mid-test.
-- **Cross-rank invariants** — the DP-averaged loss agrees across ranks
-  (`TOL.rank_loss_consistency_abs`); TP grad-norm is identical across the TP group
-  (`TOL.tp_grad_norm_spread_abs`). Compute the verdict on **all** ranks (all-gather /
-  broadcast) — setting `checks[...] = True` off rank 0 or on a `world_size < 2` fallback
-  masks rank-skew bugs.
+- **Cross-rank invariants** — an identical broadcast batch gives every rank the same loss
+  (`TOL.ep_identical_batch_rank_spread_abs`, via `world_spread`). A logged loss is already the world
+  mean (HF all-gathers it), so a spread of it cannot fail. Compute the verdict on **all** ranks
+  (all-gather / broadcast) — setting `checks[...] = True` off rank 0 or on a `world_size < 2`
+  fallback masks rank-skew bugs.
 - **Parallel-vs-reference** — EP/CP/TP/ETP step-0 loss matches the dense reference within
   `TOL.parallel_vs_baseline_loss_abs`; the trend within `TOL.parallel_vs_baseline_train_loss_abs`.
 

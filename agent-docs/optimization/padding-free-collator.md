@@ -2,7 +2,7 @@
 
 Concatenates variable-length sequences into one flattened tensor and emits `cu_seq_lens` so a varlen Flash Attention kernel skips padding compute. These collators are SFT-only: `select_data_collator` (`src/data/collators/factory.py`) picks them when `padding_free: true`. Mutually exclusive with `packing`. Incompatible with Context Parallelism.
 
-SMPO also supports `padding_free`, but flattens the batch itself in `_forward_padding_free` (`src/trainers/preference/smpo.py`) rather than using these collators. Padded rows pay full GEMM cost; the M-dimension argument is in [GPU Training Theory §2](../reference/gpu-training-theory.md#2-the-roofline-arithmetic-intensity-and-the-ridge-point).
+SMPO also supports `padding_free`, but flattens the batch itself in `_forward_padding_free` (`src/trainers/preference/smpo.py`) rather than using these collators. Padded rows pay full GEMM cost; the M-dimension argument is in [GPU Training Theory §2](../reference/gpu-training-theory.md#2-the-roofline--arithmetic-intensity-and-the-ridge-point).
 
 SMPO's flattened row isolates its documents too: attention through `position_ids`, and LFM-2 and GatedDeltaNet through `seq_idx` / `cu_seq_lens` segment markers built by the same gate these collators use (`src/models/segment_markers.py`).
 
@@ -74,7 +74,7 @@ Throughput is **real (non-padding) tokens/s/GPU** — `attention_mask.sum()`, no
 
 Peak memory is ~115.8 GB across all three (weights + optimizer states dominate). At ~75% padding waste, packing wins by filling each max_length block with ~4 real sequences and cutting the step count. Padding-free strips the padding via varlen FA, so it processes only real tokens per step at lower memory than packing, while keeping per-sample boundaries (no cross-sequence attention).
 
-The table uses `--attn_implementation flash_attention_2`. FA4 is also valid: FA4 + packing + EP is safe (DeepEP V2's long-timeout dispatch barrier absorbs FA4's first-use JIT compile — see [Flash Attention](flash-attention.md#known-issues)). With `--attn_implementation` unset (the default), the benchmark auto-detects FA4 on Blackwell (`tests/common/benchmark_args.py`).
+The table uses `--attn_implementation flash_attention_2`. FA4 is also valid: FA4 + packing + EP is safe (`warm_attention_kernels` compiles the FA4 kernels behind a barrier at load — see [Flash Attention](flash-attention.md#known-issues)). With `--attn_implementation` unset (the default), the benchmark auto-detects FA4 on Blackwell (`tests/common/benchmark_args.py`).
 
 ## Parallelism compatibility
 

@@ -10,6 +10,7 @@ Run: pytest tests/cpu/config/test_knob_wiring.py
 
 import ast
 import dataclasses
+import importlib
 import inspect
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from unittest import mock
 
 import pytest
 from datasets import Dataset, DatasetDict
+from trl import SFTConfig
 
 from src.args.distributed_args import DistributedArguments
 from src.args.mixins import RLRRConfig, SDPGArguments
@@ -29,11 +31,13 @@ from src.trainers.distillation.self_distillation import DistributedSelfDistillat
 from src.trainers.grpo.objective.logratio import ISMaskConfig
 from src.trainers.grpo.online import DistributedGRPOTrainer
 from src.trainers.mixins.base import DistributedTrainerMixin
+from src.trainers.preference.precompute import PrecomputeRefLogpsRankConsistentMixin
 from src.trainers.sft import DistributedSFTTrainer
 from src.training.parallelism_args import parallelism_config_from_args
 from src.training.script_runner import (
     distributed_trainer_kwargs,
     reject_non_default_args,
+    reject_trl_dataset_prep_args,
     reject_unsupported_args,
 )
 from tests.common.utils import load_script_module
@@ -47,7 +51,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 def test_bf16_optimizer_reaches_parallelism_config(requested):
     """The DistributedArguments knob must survive into ParallelismConfig — that object is the only
     thing every entry script threads into every trainer, so a drop here makes the knob unreachable."""
-    config = parallelism_config_from_args(DistributedArguments(bf16_optimizer=requested))
+    config = parallelism_config_from_args(
+        DistributedArguments(bf16_optimizer=requested), trainer_cls=DistributedTrainerMixin
+    )
     assert config.bf16_optimizer is requested
 
 
@@ -250,6 +256,46 @@ def test_reject_unsupported_args_names_every_set_field():
     assert "images_field" not in message  # unset fields are not a request
 
 
+# reject_trl_dataset_prep_args: the knobs only TRL's own dataset prep and collator read
+
+
+def _sft_config(**overrides) -> SFTConfig:
+    return SFTConfig(output_dir="unused", bf16=False, use_cpu=True, **overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "knob"),
+    [
+        # Tri-state: an explicit False is as unhonorable a request as True.
+        ({"completion_only_loss": False}, "completion_only_loss"),
+        ({"assistant_only_loss": True}, "assistant_only_loss"),
+        ({"dataset_text_field": "messages"}, "dataset_text_field"),
+        ({"dataset_kwargs": {"add_special_tokens": False}}, "dataset_kwargs"),
+        ({"eval_packing": True}, "eval_packing"),
+    ],
+)
+def test_trl_dataset_prep_knobs_are_refused(overrides, knob):
+    config = _sft_config(**overrides)
+    with pytest.raises(ValueError, match=rf"does not support these config fields.*{knob}"):
+        reject_trl_dataset_prep_args("Some script", config, "eval_packing")
+
+
+def test_trl_dataset_prep_defaults_pass():
+    reject_trl_dataset_prep_args("Some script", _sft_config(), "eval_packing")
+
+
+def test_each_trl_dataset_prep_refusal_names_its_own_way_out():
+    """A mask knob's refusal points at the script's own masking; a rendering knob's at the caller's
+    rendering remedy. Neither message carries the other's advice."""
+    with pytest.raises(ValueError) as masked:
+        reject_trl_dataset_prep_args("Some script", _sft_config(assistant_only_loss=True), render_remedy="REMEDY")
+    assert "train_on_completions_only" in str(masked.value) and "REMEDY" not in str(masked.value)
+
+    with pytest.raises(ValueError) as rendered:
+        reject_trl_dataset_prep_args("Some script", _sft_config(dataset_text_field="messages"), render_remedy="REMEDY")
+    assert "REMEDY" in str(rendered.value) and "train_on_completions_only" not in str(rendered.value)
+
+
 # reject_non_default_args: the same gate for knobs whose own default is truthy
 
 
@@ -314,10 +360,6 @@ def _rejected_knobs(script_path: str) -> set[str]:
     return rejected
 
 
-# Consumed only by TRL's own dataset prep + default collator, which these scripts replace.
-_TRL_SFT_MASK_KNOBS = {"assistant_only_loss", "completion_only_loss"}
-
-
 @pytest.mark.parametrize(
     ("script", "fields"),
     [
@@ -328,8 +370,6 @@ _TRL_SFT_MASK_KNOBS = {"assistant_only_loss", "completion_only_loss"}
         ("scripts/training/classification.py", {"text_only_model"}),
         ("scripts/training/environmental_grpo.py", {"tools_field", "text_only_model"}),
         ("scripts/training/online_grpo/rlvr.py", {"text_only_model"}),
-        ("scripts/training/distillation/self_distill.py", _TRL_SFT_MASK_KNOBS),
-        ("scripts/training/sft.py", _TRL_SFT_MASK_KNOBS),
         (
             "scripts/training/embedding.py",
             {
@@ -462,6 +502,42 @@ def test_every_training_script_forwards_moe_balancing_to_its_trainer():
         str(script.relative_to(PROJECT_ROOT)) for script in _TRAINER_SCRIPTS if not _forwards_moe_balancing(script)
     ]
     assert not missing, f"these scripts do not forward the parsed moe_balancing to their trainer: {missing}"
+
+
+def _constructed_trainer_class(script: Path, call: ast.Call) -> type | None:
+    """The class ``call`` constructs, resolved through the script's own ``from ... import`` of it."""
+    name = getattr(call.func, "id", None)
+    for node in ast.walk(ast.parse(script.read_text())):
+        if isinstance(node, ast.ImportFrom) and node.module and any(alias.name == name for alias in node.names):
+            return getattr(importlib.import_module(node.module), name)
+    return None
+
+
+def test_precompute_trainers_receive_the_resume_context():
+    """TRL runs the reference precompute inside the trainer's ``__init__``, before ``train()`` ever
+    sees the resume checkpoint. A script that does not hand the trainer ``resume_checkpoint`` and
+    ``policy_from_checkpoint`` leaves a Path-B resume sweeping the trained policy as its own
+    reference — the checkpoint's saved columns never read. The scripts are found through the class
+    hierarchy, so a new trainer on the precompute mixin is held to it too.
+    """
+    wired: dict[str, bool] = {}
+    for script in _TRAINER_SCRIPTS:
+        call = _trainer_call(script)
+        trainer_cls = _constructed_trainer_class(script, call)
+        if trainer_cls is None or not issubclass(trainer_cls, PrecomputeRefLogpsRankConsistentMixin):
+            continue
+        passed = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+        wired[str(script.relative_to(PROJECT_ROOT))] = all(
+            isinstance(passed.get(field), ast.Attribute)
+            and passed[field].attr == field
+            and getattr(passed[field].value, "id", None) == "runtime"
+            for field in ("resume_checkpoint", "policy_from_checkpoint")
+        )
+    assert len(wired) >= 2, f"the scan found {sorted(wired)}, not the DPO and KTO scripts"
+    unwired = sorted(script for script, ok in wired.items() if not ok)
+    assert not unwired, (
+        f"these scripts do not hand their trainer runtime.resume_checkpoint/policy_from_checkpoint: {unwired}"
+    )
 
 
 def test_the_shared_bundle_carries_every_distributed_knob():

@@ -7,21 +7,18 @@ Run: python tests/cpu/parallelism/test_parallelism_config.py
 
 import datetime
 import os
-from unittest.mock import patch
 
 import pytest
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from src.args.distributed_args import DistributedArguments
-from src.distributed.expert_parallel.config import EPConfig
+from src.distributed.expert_parallel.config import EPConfig, ExpertLoraSpec
 from src.distributed.group_layout import cross_node_rank_and_group, node_local_rank_and_group
-from tests.common.parallelism import create_config, make_parallelism_config
-from tests.common.ports import free_port
-
-# Module path prefix for mocking the src.distributed.runtime imports in parallelism_config
-_MOD = "src.distributed.parallelism_config"
-
+from src.distributed.parallelism_config import ParallelismConfig
+from src.trainers.mixins.base import DistributedTrainerMixin
+from src.training.parallelism_args import parallelism_config_from_args
+from tests.common.gloo import run_gloo_ranks
+from tests.common.parallelism import create_config, make_parallelism_config, simulated_world
 
 # Computed fields
 
@@ -168,7 +165,7 @@ def test_validate_ep_tp_divisibility():
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
         # The cross-domain members-per-domain guard fires first for this shape.
-        assert "must be a multiple of tp_size" in str(e) or "must divide the NVLink domain" in str(e)
+        assert "must be a multiple of tensor_parallel_size" in str(e) or "must divide the NVLink domain" in str(e)
 
 
 def test_validate_ep_node_scope_too_large():
@@ -228,7 +225,7 @@ def test_validate_expert_tp_divides_domain_global_scope():
         create_config(ep_size=2, expert_tp_size=3, world_size=48, gpus_per_node=8, ep_scope="global")
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "expert_tp_size (3) must divide the NVLink domain (8)" in str(e), e
+        assert "expert_tensor_parallel_size (3) must divide the NVLink domain (8)" in str(e), e
         assert "Expert TP groups must stay on NVLink" in str(e), e
 
 
@@ -245,7 +242,7 @@ def test_validate_cp_exceeds_domain_rejected():
         create_config(cp_size=16, world_size=8, gpus_per_node=8)
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "CP size (16) cannot exceed the NVLink domain (8)" in str(e), e
+        assert "context_parallel_size (16) cannot exceed the NVLink domain (8)" in str(e), e
 
 
 def test_validate_cp_domain_divisibility_rejected():
@@ -253,7 +250,7 @@ def test_validate_cp_domain_divisibility_rejected():
         create_config(cp_size=3, world_size=8, gpus_per_node=8)
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "CP size (3) must divide the NVLink domain (8)" in str(e), e
+        assert "context_parallel_size (3) must divide the NVLink domain (8)" in str(e), e
 
 
 def test_validate_tp_exceeds_stage_world_rejected():
@@ -261,7 +258,7 @@ def test_validate_tp_exceeds_stage_world_rejected():
         create_config(tp_size=16, world_size=8, gpus_per_node=8)
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "TP size (16) cannot exceed world size (8)" in str(e), e
+        assert "tensor_parallel_size (16) cannot exceed world size (8)" in str(e), e
 
 
 def test_validate_tp_stage_world_divisibility_rejected():
@@ -269,7 +266,7 @@ def test_validate_tp_stage_world_divisibility_rejected():
         create_config(tp_size=3, world_size=8, gpus_per_node=8)
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "TP size (3) must divide world size (8)" in str(e), e
+        assert "tensor_parallel_size (3) must divide world size (8)" in str(e), e
 
 
 def test_validate_pure_tp_domain_divisibility_rejected():
@@ -294,12 +291,16 @@ def test_validate_multi_domain_multigroup_ep_etp_rejected():
 def test_validate_shard_ep1_experts_off_under_tp_cp_rejected():
     """fsdp_shard_ep1_experts=False is a silent no-op under TP/CP (their wraps shard experts
     unconditionally) — the config must refuse rather than not honor the flag."""
-    for axis_kwargs in ({"tp_size": 2}, {"cp_size": 2}):
+    for axis_kwargs, named_knob in (
+        ({"tp_size": 2}, "tensor_parallel_size=2"),
+        ({"cp_size": 2}, "context_parallel_size=2"),
+    ):
         try:
             create_config(fsdp_shard_ep1_experts=False, world_size=8, gpus_per_node=8, **axis_kwargs)
             raise AssertionError(f"Should have raised ValueError for {axis_kwargs}")
         except ValueError as e:
             assert "fsdp_shard_ep1_experts=False is not honored under TP or CP" in str(e), e
+            assert named_knob in str(e), e
     # Pure DP keeps the full replicated-expert copy — the flag's documented purpose.
     cfg = create_config(fsdp_shard_ep1_experts=False, world_size=8, gpus_per_node=8)
     assert cfg.experts_fsdp_managed is False
@@ -370,7 +371,7 @@ def test_validate_ep_tp_size_not_multiple_of_tp():
         create_config(ep_size=2, tp_size=4, world_size=8, gpus_per_node=8, ep_scope="node")
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
-        assert "multiple of tp_size" in str(e)
+        assert "multiple of tensor_parallel_size" in str(e)
 
 
 def test_validate_max_concurrent_loading_negative():
@@ -396,8 +397,13 @@ def _expect_reject(substr=None, **kw):
 
 
 def test_guard_size_below_one():
-    for name in ("ep_size", "tp_size", "cp_size", "expert_tp_size"):
-        _expect_reject(name, **{name: 0, "world_size": 8, "gpus_per_node": 8})
+    for field_name, knob in (
+        ("ep_size", "expert_parallel_size"),
+        ("tp_size", "tensor_parallel_size"),
+        ("cp_size", "context_parallel_size"),
+        ("expert_tp_size", "expert_tensor_parallel_size"),
+    ):
+        _expect_reject(f"{knob} must be >= 1", **{field_name: 0, "world_size": 8, "gpus_per_node": 8})
 
 
 def test_guard_bad_ep_scope():
@@ -539,6 +545,35 @@ def test_boolean_mode_properties():
     assert cfg.is_ep_cp_mode is False
 
 
+def test_default_sizes_and_mode_flags():
+    """Default config: every axis at 1, no mode flag set, grouped GEMM (and so the EP wrappers) on."""
+    cfg = create_config(world_size=8, gpus_per_node=8)
+    assert (cfg.ep_size, cfg.cp_size, cfg.tp_size, cfg.expert_tp_size) == (1, 1, 1, 1)
+    assert not (cfg.is_ep_mode or cfg.is_cp_mode or cfg.is_tp_mode)
+    assert cfg.use_grouped_gemm is True
+    assert cfg.needs_ep_wrappers is True
+
+
+@pytest.mark.parametrize(
+    ("axis", "ep_cp_tp_flags"),
+    [
+        ({"ep_size": 8}, (True, False, False)),
+        ({"cp_size": 4}, (False, True, False)),
+        ({"tp_size": 4}, (False, False, True)),
+    ],
+)
+def test_a_single_axis_sets_only_its_own_mode_flag(axis, ep_cp_tp_flags):
+    cfg = create_config(world_size=8, gpus_per_node=8, **axis)
+    assert (cfg.is_ep_mode, cfg.is_cp_mode, cfg.is_tp_mode) == ep_cp_tp_flags
+
+
+def test_ep_cp_mode_flags():
+    """EP+CP sets both axis flags and the combined one, and not the EP+TP one."""
+    cfg = create_config(ep_size=8, cp_size=8, world_size=16, gpus_per_node=8, ep_scope="node")
+    assert cfg.is_ep_mode and cfg.is_cp_mode and cfg.is_ep_cp_mode
+    assert not (cfg.is_tp_mode or cfg.is_ep_tp_mode)
+
+
 def test_num_ep_groups_node():
     """Node-local EP: num_ep_groups = (gpus_per_node / ep_group_size) * num_nodes."""
     cfg = create_config(ep_size=4, world_size=16, gpus_per_node=8, ep_scope="node")
@@ -595,28 +630,21 @@ _GLOO_WORLD = 8
 _GLOO_TIMEOUT_SEC = 180
 
 
-def _ep_group_size_one_worker(rank: int, out_dir: str, port: int) -> None:
+def _ep_group_size_one_worker(rank: int, out_dir: str) -> None:
     """Build the REAL ``EPConfig`` and ``ParallelismConfig`` for ``rank`` on a live gloo group."""
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(_GLOO_WORLD))
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=_GLOO_WORLD, timeout=datetime.timedelta(seconds=_GLOO_TIMEOUT_SEC)
-    )
-    try:
-        ep = EPConfig(ep_size=1, world_size=_GLOO_WORLD, gpus_per_node=_GLOO_WORLD, use_grouped_gemm=False)
-        pc = make_parallelism_config(world_size=_GLOO_WORLD, gpus_per_node=_GLOO_WORLD, rank=rank, ep_size=1)
-        failures = []
-        if ep.ep_group_size != 1 or not ep.needs_expert_grad_sync:
-            failures.append(f"precondition: ep_group_size={ep.ep_group_size} sync={ep.needs_expert_grad_sync}")
-        if pc.num_ep_groups != ep.num_ep_groups:
-            failures.append(f"num_ep_groups {pc.num_ep_groups} != EPConfig's {ep.num_ep_groups}")
-        if sorted(pc.get_expert_replica_ranks()) != sorted(ep.expert_replica_ranks):
-            failures.append(f"replicas {pc.get_expert_replica_ranks()} != EPConfig's {ep.expert_replica_ranks}")
-        if dist.get_world_size(ep.expert_replica_group) != _GLOO_WORLD:
-            failures.append(f"replica group holds {dist.get_world_size(ep.expert_replica_group)} of {_GLOO_WORLD}")
-        with open(os.path.join(out_dir, f"result_{rank}.txt"), "w") as fh:
-            fh.write("PASS" if not failures else "FAIL: " + "; ".join(failures))
-    finally:
-        dist.destroy_process_group()
+    ep = EPConfig(ep_size=1, world_size=_GLOO_WORLD, gpus_per_node=_GLOO_WORLD, use_grouped_gemm=False)
+    pc = make_parallelism_config(world_size=_GLOO_WORLD, gpus_per_node=_GLOO_WORLD, rank=rank, ep_size=1)
+    failures = []
+    if ep.ep_group_size != 1 or not ep.needs_expert_grad_sync:
+        failures.append(f"precondition: ep_group_size={ep.ep_group_size} sync={ep.needs_expert_grad_sync}")
+    if pc.num_ep_groups != ep.num_ep_groups:
+        failures.append(f"num_ep_groups {pc.num_ep_groups} != EPConfig's {ep.num_ep_groups}")
+    if sorted(pc.get_expert_replica_ranks()) != sorted(ep.expert_replica_ranks):
+        failures.append(f"replicas {pc.get_expert_replica_ranks()} != EPConfig's {ep.expert_replica_ranks}")
+    if dist.get_world_size(ep.expert_replica_group) != _GLOO_WORLD:
+        failures.append(f"replica group holds {dist.get_world_size(ep.expert_replica_group)} of {_GLOO_WORLD}")
+    with open(os.path.join(out_dir, f"result_{rank}.txt"), "w") as fh:
+        fh.write("PASS" if not failures else "FAIL: " + "; ".join(failures))
 
 
 def test_ep_group_size_one_agrees_with_a_real_eight_rank_ep_config(tmp_path):
@@ -630,8 +658,8 @@ def test_ep_group_size_one_agrees_with_a_real_eight_rank_ep_config(tmp_path):
     A ``num_ep_groups`` of 1 there under-counts the replica set the deferred sweep divides by.
     """
     out_dir = str(tmp_path)
-    mp.start_processes(
-        _ep_group_size_one_worker, args=(out_dir, free_port()), nprocs=_GLOO_WORLD, join=True, start_method="spawn"
+    run_gloo_ranks(
+        _ep_group_size_one_worker, _GLOO_WORLD, out_dir, pg_timeout=datetime.timedelta(seconds=_GLOO_TIMEOUT_SEC)
     )
     for rank in range(_GLOO_WORLD):
         with open(os.path.join(out_dir, f"result_{rank}.txt")) as fh:
@@ -701,20 +729,13 @@ def _DistArgs() -> DistributedArguments:
 
 def test_parallelism_config_from_args_basic():
     """parallelism_config_from_args wires DistributedArguments into a ParallelismConfig."""
-    with (
-        patch(f"{_MOD}.get_global_world_size", return_value=8),
-        patch(f"{_MOD}.get_local_world_size", return_value=8),
-        patch(f"{_MOD}.get_global_rank", return_value=0),
-        patch(f"{_MOD}.is_global_main_process", return_value=True),
-    ):
-        from src.training.parallelism_args import parallelism_config_from_args
-
+    with simulated_world(world_size=8, gpus_per_node=8):
         # Non-default values on the knobs most prone to silent drift, so the asserts below fail if
         # the builder drops them back to ParallelismConfig defaults instead of forwarding.
         args = _DistArgs()
         args.fp32_grad_reduce = True
         args.max_concurrent_loading = 3
-        cfg = parallelism_config_from_args(args)
+        cfg = parallelism_config_from_args(args, trainer_cls=DistributedTrainerMixin)
         assert cfg.ep_size == 8
         assert cfg.expert_tp_size == 1
         assert cfg.use_grouped_gemm is True
@@ -724,33 +745,25 @@ def test_parallelism_config_from_args_basic():
 
 
 def test_parallelism_config_from_args_rejects_pp_when_unsupported():
-    """supports_pp=False rejects a requested pipeline_parallel_size>1 at config time — BEFORE the
-    model (or a teacher/reference/vLLM probe) loads; the trainer's _supports_pp gate fires far later."""
+    """A trainer class declaring ``_supports_pp = False`` rejects a requested pipeline_parallel_size>1
+    at config time — BEFORE the model (or a teacher/reference/vLLM probe) loads; the trainer's own
+    gate fires far later."""
     args = _DistArgs()
     args.pipeline_parallel_size = 2
-    from src.training.parallelism_args import parallelism_config_from_args
-
     try:
-        parallelism_config_from_args(args, supports_pp=False)
-        raise AssertionError("supports_pp=False must reject pipeline_parallel_size=2")
+        parallelism_config_from_args(args, trainer_cls=DistributedTrainerMixin)
+        raise AssertionError("a _supports_pp=False trainer must reject pipeline_parallel_size=2")
     except ValueError as e:
-        assert "does not support Pipeline Parallelism" in str(e)
+        assert "DistributedTrainerMixin does not support Pipeline Parallelism" in str(e)
 
 
 def test_parallelism_config_from_args_rejects_lowp_when_disallowed():
     """A non-bf16 lowp_precision is rejected when allow_low_precision=False (non-SFT trainers)."""
     args = _DistArgs()
     args.lowp_precision = "fp8"
-    with (
-        patch(f"{_MOD}.get_global_world_size", return_value=8),
-        patch(f"{_MOD}.get_local_world_size", return_value=8),
-        patch(f"{_MOD}.get_global_rank", return_value=0),
-        patch(f"{_MOD}.is_global_main_process", return_value=True),
-    ):
-        from src.training.parallelism_args import parallelism_config_from_args
-
+    with simulated_world(world_size=8, gpus_per_node=8):
         try:
-            parallelism_config_from_args(args, allow_low_precision=False)
+            parallelism_config_from_args(args, trainer_cls=DistributedTrainerMixin, allow_low_precision=False)
             raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "lowp_precision" in str(e)
@@ -760,15 +773,8 @@ def test_parallelism_config_from_args_lowp_allowed_for_sft():
     """allow_low_precision=True forwards the lowp_* knobs (SFT path)."""
     args = _DistArgs()
     args.lowp_precision = "fp8"
-    with (
-        patch(f"{_MOD}.get_global_world_size", return_value=8),
-        patch(f"{_MOD}.get_local_world_size", return_value=8),
-        patch(f"{_MOD}.get_global_rank", return_value=0),
-        patch(f"{_MOD}.is_global_main_process", return_value=True),
-    ):
-        from src.training.parallelism_args import parallelism_config_from_args
-
-        cfg = parallelism_config_from_args(args, allow_low_precision=True)
+    with simulated_world(world_size=8, gpus_per_node=8):
+        cfg = parallelism_config_from_args(args, trainer_cls=DistributedTrainerMixin, allow_low_precision=True)
         assert cfg.lowp_precision == "fp8"
 
 
@@ -969,16 +975,53 @@ def test_reshard_after_backward_false_is_gated():
     on plain DP."""
     create_config(world_size=8, fsdp_reshard_after_backward=False)
     create_config(cp_size=2, world_size=8, fsdp_reshard_after_backward=False)
-    for bad in (
-        {"fsdp_reshard_after_forward": True},
-        {"tp_size": 2},
-        {"pp_size": 2, "world_size": 16},  # 8-rank stages = one NVLink domain each (valid PP shape)
+    for bad, named_knob in (
+        ({"fsdp_reshard_after_forward": True}, "fsdp_reshard_after_forward"),
+        ({"tp_size": 2}, "tensor_parallel_size=2"),
+        # 8-rank stages = one NVLink domain each (valid PP shape)
+        ({"pp_size": 2, "world_size": 16}, "pipeline_parallel_size=2"),
     ):
         try:
             create_config(**{"world_size": 8, "fsdp_reshard_after_backward": False, **bad})
             raise AssertionError(f"Should have raised ValueError for reshard_after_backward=False + {bad}")
         except ValueError as e:
             assert "fsdp_reshard_after_backward" in str(e)
+            assert named_knob in str(e), e
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"world_size": 1, "gpus_per_node": 1},  # no peers: nothing to reduce, the toggle stays inert
+        {},  # pure DP
+        {"cp_size": 2},
+        {"tp_size": 2},  # TP+DP: FSDP2 reduces over the mesh's dp dimension
+        {"ep_size": 8},  # one EP group: expert/router hooks gate on the same window-end signal
+        {"ep_size": 2},  # multi-group EP: experts synced by the post-backward sweep, once per step
+        {"world_size": 16, "use_hsdp": True},
+        {"fsdp_reshard_after_backward": False},
+        {"fsdp_reshard_after_forward": True},
+        {"fp32_grad_reduce": True},
+    ],
+)
+def test_defer_grad_sync_accepted_wherever_fsdp2_reduces_per_microstep(shape):
+    create_config(fsdp_defer_grad_sync=True, **shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "named_knob"),
+    [
+        # the schedule already reduces once per optimizer step
+        ({"world_size": 16, "pp_size": 2}, "pipeline_parallel_size=2"),
+        # pure TP: data_parallel_size=1 applies no FSDP2 wrap
+        ({"tp_size": 8}, "tensor_parallel_size=8"),
+    ],
+)
+def test_defer_grad_sync_rejected_without_a_per_microstep_reduce(shape, named_knob):
+    """The refusal names the knobs a user sets, not the config's internal field names."""
+    with pytest.raises(ValueError, match="fsdp_defer_grad_sync") as excinfo:
+        create_config(fsdp_defer_grad_sync=True, **shape)
+    assert named_knob in str(excinfo.value)
 
 
 def test_reshard_rejects_ep():
@@ -1156,24 +1199,14 @@ def test_expert_lora_reaches_validation_through_the_builder():
     weights, because the EP export skips the adapter keys and ``PeftAdapterSaver`` never engages
     (expert-only LoRA leaves no attention ``PeftModel`` to find). Nothing errors, at any point.
     """
-    from src.distributed.expert_parallel.config import ExpertLoraSpec
-    from src.training.parallelism_args import parallelism_config_from_args
-
     spec = ExpertLoraSpec(r=8, alpha=16.0)
-    with (
-        patch(f"{_MOD}.get_global_world_size", return_value=8),
-        patch(f"{_MOD}.get_local_world_size", return_value=8),
-        patch(f"{_MOD}.get_global_rank", return_value=0),
-        patch(f"{_MOD}.is_global_main_process", return_value=True),
-    ):
+    with simulated_world(world_size=8, gpus_per_node=8):
         args = _DistArgs()
-        cfg = parallelism_config_from_args(args, expert_lora=spec)
+        cfg = parallelism_config_from_args(args, trainer_cls=DistributedTrainerMixin, expert_lora=spec)
         assert cfg.expert_lora is spec, "the builder must forward expert_lora into the constructor"
         # The same spec under PP must be REJECTED, which only happens if it reached __post_init__.
         # Built directly: the from_args builder refuses pipeline_parallel_size > 1 outright in this
         # release (the schedule engine is not shipped), before the constructor's validators run.
-        from src.distributed.parallelism_config import ParallelismConfig
-
         try:
             ParallelismConfig(ep_size=4, pp_size=2, expert_lora=spec)
             raise AssertionError("PP + expert LoRA must be rejected at config time, but was accepted")
@@ -1186,20 +1219,20 @@ def test_expert_lora_reaches_validation_through_the_builder():
         args_etp = _DistArgs()
         args_etp.expert_parallel_size = 1
         args_etp.expert_tensor_parallel_size = 2
-        assert parallelism_config_from_args(args_etp).expert_lora is None
+        assert parallelism_config_from_args(args_etp, trainer_cls=DistributedTrainerMixin).expert_lora is None
         try:
-            parallelism_config_from_args(args_etp, expert_lora=spec)
+            parallelism_config_from_args(args_etp, trainer_cls=DistributedTrainerMixin, expert_lora=spec)
             raise AssertionError("expert LoRA under expert_tp_size > 1 must be rejected at config time")
         except ValueError as e:
-            assert "Expert LoRA is not supported with expert_tp_size" in str(e), f"wrong validator fired: {e}"
+            assert "Expert LoRA is not supported with expert_tensor_parallel_size" in str(e), (
+                f"wrong validator fired: {e}"
+            )
 
 
 def test_epconfig_second_timing_rejects_expert_lora_with_etp():
     """A HAND-BUILT ``EPConfig`` (bypassing ``ParallelismConfig``) must still refuse expert LoRA
     under ETP — the shared raiser keeps the two timings' messages identical; this pins that the
     second timing actually fires."""
-    from src.distributed.expert_parallel.config import EPConfig, ExpertLoraSpec
-
     try:
         EPConfig(
             ep_size=1,
@@ -1211,12 +1244,8 @@ def test_epconfig_second_timing_rejects_expert_lora_with_etp():
         )
         raise AssertionError("hand-built EPConfig accepted expert LoRA under expert_tp_size > 1")
     except ValueError as e:
-        assert "Expert LoRA is not supported with expert_tp_size" in str(e)
+        assert "Expert LoRA is not supported with expert_tensor_parallel_size" in str(e)
 
 
 if __name__ == "__main__":
-    import sys
-
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

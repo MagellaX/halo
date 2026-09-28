@@ -18,9 +18,9 @@ Run: pytest tests/cpu/checkpoint/test_after_training_tool_guards.py
 """
 
 import json
-import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 from datasets import Dataset
 
@@ -91,7 +91,7 @@ def test_reset_sinks_refuses_to_pick_an_output_directory_for_you(tmp_path):
 
 
 def test_reset_sinks_refuses_an_output_dir_aimed_at_its_own_input(tmp_path):
-    """The same mistake through the other flag: --output_dir == --checkpoint_dir IS the in-place run
+    """The same mistake through the other flag: --output_dir == --model_id IS the in-place run
     the explicit flag exists to make deliberate."""
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir()
@@ -108,9 +108,15 @@ def test_in_place_and_output_dir_together_are_contradictory(tmp_path):
         reset_sinks.reset_sinks(str(checkpoint), output_dir=str(tmp_path / "other"), in_place=True)
 
 
-def test_in_place_cannot_target_a_hub_repo_id(tmp_path):
-    with pytest.raises(ValueError, match="HuggingFace repo ID"):
-        reset_sinks.reset_sinks("org/model", in_place=True)
+@pytest.mark.parametrize("source", ["org/model", "missing-checkpoint"], ids=["hub-repo-id", "missing-path"])
+def test_in_place_needs_a_local_directory(source, tmp_path, monkeypatch):
+    """--in_place rewrites its source, so only a local directory qualifies: a Hub repo id and a
+    mistyped path, slash or not, are refused before anything is loaded."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(reset_sinks, "auto_load_model", lambda *a, **k: pytest.fail(f"--in_place loaded {source}"))
+
+    with pytest.raises(ValueError, match="not a local directory"):
+        reset_sinks.reset_sinks(source, in_place=True)
 
 
 def test_one_spelling_decides_what_a_sink_key_is():
@@ -194,7 +200,7 @@ def test_an_unknown_additional_field_raises(tmp_path):
     with pytest.raises(ValueError) as excinfo:
         dataset_deduplication.save_deduplicated_dataset(
             dataset,
-            __import__("numpy").array([0, 1]),
+            np.array([0, 1]),
             str(tmp_path / "out.jsonl"),
             additional_fields=["text", "sorce"],
         )
@@ -204,8 +210,6 @@ def test_an_unknown_additional_field_raises(tmp_path):
 
 def test_known_additional_fields_still_narrow_the_output(tmp_path):
     """Anti-vacuity: the guard must not refuse the working case it exists around."""
-    import numpy as np
-
     dataset = Dataset.from_dict({"text": ["a", "b"], "id": [1, 2]})
     output = tmp_path / "out.jsonl"
 
@@ -216,4 +220,4 @@ def test_known_additional_fields_still_narrow_the_output(tmp_path):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

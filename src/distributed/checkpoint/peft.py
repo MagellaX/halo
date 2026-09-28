@@ -3,7 +3,8 @@
 :class:`PeftAdapterSaver` is invoked by ``save_model`` before the mode ladder: DTensor-LoRA gather,
 CP key normalization, or the standard ``save_pretrained`` path. :func:`restore_adapters` is the
 resume counterpart, needed because EP/CP rebuild the model with zero-init adapters; both directions
-share the CP key remap defined here.
+share the CP key remap defined here. Restores write through
+:func:`~src.distributed.runtime.copy_full_tensor`, the DTensor-aware whole-tensor write.
 """
 
 from __future__ import annotations
@@ -18,13 +19,14 @@ import torch
 from peft import PeftModel
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import save_file as safetensors_save_file
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor
 
 from src.checkpoint.adapters import (
+    EXPERT_LORA_CONFIG_KEY,
     MIXED_EXPERT_LORA_PEFT_TYPE,
-    adapter_weight_paths,
     cast_adapter_state_to_save_dtype,
     is_expert_lora_key,
+    lora_scaling_mismatch,
     read_adapter_file,
 )
 from src.checkpoint.format import (
@@ -33,11 +35,13 @@ from src.checkpoint.format import (
     ADAPTER_SAFETENSORS_FILE,
     PROVENANCE_GPT_OSS_SINKS,
     TRAINING_PROVENANCE_FILE,
+    adapter_weight_paths,
 )
 from src.checkpoint.model_card import tag_model_card
 from src.distributed.checkpoint.context import CheckpointContext
 from src.distributed.checkpoint.coordination import KEY_PREVIEW_COUNT, consensus_read
 from src.distributed.context_parallel.key_mapping import strip_cp_attention_prefix
+from src.distributed.expert_parallel.base_layer import EPMoELayerBase
 from src.distributed.expert_parallel.config import ExpertLoraSpec
 from src.distributed.expert_parallel.expert_weights import (
     apply_ep_lora_adapters,
@@ -45,8 +49,10 @@ from src.distributed.expert_parallel.expert_weights import (
 )
 from src.distributed.runtime import (
     barrier_on_exit,
+    copy_full_tensor,
     fs_aware_makedirs,
     is_global_main_process,
+    reject_across_ranks,
     resolve_param_tensor,
 )
 from src.models.patches.gpt_oss_sinks import stamped_sinks_policy
@@ -78,6 +84,13 @@ def find_peft_model(model) -> PeftModel | None:
     if hasattr(model, "model"):
         return find_peft_model(model.model)
     return None
+
+
+def _adapter_file_state(ctx: CheckpointContext, state: dict) -> dict:
+    """The adapter tensors a hand-written adapter file holds: at the save dtype for an export, so an
+    fp32-master run (``fp32_experts`` / ``fp32_non_ep_params``) does not write a 2x adapter; at the
+    live dtype for a training checkpoint, whose fp32 adapters must resume unrounded."""
+    return state if ctx.training_checkpoint else cast_adapter_state_to_save_dtype(state)
 
 
 def expert_lora_config_fields(spec: ExpertLoraSpec) -> dict:
@@ -178,10 +191,7 @@ class PeftAdapterSaver:
                     getattr(ctx.parallelism_config, "expert_lora", None),
                     output_dir,
                 )
-                # Cast to save dtype so fp32_experts / fp32_non_ep_params don't write a 2x adapter file.
-                self._write_adapter_state_dict(
-                    cast_adapter_state_to_save_dtype({**attn_state, **expert_state}), output_dir
-                )
+                self._write_adapter_state_dict(_adapter_file_state(ctx, {**attn_state, **expert_state}), output_dir)
                 if ctx.tokenizer is not None:
                     ctx.tokenizer.save_pretrained(output_dir)
                 logger.info(
@@ -217,7 +227,7 @@ class PeftAdapterSaver:
 
         PEFT serializes its own config, so every LoRA field is preserved; the expert half is
         described under ``ep_expert_lora``. This toolkit's resume reads the tensors directly and
-        never parses this file.
+        holds the LoRA scaling fields here to the live run's (:func:`restore_adapters`).
         """
         peft_config.save_pretrained(output_dir)
         config_path = os.path.join(output_dir, ADAPTER_CONFIG_FILE)
@@ -225,7 +235,7 @@ class PeftAdapterSaver:
             config = json.load(fh)
         config["peft_type"] = MIXED_EXPERT_LORA_PEFT_TYPE
         if expert_lora_spec is not None:
-            config["ep_expert_lora"] = expert_lora_config_fields(expert_lora_spec)
+            config[EXPERT_LORA_CONFIG_KEY] = expert_lora_config_fields(expert_lora_spec)
         with open(config_path, "w") as fh:
             json.dump(config, fh, indent=2)
 
@@ -281,7 +291,7 @@ class PeftAdapterSaver:
                 (self._cp_normalized_config(peft_config) if ctx.is_cp_mode else peft_config).save_pretrained(
                     output_dir
                 )
-                self._write_adapter_state_dict(cast_adapter_state_to_save_dtype(adapter_state_dict), output_dir)
+                self._write_adapter_state_dict(_adapter_file_state(ctx, adapter_state_dict), output_dir)
                 if ctx.tokenizer is not None:
                     ctx.tokenizer.save_pretrained(output_dir)
                 logger.info(f"Saved PEFT adapters ({reconstruction}) to {output_dir}")
@@ -367,12 +377,15 @@ class PeftAdapterSaver:
         return config or peft_config
 
 
-def restore_adapters(checkpoint: str, model, *, is_cp_mode: bool) -> None:
+def restore_adapters(checkpoint: str, model, *, is_cp_mode: bool) -> str | None:
     """Restore LoRA adapters when base-weight reload is skipped (EP/CP).
 
     EP/CP rebuild the model with zero-init adapters, so trained weights must reload here or resume
     continues from the untrained adapter. Handles native EP expert adapters (sliced per rank by
-    :func:`apply_ep_lora_adapters`) and PEFT attention adapters. No-op when no adapter file.
+    :func:`apply_ep_lora_adapters`) and PEFT attention adapters. Refuses, on every rank, an adapter
+    whose recorded LoRA scaling differs from the live run's (:func:`lora_scaling_mismatch`). Returns
+    the adapter file restored from, or ``None`` when ``checkpoint`` holds none on any rank (a no-op);
+    rank-uniform either way.
     """
     state, loaded_path = consensus_read(
         adapter_weight_paths(checkpoint),
@@ -381,8 +394,19 @@ def restore_adapters(checkpoint: str, model, *, is_cp_mode: bool) -> None:
         checkpoint=checkpoint,
     )
     if loaded_path is None:
-        return  # no adapters anywhere: full fine-tuning
+        return None  # no adapters anywhere: full fine-tuning
     unwrapped = unwrap_framework_wrappers(model)
+    peft_model = find_peft_model(unwrapped)
+    expert_spec = _live_expert_lora_spec(unwrapped)
+    reject_across_ranks(
+        lora_scaling_mismatch(
+            checkpoint,
+            peft_model.peft_config["default"].to_dict() if peft_model is not None else None,
+            expert_lora_config_fields(expert_spec) if expert_spec is not None else None,
+        ),
+        "Adapter resume",
+        ValueError,
+    )
 
     expert_state = {k: v for k, v in state.items() if is_expert_lora_key(k)}
     # Unconditional: the apply is collective at ep_size==1 and decides "nothing to load" rank-uniformly.
@@ -391,7 +415,6 @@ def restore_adapters(checkpoint: str, model, *, is_cp_mode: bool) -> None:
 
     attn_state = {k: v for k, v in state.items() if k not in expert_state}
     if attn_state:
-        peft_model = find_peft_model(unwrapped)
         if peft_model is None:
             # Attention tensors with no PeftModel would be dropped, resuming base weights.
             raise RuntimeError(
@@ -421,6 +444,15 @@ def restore_adapters(checkpoint: str, model, *, is_cp_mode: bool) -> None:
         logger.info(
             f"Restored adapters from {loaded_path} ({len(expert_state)} expert + {len(attn_state)} attention tensors)"
         )
+    return loaded_path
+
+
+def _live_expert_lora_spec(model) -> ExpertLoraSpec | None:
+    """The native expert adapters' recipe, off an EP layer that built them, or None."""
+    return next(
+        (m.ep_config.expert_lora for m in model.modules() if isinstance(m, EPMoELayerBase) and m.has_expert_lora),
+        None,
+    )
 
 
 def _load_peft_adapter_state(peft_model, attn_state: dict) -> list[str]:
@@ -454,13 +486,7 @@ def _load_peft_adapter_state(peft_model, attn_state: dict) -> list[str]:
             if param is None:
                 unexpected.append(key)
                 continue
-            value = value.to(param.dtype)
-            if isinstance(param.data, DTensor):
-                # Default ``src_data_rank``: mesh rank 0's read is broadcast, so every DP replica
-                # holds one node's adapter bytes (``_load_tp`` slices per rank instead, since its
-                # ranks each need the full tensor and it joins the key set explicitly).
-                value = distribute_tensor(value, param.data.device_mesh, param.data.placements)
-            param.data.copy_(value)
+            copy_full_tensor(param, value)
     return unexpected
 
 

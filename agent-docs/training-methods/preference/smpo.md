@@ -11,7 +11,7 @@ L_total = loss_fn(beta · logits) + chosen_sft_ratio · CE(chosen) + (1 − chos
 
 ![SMPO on one preference pair: one forward over the 2N concatenated rows gives per-token log-probs; the percentile clip (rejected tail at the 2% token quantile, optional chosen-side cap, min_log_prob floor) trims the margin path only, whose per-sequence mean feeds the smooth_lower_bound term relu(−β·z)² against the scheduled margin, while the SFT anchors take the pre-clip NLL of both sides; the total is the mean margin loss plus chosen_sft_ratio-weighted cross-entropy, with no reference model](../../assets/diagrams/smpo_pipeline.png)
 
-Under CP the per-sequence sums and counts all-reduce across the group before the mean.
+Under CP the per-sequence sums and counts all-reduce across the group before the mean. The sum reduce is autograd-aware: its backward sums the gradient over the group, which cancels FSDP2's `1/cp_size` average, so the loss takes no `cp_size` factor and logs the unsplit-sequence value.
 
 ## Configuration
 
@@ -71,7 +71,7 @@ torchrun --nproc_per_node=8 scripts/training/preference/smpo.py \
 
 ## Vision-language
 
-The model class follows the **checkpoint**: a multimodal config loads through `AutoModelForImageTextToText` plus its processor, so the run's checkpoints carry a `processor_config.json` (unless `text_only_model` forced the text class). The data path follows the **run** — VLM only when the dataset declares images in an `images`/`image` column. Text pairs on a multimodal checkpoint are a text run, and keep CP and `padding_free`.
+The model class follows the **checkpoint**: a multimodal config loads through `AutoModelForImageTextToText` plus its processor wherever the checkpoint ships one ([SFT — VLMs](../sft.md#vision-language-models)), so the run's checkpoints carry that `processor_config.json` (unless `text_only_model` forced the text class). The data path follows the **run** — VLM only when the dataset declares images in an `images`/`image` column. Text pairs on a multimodal checkpoint are a text run, and keep CP and `padding_free`.
 
 A dataset carrying images inside its messages alone reads as text, and the renderer refuses it rather than training on pixel-less placeholders.
 

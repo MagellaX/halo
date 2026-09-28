@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Test: DistributedDPOTrainer on a VLM (Qwen3-VL-2B) — single-GPU vision-DPO smoke.
 
-Validates that VLM DPO works end-to-end under TRL 1.6: passing a processor as processing_class
-flips TRL into vision mode (_is_vlm) and an images-bearing preference dataset auto-selects TRL's
-DataCollatorForVisionPreference, threading pixel_values to the model. Asserts training completes
-with finite losses (so the vision path actually ran, not just the text arm).
+Under TRL 1.6, passing a processor as processing_class flips TRL into vision mode (_is_vlm) and an
+images-bearing preference dataset auto-selects TRL's DataCollatorForVisionPreference, threading
+pixel_values to the model. Asserts the trainer enters VLM mode and training completes every step
+with a finite loss. It does not compare the loss to a reference.
 
 Run:
     torchrun --nproc_per_node=1 tests/gpu/trainers/preference/test_dpo_vlm.py
@@ -57,6 +57,7 @@ def run(ctx) -> dict:
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=1024,
         dataloader_drop_last=True,
         dataloader_num_workers=0,
@@ -79,12 +80,11 @@ def run(ctx) -> dict:
     result = trainer.train()
     loss = result.training_loss
     log(f"Training loss: {loss:.6f}")
-    logged = [e["loss"] for e in trainer.state.log_history if "loss" in e]
 
     return {
         "checks": {
             "training_loss_finite": bool(torch.isfinite(torch.tensor(loss))),
-            "enough_steps_logged": len(logged) >= 2,
+            "steps_completed": result.global_step == NUM_TRAIN_STEPS,
         }
     }
 

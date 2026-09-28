@@ -27,7 +27,12 @@ from transformers import AutoTokenizer
 
 import src.distributed.expert_parallel.layers.roster  # noqa: F401 — registers the EP export roster the config finalizer requires
 from scripts._common import add_hub_source_args, add_max_shard_size_arg, add_trust_remote_code_arg
-from src.checkpoint.format import DEFAULT_MAX_SHARD_SIZE, SAFETENSORS_WEIGHTS_FILE, sweep_after_full_save
+from src.checkpoint.format import (
+    DEFAULT_MAX_SHARD_SIZE,
+    SAFETENSORS_METADATA,
+    SAFETENSORS_WEIGHTS_FILE,
+    sweep_after_full_save,
+)
 from src.checkpoint.model_card import tag_exported_model_card
 from src.checkpoint.tool_io import (
     STAGING_SUFFIX,
@@ -81,7 +86,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to save the modified checkpoint. Required unless --in_place is given.",
+        help="Directory to save the modified checkpoint. Required unless --in_place or --dry_run is given.",
     )
     parser.add_argument(
         "--in_place",
@@ -155,7 +160,7 @@ def _reset_sinks_safetensors(safetensors_path: Path, output_dir: Path, dry_run: 
     # which a kill mid-write would otherwise destroy.
     logger.info(f"Saving updated checkpoint to {output_safetensors}...")
     tmp_path = output_safetensors.with_suffix(".safetensors.tmp")
-    save_file(state_dict, str(tmp_path))
+    save_file(state_dict, str(tmp_path), metadata=SAFETENSORS_METADATA)
 
     # Verify the staged file before the rename: under --in_place the rename replaces the only copy,
     # so a write that kept live sinks must not get that far.
@@ -299,11 +304,6 @@ def _reset_sinks_from_pretrained(
     return len(sink_keys)
 
 
-def _is_hf_repo(checkpoint_dir: str) -> bool:
-    """Check if checkpoint_dir looks like a HuggingFace repo ID (e.g. 'org/model')."""
-    return not Path(checkpoint_dir).exists() and "/" in checkpoint_dir
-
-
 def reset_sinks(
     checkpoint_dir: str,
     output_dir: str | None = None,
@@ -319,7 +319,7 @@ def reset_sinks(
 
     Args:
         checkpoint_dir: Path to checkpoint directory or HuggingFace repo ID.
-        output_dir: Directory to save the modified checkpoint. Required unless ``in_place``.
+        output_dir: Directory to save the modified checkpoint. Required unless ``in_place`` or ``dry_run``.
         dry_run: If True, only inspect sink values without modifying.
         in_place: Rewrite ``checkpoint_dir`` itself. Explicit because it has no undo; the sibling
             conversion tools refuse an in-place run outright.
@@ -331,19 +331,20 @@ def reset_sinks(
     """
     # The input gate runs first: a per-rank EP/TP save lands on the from_pretrained branch, where the
     # real expert keys read as missing and are randomly initialized. That diagnosis is more useful
-    # than a missing-destination error, and it holds whichever destination was named.
-    if not _is_hf_repo(checkpoint_dir):
-        reject_sharded_checkpoint(checkpoint_dir)
+    # than a missing-destination error, and it holds whichever destination was named. A Hub id has no
+    # local directory here and passes through to the load, where the coverage gate stands in.
+    reject_sharded_checkpoint(checkpoint_dir)
 
     if in_place:
         if output_dir is not None:
             raise ValueError(
                 "--in_place rewrites the --model_id directory, so it cannot be combined with --output_dir."
             )
-        if _is_hf_repo(checkpoint_dir):
+        # The same local-or-Hub rule resolve_checkpoint_source applies.
+        if not os.path.isdir(checkpoint_dir):
             raise ValueError(
-                f"--in_place cannot rewrite {checkpoint_dir!r}: it is a HuggingFace repo ID, not a local "
-                f"directory. Pass --output_dir instead."
+                f"--in_place cannot rewrite {checkpoint_dir!r}: it is not a local directory (a HuggingFace "
+                f"repo ID, or a path that does not exist). Pass --output_dir instead."
             )
         output_dir = checkpoint_dir
     elif output_dir is None:
@@ -353,7 +354,7 @@ def reset_sinks(
         if not dry_run:
             raise ValueError(
                 "--output_dir is required: this tool replaces a checkpoint's sink tensors, and defaulting "
-                "to the input meant a mistyped command rewrote the only copy with no undo. Pass "
+                "to the input would let a mistyped command rewrite the only copy with no undo. Pass "
                 "--output_dir <new dir>, or --in_place to rewrite the --model_id directory deliberately."
             )
         output_dir = checkpoint_dir

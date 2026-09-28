@@ -16,7 +16,7 @@ load-bearing and neither is visible from a passing training run:
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, GptOssConfig, GptOssForCausalLM
+from transformers import AutoModelForCausalLM, GptOssConfig, GptOssForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from src.distributed.expert_parallel.lazy_loader import instantiate_on_meta
 from src.models.loading.lazy_safetensors.meta_shell import _instantiate_from_config_on_meta
@@ -156,7 +156,93 @@ def test_the_graft_leaves_persistent_meta_buffers_for_the_loader(config):
     assert not shell.rotary.inv_freq.is_meta, "the non-persistent graft must still run alongside"
 
 
-if __name__ == "__main__":
-    import sys
+class _FlashRefusingModel(_CtorBufferModel):
+    """Refuses every flash label at build, as a remote-code family declaring no v5 flash flag does."""
 
-    sys.exit(pytest.main([__file__, "-v"]))
+    @staticmethod
+    def _refuse_flash(kwargs):
+        if str(kwargs.get("attn_implementation", "")).startswith("flash_attention"):
+            raise ValueError("_FlashRefusingModel does not support Flash Attention 2 yet")
+
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        cls._refuse_flash(kwargs)
+        with torch.device("meta"):
+            return cls(kwargs.get("config"))
+
+    @classmethod
+    def _from_config(cls, config, **kwargs):
+        cls._refuse_flash(kwargs)
+        return cls(config)
+
+
+def test_a_refused_attention_backend_fails_the_lazy_build():
+    """The backend is ``resolve_attn_implementation``'s choice on every load path. A lazy shell that
+    swapped a refused flash label for SDPA on its own would run a kernel the eager and CP loaders
+    refuse to pick for the same config, so the refusal has to reach the caller."""
+    with pytest.raises(RuntimeError, match="does not support Flash Attention"):
+        instantiate_on_meta(
+            NO_SUCH_CHECKPOINT,
+            _FlashRefusingModel,
+            LlamaConfig(),
+            dtype=torch.float32,
+            trust_remote_code=False,
+            attn_implementation="flash_attention_4",
+        )
+
+
+class _NoFlashLlama(LlamaForCausalLM):
+    """Refuses flash through transformers' own class flag, as a remote-code family declaring only the
+    v4-era ``_supports_flash_attn_2`` does."""
+
+    _supports_flash_attn = False
+
+
+@pytest.mark.parametrize("config_only", [False, True])
+def test_an_architecture_refusal_names_the_attention_label_not_lazy_loading(tmp_path, config_only):
+    """``ep_lazy_loading=False`` builds the same class with the same label and hits the same refusal,
+    so the remedy must be the label itself."""
+    config = LlamaConfig(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, vocab_size=64
+    )
+    LlamaForCausalLM(config).save_pretrained(tmp_path, safe_serialization=True)
+    with pytest.raises(ValueError, match="refuses attn_implementation='flash_attention_4'") as raised:
+        instantiate_on_meta(
+            str(tmp_path),
+            _NoFlashLlama,
+            config,
+            dtype=torch.bfloat16,
+            trust_remote_code=False,
+            config_only=config_only,
+            attn_implementation="flash_attention_4",
+        )
+    assert "ep_lazy_loading" not in str(raised.value)
+
+
+class _MissingKernelLlama(LlamaForCausalLM):
+    """Fails the attention check with an environment error, as a flash build absent from the image does."""
+
+    def _check_and_adjust_attn_implementation(self, *args, **kwargs):
+        raise ImportError("simulated: the flash kernel is not installed")
+
+
+def test_a_missing_kernel_is_not_reported_as_an_architecture_refusal(tmp_path):
+    """Only the class flags' ValueError is a verdict on the architecture; an ImportError under the same
+    check is the environment's, so it keeps the lazy-build error that names it."""
+    config = LlamaConfig(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, vocab_size=64
+    )
+    with pytest.raises(RuntimeError, match="ImportError: simulated: the flash kernel is not installed"):
+        instantiate_on_meta(
+            str(tmp_path),
+            _MissingKernelLlama,
+            config,
+            dtype=torch.bfloat16,
+            trust_remote_code=False,
+            config_only=True,
+            attn_implementation="flash_attention_2",
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,10 +1,12 @@
 """Distributed setup/teardown for torchrun-based tests.
 
 Covers process-group init, scratch/cache dir allocation under the launcher's ``TMPDIR``,
-rank-0-then-barrier model download, world-wide scalar reductions and teardown.
+rank-0-then-barrier model download, world-wide scalar reductions, the cross-rank tensor-identity probe
+and teardown.
 """
 
 import contextlib
+import math
 import os
 import shutil
 import tempfile
@@ -18,8 +20,9 @@ from torch.testing._internal.distributed.fake_pg import FakeStore as TorchFakeSt
 from transformers import AutoConfig, AutoTokenizer
 
 from src.distributed.expert_parallel.dispatcher import destroy_all_dispatchers
-from src.distributed.runtime import barrier
+from src.distributed.runtime import barrier, broadcast_from_rank0
 from src.models.patches.attention import ensure_fa4_kernel_cache_env
+from tests.common.scratch import SCRATCH_DIR_TAG
 
 
 class FakeStore:
@@ -126,15 +129,16 @@ def init_distributed() -> tuple[int, int, int]:
 def setup_cache_dirs(prefix: str, rank: int) -> tuple[str, str]:
     """Create isolated output and HF cache directories.
 
-    Returns (output_dir, cache_dir). Sets HF_DATASETS_CACHE env var.
+    Returns (output_dir, cache_dir). Sets HF_DATASETS_CACHE env var. Both names start with
+    :data:`SCRATCH_DIR_TAG`, the one spelling ``tests/conftest.py`` sweeps when a crash leaks them.
     """
-    cache_dir = tempfile.mkdtemp(prefix=f"{prefix}_cache_r{rank}_")
+    cache_dir = tempfile.mkdtemp(prefix=f"{SCRATCH_DIR_TAG}{prefix}_cache_r{rank}_")
     os.environ["HF_DATASETS_CACHE"] = cache_dir
     # datasets froze the env at import (datasets.config latches at module load), so the env write
     # alone doesn't isolate direct load_dataset callers — update the live config too (mirrors
     # src/training/environment.py).
     datasets.config.HF_DATASETS_CACHE = Path(cache_dir)
-    output_dir = tempfile.mkdtemp(prefix=f"{prefix}_out_")
+    output_dir = tempfile.mkdtemp(prefix=f"{SCRATCH_DIR_TAG}{prefix}_out_")
     return output_dir, cache_dir
 
 
@@ -150,6 +154,15 @@ def shared_scratch_dir(name: str) -> str:
     path = os.path.join(tempfile.gettempdir(), f"{name}_{os.environ.get('MASTER_PORT', 'standalone')}")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def shared_output_dir(ctx) -> str:
+    """Rank 0's output dir, on every rank.
+
+    The EP/FSDP2 saver writes one directory; a per-rank ``mkdtemp`` would leave every peer with no
+    checkpoint to resume from, leaving the restore untested.
+    """
+    return broadcast_from_rank0(ctx.output_dir if ctx.rank == 0 else None)
 
 
 def cleanup_dirs(*dirs: str):
@@ -191,6 +204,17 @@ def world_any(flag: bool, device=None) -> bool:
     return bool(local.item())
 
 
+def world_all(flag: bool, device=None) -> bool:
+    """True if ``flag`` holds on every rank. Collective.
+
+    For a property each rank checks on its own shard (a rank-local bit-identity read): one rank
+    failing it fails the world.
+    """
+    local = torch.tensor(float(bool(flag)), device=device or torch.device("cuda", torch.cuda.current_device()))
+    dist.all_reduce(local, op=dist.ReduceOp.MIN)
+    return bool(local.item())
+
+
 def world_min(value: float, device=None) -> float:
     """The smallest ``value`` across all ranks. Collective.
 
@@ -200,6 +224,35 @@ def world_min(value: float, device=None) -> float:
     local = torch.tensor(float(value), device=device or torch.device("cuda", torch.cuda.current_device()))
     dist.all_reduce(local, op=dist.ReduceOp.MIN)
     return float(local)
+
+
+def world_spread(value: float, device=None) -> float:
+    """``max - min`` of ``value`` across all ranks, or ``inf`` when any rank's value is non-finite. Collective.
+
+    A NaN on one rank would otherwise compare false against every bound and read as agreement.
+    """
+    local = torch.tensor(
+        [float(value)], dtype=torch.float64, device=device or torch.device("cuda", torch.cuda.current_device())
+    )
+    gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    values = torch.cat(gathered)
+    if not torch.isfinite(values).all():
+        return math.inf
+    return float(values.max() - values.min())
+
+
+def group_max_abs_diff(tensor: torch.Tensor, group: dist.ProcessGroup | None = None) -> float:
+    """Largest elementwise ``|Δ|`` of ``tensor`` between any rank of ``group`` and its first rank.
+
+    ``0.0`` means bit-identical across the group, the replica-identity verdict. A NaN on any rank
+    returns NaN, which fails every bound: the reduction stays in torch, whose ``max`` propagates NaN
+    where Python's drops it. Collective over ``group`` (default: the world).
+    """
+    local = tensor.detach().contiguous()
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, local, group=group)
+    return torch.stack([(g - gathered[0]).abs().max() for g in gathered]).max().item()
 
 
 def snapshot_full_weights(model) -> dict[str, torch.Tensor]:
@@ -214,81 +267,6 @@ def snapshot_full_weights(model) -> dict[str, torch.Tensor]:
         full = tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
         snapshot[name] = full.detach().to("cpu", copy=True)
     return snapshot
-
-
-def _dp_step_losses(step_losses: list[float], dp_rank: int, dp_size: int) -> list[list[float]]:
-    """Per step, each data-parallel replica's loss in DP-rank order: the chunks a metric gather keeps.
-
-    The eval gather is scoped to the DP replicas, so a pipeline chain's stages (and a TP group's
-    siblings) contribute their shared batch once. They hold the same value, so which holder supplies
-    a replica's entry does not change the result; an absent replica does, and raises.
-
-    Collective: every rank all-gathers its own vector, so all ranks must call with the same number of
-    steps (accelerate's ``even_batches`` guarantees it).
-    """
-    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else "cpu"
-    local = torch.tensor(
-        [float(dp_rank), *(float(value) for value in step_losses)], dtype=torch.float64, device=device
-    )
-    peers = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
-    dist.all_gather(peers, local)
-
-    by_dp: dict[int, list[float]] = {}
-    for peer in peers:
-        by_dp.setdefault(int(peer[0].item()), peer[1:].tolist())
-    absent = [rank for rank in range(dp_size) if rank not in by_dp]
-    if absent:
-        raise AssertionError(f"data-parallel ranks {absent} contributed no eval losses; the gather scope is wrong")
-    return [[by_dp[rank][step] for rank in range(dp_size)] for step in range(len(step_losses))]
-
-
-def hf_eval_loss_reference(
-    step_losses: list[float], batch_size: int, remainder: int, *, dp_rank: int, dp_size: int
-) -> float:
-    """Reproduce HF ``evaluation_loop``'s eval_loss from per-rank per-step reference losses.
-
-    HF repeats each step's scalar loss ``eval_batch_size`` times and gathers; the toolkit scopes that
-    gather to the DP replicas (``_install_dp_metric_gather``), so the vector is one chunk per DP rank
-    in DP-rank order rather than one per global rank, and the same batch is not counted once per
-    pipeline stage. At the dataloader's final step accelerate's ``gather_for_metrics`` truncates that
-    vector to ``remainder`` entries (``len(eval_dataset) % (eval_batch_size * dp_size)``, the tail
-    trim; 0 = no trim). The final metric is the mean over every kept entry.
-
-    Collective: every rank must call with its own ``step_losses``. Cross-check any result against
-    :func:`eval_loss_over_examples`, which derives the same number without modelling the gather.
-    """
-    kept: list[float] = []
-    per_step = _dp_step_losses(step_losses, dp_rank, dp_size)
-    for step, replicas in enumerate(per_step):
-        vector = [value for value in replicas for _ in range(batch_size)]
-        if step == len(per_step) - 1 and remainder > 0:
-            vector = vector[:remainder]
-        kept.extend(vector)
-    return sum(kept) / len(kept)
-
-
-def eval_loss_over_examples(
-    step_losses: list[float], batch_size: int, dataset_rows: int, *, dp_rank: int, dp_size: int
-) -> float:
-    """The eval_loss an example-by-example walk of the eval dataset gives: an independent oracle.
-
-    Derived from what the metric means rather than from how the gather is built: every eval example
-    contributes its own batch's loss once, so the metric is the mean over ``dataset_rows`` entries in
-    the order the loader produced them (per step, DP rank 0's batch, then rank 1's, ...). Nothing here
-    models the dedup or accelerate's trim, so it disagrees with :func:`hf_eval_loss_reference` if
-    either is wrong, including the case that motivates both: a gather repeating each replica once per
-    pipeline stage keeps a prefix of the duplicates on a partial final batch, which is a different set
-    of examples rather than a re-weighted one.
-    """
-    entries = [
-        value
-        for replicas in _dp_step_losses(step_losses, dp_rank, dp_size)
-        for value in replicas
-        for _ in range(batch_size)
-    ]
-    if len(entries) < dataset_rows:
-        raise AssertionError(f"{len(entries)} gathered entries cannot cover {dataset_rows} eval examples")
-    return sum(entries[:dataset_rows]) / dataset_rows
 
 
 def teardown_distributed():

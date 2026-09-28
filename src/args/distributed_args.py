@@ -75,9 +75,12 @@ class DistributedArguments:
             "help": "When training native grouped-LoRA on EP experts, fold the LoRA delta into the "
             "base on save so the checkpoint is a fully-merged, servable HF model. Covers both "
             "halves of a mixed run: the expert deltas inside each family's gather, and any "
-            "attention adapters via merge_adapter held over the write (undone afterwards, so "
-            "training continues). If False (default), a standalone adapter file is written and the "
-            "frozen base is left unchanged (reload pairs the adapter with the base model)."
+            "attention adapters into each tensor as it is written, out of place, so the frozen base "
+            "is never changed and training continues. Each training checkpoint also keeps the "
+            "unmerged adapter in "
+            "resume_adapter/, which resume restores onto the base. If False (default), a standalone "
+            "adapter file is written and the frozen base is left unchanged (reload pairs the adapter "
+            "with the base model)."
         },
     )
 
@@ -138,7 +141,9 @@ class DistributedArguments:
             "help": "Use AdamWBF16 (bf16 master weights + stochastic rounding, 6 B/param) instead of the "
             "standard optimizer. None (default) = auto: on when bf16 is set and the optimizer is the "
             "default AdamW, off under replicated DDP (accelerate MULTI_GPU). True forces it on (e.g. to "
-            "opt in under DDP); False forces full fp32 master weights — rejected only where the run "
+            "opt in under DDP); False forces the stock AdamW over the parameters as loaded (bf16 under "
+            "bf16: true — round-to-nearest bf16 masters, not fp32; fp32 masters come from "
+            "fp32_non_ep_params or bf16: false) — rejected only where the run "
             "mixes plain-tensor experts with FSDP2 DTensors (any expert distribution with "
             "ep_group_size>1 — EP or pure ETP — or ep_size==1 with fsdp_shard_ep1_experts=false), "
             "since fused AdamW cannot span the two; allowed on dense runs and on ep_size==1 MoE with "
@@ -365,14 +370,28 @@ class DistributedArguments:
             "rejected with fsdp_reshard_after_forward=True, TP, or PP."
         },
     )
+    fsdp_defer_grad_sync: bool = field(
+        default=False,
+        metadata={
+            "help": "True skips FSDP2's gradient reduce-scatter on a gradient-accumulation window's "
+            "microsteps 1..n-1 (torch set_requires_gradient_sync, re-armed for the window's last "
+            "backward), so each optimizer step reduces once instead of once per microstep. Does "
+            "nothing at gradient_accumulation_steps=1, and holds one full unsharded gradient copy "
+            "per GPU across the window at the reduce dtype (2 B/param; 4 B/param when the reduce runs "
+            "in fp32: fp32_grad_reduce, fp32_non_ep_params or an fp32 run); peak memory rises by that "
+            "copy less the sharded gradient the default holds anyway. Torchrun FSDP2 path only; "
+            "rejected under PP, TP with data_parallel_size=1, and QLoRA."
+        },
+    )
     fsdp_shard_ep1_experts: bool = field(
         default=True,
         metadata={
             "help": "At ep_group_size==1 only (ep_size * expert_tp_size, i.e. the experts are truly "
             "replicated): FSDP-shard the MoE experts (reduce-scatter is their sole gradient sync; the "
             "EP layer skips its own hooks). True (default): frees memory that grows with DP "
-            "(gpt-oss-20b -19%/-37% at 2/8 GPU), throughput-neutral, grad-equivalent. False: every DP "
-            "rank keeps a full copy (max throughput, e.g. dense-ep1 b1 SFT). No effect when "
+            "(gpt-oss-20b on 8 GPUs at batch 1: -59% peak memory for -10.5% throughput), "
+            "grad-equivalent. False: every DP rank keeps a full copy (max throughput, e.g. dense-ep1 "
+            "b1 SFT). No effect when "
             "ep_group_size>1 — that includes pure ETP (ep_size==1, expert_tp_size>1), where the "
             "experts are sharded across the ETP group rather than replicated. RL-safe (the vLLM "
             "weight-sync gather materializes the shards with full_tensor before reshaping) under both "

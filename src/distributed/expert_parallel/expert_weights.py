@@ -251,7 +251,10 @@ def is_expert_weight_attr(param_name: str) -> bool:
 
 
 def gather_ep_layer_weights(
-    layer_name: str, module: EPMoELayerBase, merge_lora: bool = False, retain: bool = True
+    layer_name: str,
+    module: EPMoELayerBase,
+    merge_lora: bool = False,
+    retain: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Gather a whole EP layer for checkpoint saving.
 
@@ -260,7 +263,9 @@ def gather_ep_layer_weights(
     family's hub spelling via :func:`to_hub_layer_key`. The replicated pass skips expert params via
     the layer's ``expert_named_params()``, the live expert attrs on this rank. ``merge_lora`` folds
     the grouped expert-LoRA delta into the base experts inside the per-family gather, before any
-    family-specific unfuse/re-interleave, so it applies to every layout.
+    family-specific unfuse/re-interleave, so it applies to every layout. No LoRA layer sits inside an
+    EP layer (the trainer's ``_validate_lora_ep_compatibility`` refuses one), so the replicated params
+    carry no delta to fold and are written as they are.
 
     Every rank enters the same collectives, but only ``retain=True`` ranks keep the result: the
     others join each gather and return ``{}``, so neither the family's post-gather assembly

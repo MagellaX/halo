@@ -467,12 +467,14 @@ def test_the_unmerged_adapter_conversion_tags_its_output(tmp_path):
 
 
 def test_the_embedding_pipeline_card_carries_the_tag(tmp_path):
-    """sentence-transformers writes its card from ``model_card_data`` and never reads ``model_tags``."""
+    """sentence-transformers writes its card from ``model_card_data`` and never reads ``model_tags``; the
+    backbone still carries them, finalized like the EP/TP branch's, for a push of the backbone alone."""
     base = tmp_path / "base"
     _tiny_qwen3().save_pretrained(base)
     _tiny_tokenizer().save_pretrained(base)
     runtime = SimpleNamespace(
-        parallelism_config=SimpleNamespace(is_ep_mode=False, is_tp_mode=False), model_source=str(base)
+        parallelism_config=SimpleNamespace(is_ep_mode=False, is_tp_mode=False, fp32_non_ep_params=False),
+        model_source=str(base),
     )
     embedding_config = EmbeddingConfig(
         output_dir=str(tmp_path / "run"), bf16=False, pooling_mode="mean", normalize_embeddings=False, max_length=32
@@ -483,6 +485,8 @@ def test_the_embedding_pipeline_card_carries_the_tag(tmp_path):
         ModelConfig(model_name_or_path=str(base)),
         SimpleNamespace(reset_sinks=True, train_sinks=False),
     )
+
+    assert HALO_TAG in st_model[0].auto_model.model_tags
 
     st_model.save(str(tmp_path / "embedding"))
     card = _card(tmp_path / "embedding")

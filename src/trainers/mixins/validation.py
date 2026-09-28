@@ -3,8 +3,8 @@
 Read-only checks run once during setup: inspect ``self.parallelism_config`` / ``self.model`` and
 raise with an actionable message, or return. :func:`ctor_positions` / :func:`ctor_value` /
 :func:`ctor_config` / :func:`ctor_model_and_config` read the argument a gate validates out of a
-trainer ``__init__``'s ``*args``, before the checks below run, and :func:`disable_trl_liger` clears
-the TRL flag a gate rejects.
+trainer ``__init__``'s ``*args``, before the checks below run, :func:`disable_trl_liger` clears
+the TRL flag a gate rejects, and :func:`evaluation_runs` says whether an eval-side gate applies.
 """
 
 from __future__ import annotations
@@ -20,12 +20,14 @@ from src.distributed.checkpoint.peft import find_peft_model
 from src.distributed.expert_parallel.base_layer import find_ep_layers
 from src.distributed.expert_parallel.expert_weights import has_ep_lora
 from src.distributed.parallelism_config import accelerate_launch_rejection
+from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.config_levels import config_sources, set_config_field_run_scoped
 from src.models.moe_balancing import (
     config_has_experts,
     mark_router_logits_forced_off,
 )
 from src.models.patches.gpt_oss_sinks import has_live_attention_sinks
+from src.models.structure import tuner_adapter_param_ids
 
 logger = get_logger(__name__)
 
@@ -124,17 +126,9 @@ def disable_trl_liger(training_args, reason: str | None = None) -> bool:
     return True
 
 
-def has_non_expert_lora(model) -> bool:
-    """Whether ``model`` carries LoRA weights outside the EP expert layers.
-
-    Structural, not ``isinstance(model, PeftModel)``: adapters injected in place with
-    ``peft.inject_adapter_in_model`` (the embedding path, since ``SentenceTransformer`` cannot be
-    PEFT-wrapped) leave the model an ordinary ``nn.Module`` while carrying real adapters. EP's native
-    grouped expert adapters are excluded: they live on FSDP-ignored expert weights, not on the
-    TP-sharded backbone.
-    """
-    ep_param_ids = {id(p) for _name, m in find_ep_layers(model) for p in m.parameters()}
-    return any("lora_" in name and id(param) not in ep_param_ids for name, param in model.named_parameters())
+def evaluation_runs(training_args) -> bool:
+    """Whether the HF loop evaluates at all: an eval strategy, or ``eval_on_start`` under ``"no"``."""
+    return training_args.eval_strategy not in ("no", None) or bool(training_args.eval_on_start)
 
 
 def active_router_aux_loss_coef(model) -> float:
@@ -192,10 +186,11 @@ class ParallelismValidationMixin:
         config = self.parallelism_config
         if ref_model is not None and (config.is_ep_mode or config.is_tp_mode):
             raise ValueError(
-                f"An explicit ref_model is not supported under EP/TP (ep_size={config.ep_size}, "
-                f"tp_size={config.tp_size}): the reference is not parallelized, so it would run the "
-                f"unpatched dense path and its log-probs would not match the policy's. Use PEFT/LoRA "
-                f"(ref_model=None) or precompute_ref_log_probs=True."
+                f"An explicit ref_model is not supported under EP/TP "
+                f"(expert_parallel_size={config.ep_size}, tensor_parallel_size={config.tp_size}): "
+                f"the reference is not parallelized, so it would run the unpatched dense path and "
+                f"its log-probs would not match the policy's. Use PEFT/LoRA (ref_model=None) or "
+                f"precompute_ref_log_probs=True."
             )
 
     def _validate_implicit_reference_model(self) -> None:
@@ -261,8 +256,12 @@ class ParallelismValidationMixin:
                 f"have rank-specific inputs and break gradient sync.\n"
                 f"\n"
                 f"Offending parameters ({len(offending)}):\n"
-                + "\n".join(f"  - {p}" for p in offending[:10])
-                + (f"\n  ... and {len(offending) - 10} more" if len(offending) > 10 else "")
+                + "\n".join(f"  - {p}" for p in offending[:KEY_PREVIEW_COUNT])
+                + (
+                    f"\n  ... and {len(offending) - KEY_PREVIEW_COUNT} more"
+                    if len(offending) > KEY_PREVIEW_COUNT
+                    else ""
+                )
                 + "\n\n"
                 "To LoRA-tune experts under EP, list the expert projections (gate_proj/up_proj/"
                 "down_proj/gate_up_proj/experts) in lora_target_modules: split_expert_lora_targets "
@@ -328,7 +327,7 @@ class ParallelismValidationMixin:
                 f"lora_dropout={configured} is configured but every LoRA dropout in the live model is 0: "
                 f"this trainer disables dropout after the adapter wrap (disable_dropout=True), which "
                 f"zeroes PEFT's lora_dropout along with the model's own. Set disable_dropout=False to keep "
-                f"it, or drop lora_dropout to stop expecting regularization that is not applied."
+                f"it, or set lora_dropout: 0.0 to stop expecting regularization that is not applied."
             )
 
     def _validate_expert_lora_realized(self):
@@ -443,15 +442,16 @@ class ParallelismValidationMixin:
         sync. CP and pure ETP leave attention unsharded, so LoRA there is fine.
 
         Adapters count whether PEFT wrapped the model or injected them in place (the embedding path
-        does the latter, so an ``isinstance`` check alone would miss it). EP's native grouped expert
-        adapters are counted separately: they are excluded by param identity from both the
-        attention-adapter test and the TP replicated-grad sweep, so expert-only LoRA under EP+TP
-        would otherwise reach no gate.
+        does the latter, so an ``isinstance`` check alone would miss it), read off the tuner layers
+        (:func:`~src.models.structure.tuner_adapter_param_ids`) so a backbone's own ``lora_*``
+        parameters stay base weights. EP's native grouped expert adapters are counted separately:
+        they are no tuner layer and the TP replicated-grad sweep excludes them by param identity, so
+        expert-only LoRA under EP+TP would otherwise reach no gate.
         """
         model = self._top_level_model()
         if has_ep_lora(model):
             raise ValueError(
-                "Native EP expert LoRA is not supported with Tensor Parallelism (tp_size > 1).\n"
+                "Native EP expert LoRA is not supported with Tensor Parallelism (tensor_parallel_size > 1).\n"
                 "The expert adapters live on the EP-distributed expert weights, so every TP gate "
                 "skips them by param identity: neither the attention-adapter check nor the TP "
                 "replicated-grad sync sees them, and no gradient-equivalence or save/merge test "
@@ -461,10 +461,10 @@ class ParallelismValidationMixin:
                 "  - expert LoRA under EP without TP (validated: save, resume and merge-on-save)\n"
                 "  - full fine-tuning under EP+TP (no adapters)"
             )
-        if not isinstance(model, PeftModel) and not has_non_expert_lora(model):
+        if not isinstance(model, PeftModel) and not tuner_adapter_param_ids(model):
             return
         raise ValueError(
-            "LoRA/PEFT adapters are not supported with Tensor Parallelism (tp_size > 1).\n"
+            "LoRA/PEFT adapters are not supported with Tensor Parallelism (tensor_parallel_size > 1).\n"
             "TP shards the attention/MLP base layers as DTensors, but PEFT adapters are added as "
             "plain tensors outside the TP graph: the replicated adapter matrix diverges across "
             "ranks (per-rank init, never broadcast) and the sharded one is corrupted by the TP "

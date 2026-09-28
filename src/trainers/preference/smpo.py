@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate.logging import get_logger
@@ -56,10 +57,10 @@ from src.data.collators.smpo import (
 )
 from src.data.pipeline.preferences import split_rendered_completion, split_vlm_preference_row
 from src.data.pipeline.processing import coordinated_map
-from src.data.pipeline.rendered import probe_tokenizer_specials
-from src.data.spans import LABEL_IGNORE_INDEX, ends_with_terminator, resolve_eos_token_ids
+from src.data.pipeline.rendered import lacks_emitted_bos
+from src.data.spans import LABEL_IGNORE_INDEX, lacks_terminator, resolve_eos_token_ids
 from src.data.vlm import render_vlm_text
-from src.distributed.context_parallel.config import cp_boundary_shift, split_sequence_for_cp
+from src.distributed.context_parallel.config import cp_shift_against_full_labels
 from src.distributed.loading.model_loading import load_model_from_pretrained
 from src.distributed.loading.peft_setup import peft_bf16_autocast, prepare_peft_model
 from src.distributed.parallelism_config import ParallelismConfig
@@ -79,7 +80,7 @@ from src.models.segment_markers import (
     segment_marker_kwargs,
     segment_markers_for,
 )
-from src.models.structure import resolve_tokenizer
+from src.models.structure import is_kbit_quantized, resolve_tokenizer
 from src.trainers.mixins.base import DistributedTrainerMixin
 from src.trainers.mixins.pp_gates import reject_pp_peft
 from src.trainers.mixins.stored_metrics import StoredMetricsMixin
@@ -125,28 +126,15 @@ def tokenize_preference_row(
     chosen_input_ids = full_chosen["input_ids"][split:]
     rejected_input_ids = full_rejected["input_ids"][split:]
 
-    # BOS only when the tokenizer's own post-processor emits one: gpt-oss/Bailing define a
-    # nominal bos_token it never emits, so forcing it trains on a token the policy never sees.
-    bos_id = processing_class.bos_token_id
-    if (
-        bos_id is not None
-        and probe_tokenizer_specials(processing_class).adds_leading_bos
-        and (len(prompt_tokens) == 0 or prompt_tokens[0] != bos_id)
-    ):
-        prompt_tokens = [bos_id] + prompt_tokens
+    if lacks_emitted_bos(prompt_tokens, processing_class):
+        prompt_tokens = [processing_class.bos_token_id] + prompt_tokens
 
-    # Two cases make a naive "already terminated?" check append an ender the policy never emits,
-    # inside the mean log-prob the SMPO margin is computed from: the render closes with
-    # ``<terminator>\n``, so the last token is a newline, and GLM-4/Gemma close turns with a role
-    # marker carried on the config, not on tokenizer.eos_token_id. Hence the whitespace-tolerant
-    # walk over the full terminator set.
+    # A spurious ender would sit inside the mean log-prob the SMPO margin is computed from.
     eos_id = processing_class.eos_token_id
-    terminators = eos_token_ids or ({eos_id} if eos_id is not None else set())
-    if eos_id is not None:
-        if not ends_with_terminator(chosen_input_ids, processing_class, terminators):
-            chosen_input_ids = chosen_input_ids + [eos_id]
-        if not ends_with_terminator(rejected_input_ids, processing_class, terminators):
-            rejected_input_ids = rejected_input_ids + [eos_id]
+    if lacks_terminator(chosen_input_ids, processing_class, eos_token_ids):
+        chosen_input_ids = chosen_input_ids + [eos_id]
+    if lacks_terminator(rejected_input_ids, processing_class, eos_token_ids):
+        rejected_input_ids = rejected_input_ids + [eos_id]
 
     if max_prompt_length and len(prompt_tokens) > max_prompt_length:
         if truncation_mode == "keep_start":
@@ -310,7 +298,9 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
             )
         self._reject_pp_explicit_options(parallelism_config, peft_config)
 
-        model, _ = load_model_from_pretrained(model, args)
+        model, _ = load_model_from_pretrained(
+            model, args, keep_fp32=parallelism_config is not None and parallelism_config.fp32_non_ep_params
+        )
 
         # After the load: the ctor accepts a model id, and the config is where a family that closes
         # turns with a role marker (GLM-4, Gemma) declares it — resolving earlier would degrade to
@@ -319,20 +309,14 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         self._eos_token_ids = resolve_eos_token_ids(tokenizer, getattr(model, "config", None))
 
         self._peft_has_been_casted_to_bf16 = False
+        # Gradient checkpointing over frozen embeddings needs grad-requiring inputs. The hook must
+        # precede the PEFT wrap, whose k-bit preparation installs its own on a quantized model.
         if peft_config is not None:
-            # Same three flags prepare_peft_model tests: a torchao/quanto model sets only is_quantized,
-            # and missing it here re-enables the input-requires-grad hook the k-bit prep installs.
-            quantized = (
-                getattr(model, "is_loaded_in_8bit", False)
-                or getattr(model, "is_loaded_in_4bit", False)
-                or getattr(model, "is_quantized", False)
-            )
-            # The input-requires-grad hook must precede the PEFT wrap (which covers the k-bit path).
-            if not quantized and args.gradient_checkpointing:
-                self._enable_input_require_grads(model)
+            if not is_kbit_quantized(model) and args.gradient_checkpointing:
+                model.enable_input_require_grads()
             model, self._peft_has_been_casted_to_bf16 = prepare_peft_model(model, peft_config, args)
         elif args.gradient_checkpointing:
-            self._enable_input_require_grads(model)
+            model.enable_input_require_grads()
 
         if args.disable_dropout:
             disable_dropout_in_model(model)
@@ -681,49 +665,21 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
 
         return losses, chosen_rewards, rejected_rewards
 
-    def _aggregate_logps_with_cp(
-        self,
-        logp_sums: torch.Tensor,
-        token_counts: torch.Tensor,
-        cp_config,
-    ) -> torch.Tensor:
-        """Average per-sequence log probs, all-reducing partial sums/counts across the CP group.
+    @staticmethod
+    def _cp_global_mean(sums: torch.Tensor, counts: torch.Tensor, cp_config) -> torch.Tensor:
+        """``sums / counts`` over whole sequences: under CP each rank holds one chunk's partial sums
+        and counts, both summed over the group first, so every rank gets the unsplit value.
 
-        Each CP rank holds only its chunk's partial sums and counts.
+        The ``sums`` reduce must be autograd-aware (its backward sums the gradient over the group): an
+        in-place ``dist.all_reduce`` reaches autograd only through the deprecated c10d fallback, as the
+        identity.
         """
-        if cp_config is None or cp_config.cp_size <= 1:
-            return logp_sums / token_counts.clamp(min=1)
-
-        # fp32 collectives: a bf16 all-reduce(SUM) of per-sequence logp sums is lossy.
-        global_logp_sums = logp_sums.clone().float()
-        global_token_counts = token_counts.clone().float()
-
-        dist.all_reduce(global_logp_sums, op=dist.ReduceOp.SUM, group=cp_config.process_group)
-        dist.all_reduce(global_token_counts, op=dist.ReduceOp.SUM, group=cp_config.process_group)
-
-        return global_logp_sums / global_token_counts.clamp(min=1)
-
-    def _get_boundary_labels(
-        self,
-        labels: torch.Tensor,
-        cp_config,
-    ) -> torch.Tensor | None:
-        """First token of the next rank's chunk, which this rank's last logit predicts.
-
-        Returns [batch, 1], or None on the last rank (and without CP). ``labels`` is the full
-        pre-split sequence [batch, seq_len].
-        """
-        if cp_config is None or cp_config.cp_size <= 1:
-            return None
-
-        if cp_config.cp_rank == cp_config.cp_size - 1:  # last rank needs no boundary labels
-            return None
-
-        chunk_size = labels.size(1) // cp_config.cp_size
-        next_chunk_start = (cp_config.cp_rank + 1) * chunk_size
-        boundary_label = labels[:, next_chunk_start : next_chunk_start + 1]
-
-        return boundary_label
+        if cp_config is not None and cp_config.cp_size > 1:
+            # fp32 collectives: a bf16 all-reduce(SUM) of partial sums is lossy.
+            sums = dist_nn.all_reduce(sums.float(), group=cp_config.process_group)
+            counts = counts.to(torch.float32, copy=True)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=cp_config.process_group)
+        return sums / counts.clamp(min=1)
 
     def concatenated_forward(
         self,
@@ -771,7 +727,6 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
             )
 
         cp_config = self.cp_config
-        boundary_labels = self._get_boundary_labels(labels, cp_config) if cp_config else None
 
         outputs = model(
             input_ids=input_ids,
@@ -782,9 +737,9 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         logits = outputs.logits
 
         if cp_config is not None and cp_config.cp_size > 1:
-            local_labels = split_sequence_for_cp(labels, cp_config, seq_dim=1)
-            is_last_rank = cp_config.cp_rank == cp_config.cp_size - 1
-            shift_logits, shift_labels = cp_boundary_shift(logits, local_labels, boundary_labels, is_last_rank)
+            shift_logits, shift_labels = cp_shift_against_full_labels(
+                logits, labels, cp_config.cp_rank, cp_config.cp_size
+            )
         else:
             shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, 1:]
@@ -810,9 +765,7 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
 
         # fp32 sum: a bf16 accumulation of hundreds of per-token logps rounds enough to flip near-ties.
         logp_sums = per_token_logps.sum(dim=-1, dtype=torch.float32)
-        token_counts = loss_mask.sum(dim=-1)
-
-        seq_logps = self._aggregate_logps_with_cp(logp_sums, token_counts, cp_config)
+        seq_logps = self._cp_global_mean(logp_sums, loss_mask.sum(dim=-1), cp_config)
 
         chosen_logps = seq_logps[:num_chosen]
         rejected_logps = seq_logps[num_chosen:]
@@ -821,13 +774,16 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         rejected_loss_mask = loss_mask[num_chosen:]
 
         # Masked fp32 reductions: boolean-indexing [tokens, V] logits copies them, `.any()` syncs.
-        mean_chosen_logits = self._masked_logit_mean(shift_logits[:num_chosen], chosen_loss_mask)
-        mean_rejected_logits = self._masked_logit_mean(shift_logits[num_chosen:], rejected_loss_mask)
+        mean_chosen_logits = self._masked_logit_mean(shift_logits[:num_chosen], chosen_loss_mask, cp_config)
+        mean_rejected_logits = self._masked_logit_mean(shift_logits[num_chosen:], rejected_loss_mask, cp_config)
 
-        # Shift here: under CP a deferred shift pairs local-chunk logits with full-length labels.
-        chosen_sft_loss = self._compute_cp_aggregated_sft_loss(per_token_nll[:num_chosen], chosen_loss_mask, cp_config)
-        rejected_sft_loss = self._compute_cp_aggregated_sft_loss(
-            per_token_nll[num_chosen:], rejected_loss_mask, cp_config
+        # Token-mean NLL per side. The count comes from the mask, never the NLL's nonzero support: a
+        # saturated token's NLL is legitimately 0 and still counts.
+        chosen_sft_loss = self._cp_global_mean(
+            per_token_nll[:num_chosen].sum(dtype=torch.float32), chosen_loss_mask.sum(), cp_config
+        )
+        rejected_sft_loss = self._cp_global_mean(
+            per_token_nll[num_chosen:].sum(dtype=torch.float32), rejected_loss_mask.sum(), cp_config
         )
 
         return {
@@ -840,33 +796,21 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         }
 
     @staticmethod
-    def _masked_logit_mean(logits: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    def _masked_logit_mean(logits: torch.Tensor, loss_mask: torch.Tensor, cp_config=None) -> torch.Tensor:
         """Mean over the logits of unmasked positions without materializing a masked copy.
 
-        Equals ``logits[loss_mask].mean()`` (fp32-accumulated); an empty mask yields 0.
+        Equals ``logits[loss_mask].mean()`` (fp32-accumulated); an empty mask yields 0. Under CP each
+        rank holds one chunk of every sequence, so the sum and token count are summed over the group
+        first and every rank reports the sequence-global mean. A logged metric, computed without grad.
         """
-        total = (logits.sum(dim=-1, dtype=torch.float32) * loss_mask).sum()
-        count = loss_mask.sum() * logits.size(-1)
-        return total / count.clamp(min=1)
-
-    def _compute_cp_aggregated_sft_loss(
-        self, per_token_nll: torch.Tensor, loss_mask: torch.Tensor, cp_config
-    ) -> torch.Tensor:
-        """Mean NLL over unmasked shifted tokens, aggregated across the CP group.
-
-        ``per_token_nll`` is ``-per_token_logps`` pre-clip, already zeroed at masked positions — the
-        per-token cross-entropy without a second full-vocab pass over the logits. The count comes from
-        ``loss_mask`` (never from the NLL's nonzero support: a saturated token's NLL is legitimately
-        exactly 0 and must still count). Summing loss and token count and all-reducing both reproduces
-        the non-CP ``reduction="mean"`` value regardless of how the sequence was split.
-        """
-        # fp32 sum + fp32 all-reduce — same bf16-accumulation hazard as the logp sums.
-        total_loss = per_token_nll.sum(dtype=torch.float32)
-        total_count = loss_mask.sum().float()
-        if cp_config is not None and cp_config.cp_size > 1:
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM, group=cp_config.process_group)
-            dist.all_reduce(total_count, op=dist.ReduceOp.SUM, group=cp_config.process_group)
-        return total_loss / total_count.clamp(min=1)
+        with torch.no_grad():
+            stats = torch.stack(
+                [(logits.sum(dim=-1, dtype=torch.float32) * loss_mask).sum(), loss_mask.sum(dtype=torch.float32)]
+            )
+            if cp_config is not None and cp_config.cp_size > 1:
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=cp_config.process_group)
+            total, tokens = stats.unbind()
+            return total / (tokens * logits.size(-1)).clamp(min=1)
 
     def _forward_padding_free(
         self,
@@ -926,7 +870,8 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         token_counts = torch.zeros(num_seqs, device=device, dtype=torch.float32)
         logp_sums.scatter_add_(0, shift_seq_idx, (flat_logps * flat_mask).float())
         token_counts.scatter_add_(0, shift_seq_idx, flat_mask.float())
-        seq_logps = logp_sums / token_counts.clamp(min=1)
+        # padding_free is refused under CP, so these means are rank-local.
+        seq_logps = self._cp_global_mean(logp_sums, token_counts, None)
 
         chosen_logps = seq_logps[:num_chosen]
         rejected_logps = seq_logps[num_chosen:]
@@ -938,8 +883,12 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         mean_chosen_logits = self._masked_logit_mean(shift_logits_flat, chosen_valid)
         mean_rejected_logits = self._masked_logit_mean(shift_logits_flat, rejected_valid)
 
-        chosen_sft_loss = (flat_nll * chosen_valid).sum(dtype=torch.float32) / chosen_valid.sum().clamp(min=1)
-        rejected_sft_loss = (flat_nll * rejected_valid).sum(dtype=torch.float32) / rejected_valid.sum().clamp(min=1)
+        chosen_sft_loss = self._cp_global_mean(
+            (flat_nll * chosen_valid).sum(dtype=torch.float32), chosen_valid.sum(), None
+        )
+        rejected_sft_loss = self._cp_global_mean(
+            (flat_nll * rejected_valid).sum(dtype=torch.float32), rejected_valid.sum(), None
+        )
 
         return {
             "chosen_logps": chosen_logps,
@@ -959,13 +908,13 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
 
         Detached: the bound is a clamp limit, not a term of the objective. Left differentiable,
         every clamped token would route its gradient back into the single element that is the
-        quantile, handing that token ``clamped_count`` times the gradient. The multi-rank branch is
-        detached anyway (the all-gather is not autograd-aware), so detaching here also keeps the
-        objective independent of ``cp_size``.
+        quantile, handing that token ``clamped_count`` times the gradient. Detaching up front also
+        keeps the all-gather, which has no autograd kernel, off the graph.
         """
+        values = values.detach().float()
         group = cp_config.process_group if cp_config else None
         if group is None or dist.get_world_size(group) == 1:
-            return torch.quantile(values.float(), q).detach() if values.numel() > 0 else None
+            return torch.quantile(values, q) if values.numel() > 0 else None
 
         world = dist.get_world_size(group)
         counts = torch.zeros(world, dtype=torch.long, device=values.device)
@@ -976,8 +925,8 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
             return None
 
         width = int(counts.max())
-        padded = values.float().new_zeros(width)
-        padded[: values.numel()] = values.float()
+        padded = values.new_zeros(width)
+        padded[: values.numel()] = values
         gathered = padded.new_zeros(world * width)
         dist.all_gather_into_tensor(gathered, padded, group=group)
         gathered = gathered.view(world, width)
@@ -1002,7 +951,7 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
         Order matters: the lower percentile runs before ``min_log_prob``, so the floor can only raise
         the tail further. Masked positions are never touched, and the input is left unmodified.
         """
-        clipped = per_token_logps.clone()  # avoid in-place mutation
+        clipped = per_token_logps
         chosen_valid = loss_mask & is_chosen
         rejected_valid = loss_mask & ~is_chosen
 
@@ -1347,12 +1296,9 @@ class SmoothMarginPOTrainer(StoredMetricsMixin, DistributedTrainerMixin, Trainer
 
         combined_sft_loss = self.chosen_sft_ratio * chosen_sft_loss + (1 - self.chosen_sft_ratio) * rejected_sft_loss
 
+        # No cp_size factor under CP: both terms reach the loss through autograd all-reduces, whose
+        # backward sums the cp_size rank-identical copies and so cancels FSDP2's 1/cp_size average.
         total_loss = margin_losses.mean() + combined_sft_loss
-
-        # Both terms are already a CP-global mean, but FSDP2 averages grads over cp_size * dp_size —
-        # cancel the 1/cp_size. Any future aux term must be added after this scaling.
-        if self.cp_size > 1:
-            total_loss = total_loss * self.cp_size
 
         # Every pair is valid off PP, and the logit means / SFT losses already arrive as means (under
         # CP, CP-global ones) — unit divisors report them as they are instead of re-reducing them.

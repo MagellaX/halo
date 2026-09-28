@@ -18,8 +18,8 @@ import pandas as pd
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from scripts._common import add_trust_remote_code_arg
-from scripts.inference._common import add_generation_args, add_openai_endpoint_args
+from scripts._common import add_dtype_arg, add_openai_endpoint_args, add_trust_remote_code_arg
+from scripts.inference._common import add_generation_args, add_prompt_field_args
 from src.checkpoint.tool_io import reject_sharded_checkpoint
 from src.data.pipeline.conversation import build_base_prompt, reject_image_content, resolve_system_prompt
 from src.data.pipeline.rendered import tokenize_rendered
@@ -35,7 +35,7 @@ _MESSAGE_DUMP_EXCLUDE = {"function_call", "tool_calls", "refusal", "audio"}
 # Longest basename these scripts will build, in bytes. Common filesystems cap a single name at 255
 # bytes, and the failure surfaces as an uncaught OSError(ENAMETOOLONG) from the first
 # `output_path.exists()`, after the reward model is already resident on the GPU. Reachable in
-# practice: vLLM's --served-model-name defaults to the served model's path, which --model_name then
+# practice: vLLM's --served-model-name defaults to the served model's path, which --model then
 # carries.
 _MAX_OUTPUT_BASENAME = 255
 
@@ -118,7 +118,7 @@ def boot_scoring_run(args) -> tuple[Any, Any, Any, torch.device]:
     One call for both scripts, so neither drifts onto a different set of ``--rm_*`` knobs; every flag
     the reward model is loaded under is threaded here.
     """
-    client = create_openai_client(base_url=args.openai_base_url, api_key_override=args.openai_api_key)
+    client = create_openai_client(base_url=args.base_url, api_key_override=args.api_key)
     rm_tokenizer, rm_model, rm_device = load_reward_model(
         args.rm_model_path,
         args.rm_model_atten_impl,
@@ -142,19 +142,9 @@ def build_generation_parser(description: str, *, temperature_default: float) -> 
     # Data configuration
     parser.add_argument("--prompts_source", type=str, required=True, help="Path to JSONL file with prompts")
     parser.add_argument("--output_folder", type=str, default="data")
-    parser.add_argument("--id_field", type=str, default="id")
-    parser.add_argument(
-        "--prompt_field", type=str, default="prompt", help="Field containing the prompt as list of message dicts"
-    )
+    add_prompt_field_args(parser)
     parser.add_argument("--follow_up_prompt_field", type=str, default="follow_up_prompt")
     parser.add_argument("--correct_answer_field", type=str, default="correct_answer")
-    parser.add_argument("--local_system_prompt_field", type=str, default="system_prompt")
-    parser.add_argument(
-        "--global_system_prompt",
-        type=str,
-        default=None,
-        help="System prompt applied to all rows (overridden by local)",
-    )
 
     # Generation configuration
     add_generation_args(parser, temperature_default=temperature_default)
@@ -171,12 +161,10 @@ def build_generation_parser(description: str, *, temperature_default: float) -> 
         "never truncated (default: %(default)s)",
     )
     parser.add_argument("--rm_device", type=str, default="cuda:0")
-    parser.add_argument(
-        "--rm_dtype",
-        type=str,
-        default="bfloat16",
-        choices=list(DTYPE_BY_NAME),
-        help="Reward-model compute dtype (default: bfloat16, the toolkit-wide default — float16's "
+    add_dtype_arg(
+        parser,
+        flag="--rm_dtype",
+        help="Reward-model compute dtype (default: %(default)s, the toolkit-wide default — float16's "
         "narrow range overflows on out-of-distribution reward logits)",
     )
 
@@ -206,7 +194,7 @@ async def generate_chat_message(client, messages: list[dict], args, response_for
     """
     completion = await client.chat.completions.create(
         messages=messages,
-        model=args.model_name,
+        model=args.model,
         temperature=args.temperature,
         response_format=response_format,
         max_tokens=args.max_gen_tokens,
@@ -271,11 +259,11 @@ def require_single_output(logits) -> None:
 def encode_for_scoring(tokenizer, conversations: list[list[dict]], correct_answer: str | None) -> dict:
     """Tokenize ``conversations`` for the reward model the way its training rows were tokenized.
 
-    Render through the chat template, then :func:`tokenize_rendered` (the Bradley-Terry reward map's
-    own path, ``build_reward_preprocess_fn``), so BOS lands once on a tokenizer whose post-processor
-    prepends it: re-tokenizing the rendered text would double it and the scores would come from a
-    token sequence the model never trained on. A conversation past ``tokenizer.model_max_length``
-    (``--rm_max_seq_len``) raises :class:`OverlongConversationError`.
+    Render through the chat template, then :func:`tokenize_rendered`, so BOS lands once on a
+    tokenizer whose post-processor prepends it, as in TRL's reward tokenize map (``apply_chat_template``
+    tokenizing its own render without special tokens): re-tokenizing the rendered text would double
+    it and the scores would come from a token sequence the model never trained on. A conversation
+    past ``tokenizer.model_max_length`` (``--rm_max_seq_len``) raises :class:`OverlongConversationError`.
     """
     encoded = [
         tokenize_rendered(

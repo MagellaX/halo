@@ -17,6 +17,11 @@
   A gradio major drops constructor arguments (``type=`` on ``ChatInterface``/``Chatbot``, the
   theme on ``Blocks``); the apps still import and their parsers still build, so only
   constructing the demo and launching it catches the break.
+* Endpoint flags: every generation, eval and playground CLI takes ``--base_url``/``--api_key`` from
+  the one helper in ``scripts/_common.py``, so a command line carries from one to the next.
+* Shared flag blocks: every dtype flag under ``scripts/`` comes from ``add_dtype_arg`` and every
+  prompt-row field flag of the generation CLIs from ``add_prompt_field_args``, so a re-typed copy
+  cannot drift onto its own default or choices.
 * Environment-playground request plumbing: the app documents a keyless local vLLM, so a ``None``
   API key (which ``AsyncOpenAI`` refuses at construction), an empty ``"model"`` sent verbatim, and a
   scheme-less base URL each break exactly the invocation the docstring advertises.
@@ -24,19 +29,28 @@
 Run: pytest tests/cpu/inference/test_script_defaults.py
 """
 
+import argparse
 import ast
 import functools
 import json
+import re
 import sys
 import types
 import warnings
 from pathlib import Path
 
+import gradio as gr
 import httpx
 import pytest
 import torch
 from openai import AsyncOpenAI
 
+from scripts._common import add_dtype_arg, add_openai_endpoint_args
+from scripts.inference import _common as inference_common
+from scripts.inference._common import add_prompt_field_args
+from scripts.inference.playground import gradio_environment_playground
+from scripts.inference.reward_model import _common as reward_model_common
+from scripts.inference.reward_model._common import build_generation_parser
 from src.inference.openai_client import DEFAULT_LOCAL_BASE_URL
 from tests.common.ports import free_port
 from tests.common.utils import load_script_module
@@ -46,8 +60,8 @@ _INFERENCE_ROOT = _PROJECT_ROOT / "scripts" / "inference"
 _GRADIO_APPS = sorted(_INFERENCE_ROOT.rglob("gradio_*.py"))
 # Loopback spellings: an app reachable only from its own host. Anything else is published.
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-# Env keys whose presence in a source file means a live, spendable credential is resident.
-_SECRET_ENV_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY")
+# A flag carrying an OpenAI-compatible endpoint's address or key, in any spelling.
+_ENDPOINT_FLAG = re.compile(r"^--.*(url|api[-_]key)$")
 
 
 _ABSENT = object()  # distinguishes "the script declares no such flag" from "default=None"
@@ -86,12 +100,8 @@ def _argparse_default(source: str, flag: str):
 
 
 def _rm_args(*extra: str):
-    from scripts.inference.reward_model._common import build_generation_parser
-
     parser = build_generation_parser("test", temperature_default=0.0)
-    return parser.parse_args(
-        ["--model_name", "gen", "--prompts_source", "p.jsonl", "--rm_model_path", "org/rm", *extra]
-    )
+    return parser.parse_args(["--model", "gen", "--prompts_source", "p.jsonl", "--rm_model_path", "org/rm", *extra])
 
 
 def test_reward_model_dtype_defaults_to_bfloat16():
@@ -101,8 +111,6 @@ def test_reward_model_dtype_defaults_to_bfloat16():
 @pytest.mark.parametrize(("requested", "expected"), [(None, torch.bfloat16), ("fp16", torch.float16)])
 def test_reward_model_loader_applies_the_requested_dtype(monkeypatch, requested, expected):
     """The knob has to reach the model — a parsed-and-ignored dtype is worse than no knob."""
-    from scripts.inference.reward_model import _common
-
     captured = {}
 
     class _Model(torch.nn.Module):
@@ -115,14 +123,16 @@ def test_reward_model_loader_applies_the_requested_dtype(monkeypatch, requested,
         def eval(self):
             return self
 
-    monkeypatch.setattr(_common, "reject_sharded_checkpoint", lambda path: None)
+    monkeypatch.setattr(reward_model_common, "reject_sharded_checkpoint", lambda path: None)
     monkeypatch.setattr(
-        _common, "AutoTokenizer", types.SimpleNamespace(from_pretrained=lambda *a, **k: types.SimpleNamespace())
+        reward_model_common,
+        "AutoTokenizer",
+        types.SimpleNamespace(from_pretrained=lambda *a, **k: types.SimpleNamespace()),
     )
-    monkeypatch.setattr(_common, "from_pretrained_verified", lambda *a, **k: _Model())
+    monkeypatch.setattr(reward_model_common, "from_pretrained_verified", lambda *a, **k: _Model())
 
     args = _rm_args(*(["--rm_dtype", requested] if requested else []))
-    _common.load_reward_model(
+    reward_model_common.load_reward_model(
         args.rm_model_path,
         args.rm_model_atten_impl,
         args.rm_max_seq_len,
@@ -140,8 +150,8 @@ def test_reward_model_loader_applies_the_requested_dtype(monkeypatch, requested,
 def test_the_gradio_apps_under_test_exist():
     """Guards the sweep below: an empty glob would assert nothing."""
     assert len(_GRADIO_APPS) >= 2, f"expected the shipped gradio apps, found {[p.name for p in _GRADIO_APPS]}"
-    holders = [p.name for p in _GRADIO_APPS if any(k in p.read_text(encoding="utf-8") for k in _SECRET_ENV_KEYS)]
-    assert holders, "no gradio app reads an API key from the environment — the rules below cover nothing"
+    holders = [p.name for p in _GRADIO_APPS if _gradio_app(p).build_parser().get_default("api_key") is not None]
+    assert holders, "no gradio app holds an API key — the rules below cover nothing"
 
 
 @pytest.mark.parametrize("app", _GRADIO_APPS, ids=lambda p: p.name)
@@ -198,8 +208,6 @@ def test_a_gradio_app_builds_and_serves_under_the_pinned_gradio(app):
     accepted with a warning and silently dropped, which is the same regression as a removed
     argument, only quieter.
     """
-    import gradio as gr
-
     build = _DEMO_BUILDERS.get(app.name)
     assert build is not None, f"{app.name} has no demo builder here, so its gradio API surface goes untested"
 
@@ -222,8 +230,6 @@ def test_a_gradio_app_builds_and_serves_under_the_pinned_gradio(app):
 
 
 def _playground():
-    from scripts.inference.playground import gradio_environment_playground
-
     return gradio_environment_playground
 
 
@@ -245,7 +251,7 @@ def test_the_environment_playground_key_defaults_to_the_vllm_placeholder(monkeyp
     mod.main()
 
     assert captured["api_key"] == "EMPTY", (
-        f"--api-key defaults to {captured['api_key']!r}; a keyless local vLLM needs the placeholder, "
+        f"--api_key defaults to {captured['api_key']!r}; a keyless local vLLM needs the placeholder, "
         f"and None makes AsyncOpenAI raise before the first request"
     )
 
@@ -341,8 +347,6 @@ def test_the_generation_clis_share_one_concurrency_and_checkpoint_default():
     throttles a sibling's throughput and widens what an interrupted run must regenerate, with
     nothing claiming the difference is deliberate.
     """
-    from scripts.inference import _common
-
     expected = {"--n_parallel": "DEFAULT_N_PARALLEL", "--checkpoint_interval": "DEFAULT_CHECKPOINT_INTERVAL"}
     declared: dict[str, list] = {flag: [] for flag in expected}
     for script in sorted(_INFERENCE_ROOT.rglob("*.py")):
@@ -353,7 +357,7 @@ def test_the_generation_clis_share_one_concurrency_and_checkpoint_default():
                 declared[flag].append((script.name, default))
 
     for flag, constant in expected.items():
-        assert getattr(_common, constant), f"{constant} is not defined in scripts/inference/_common.py"
+        assert getattr(inference_common, constant), f"{constant} is not defined in scripts/inference/_common.py"
         assert declared[flag], f"no inference CLI declares {flag} — this check covers nothing"
         literal = sorted(entry for entry in declared[flag] if entry[1] != constant)
         assert not literal, (
@@ -365,17 +369,101 @@ def test_the_generation_clis_share_one_concurrency_and_checkpoint_default():
 def test_the_local_endpoint_default_has_one_home():
     """One spelling of the value that decides whether a run's conversations stay on this host.
 
-    Every CLI that defaults an endpoint — the inference scripts and the environment eval scripts —
-    reads ``src.inference.openai_client``'s constant; a re-declaration anywhere under ``scripts/`` is a
+    Every CLI that defaults an endpoint takes it from ``add_openai_endpoint_args``, which reads
+    ``src.inference.openai_client``'s constant; a re-declaration anywhere under ``scripts/`` is a
     second source of truth.
     """
-    from scripts.environments import _common as env_common
-
-    assert env_common.DEFAULT_LOCAL_BASE_URL is DEFAULT_LOCAL_BASE_URL
+    assert add_openai_endpoint_args(argparse.ArgumentParser()).get_default("base_url") is DEFAULT_LOCAL_BASE_URL
     for script in sorted((_PROJECT_ROOT / "scripts").rglob("*.py")):
         source = script.read_text(encoding="utf-8")
         assert "DEFAULT_LOCAL_BASE_URL = " not in source, f"{script.name} re-declares the endpoint constant"
 
 
+def _declared_flags(source: str) -> list[str]:
+    """Every flag spelling an ``add_argument`` call in ``source`` declares."""
+    return [
+        arg.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "add_argument"
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    ]
+
+
+def test_every_endpoint_flag_comes_from_the_shared_helper():
+    """One spelling of the endpoint across the generation, eval and playground CLIs.
+
+    They drive the same served model, so a command line has to carry from one to the next; a CLI that
+    declares its own URL or key flag is how one ends up ``--base_url`` and the next ``--model-url``,
+    with the key's default and help copied beside each. ``scripts/profiling/`` is out of scope: its
+    ``--server-url`` is the rollout server's root for the weight-sync group, not an OpenAI endpoint.
+    """
+    shared = add_openai_endpoint_args(argparse.ArgumentParser())
+    shared_flags = {spelling for action in shared._actions for spelling in action.option_strings}
+    assert {"--base_url", "--api_key"} <= {flag for flag in shared_flags if _ENDPOINT_FLAG.match(flag)}, (
+        "the endpoint pattern no longer recognizes the shared spellings, so the sweep below covers nothing"
+    )
+
+    scripts_root = _PROJECT_ROOT / "scripts"
+    redeclared = [
+        f"{script.relative_to(_PROJECT_ROOT)}: {flag}"
+        for script in sorted(scripts_root.rglob("*.py"))
+        if script != scripts_root / "_common.py" and script.relative_to(scripts_root).parts[0] != "profiling"
+        for flag in _declared_flags(script.read_text(encoding="utf-8"))
+        if _ENDPOINT_FLAG.match(flag)
+    ]
+    assert not redeclared, (
+        f"endpoint flags declared outside scripts/_common.py's add_openai_endpoint_args: {redeclared}"
+    )
+
+
+def _declared_action(parser: argparse.ArgumentParser, flag: str) -> argparse.Action:
+    return next(action for action in parser._actions if flag in action.option_strings)
+
+
+def test_every_dtype_flag_comes_from_the_shared_helper():
+    """One default and one choice set for every dtype flag under ``scripts/``: the scorer's
+    ``--rm_dtype`` names a different model's dtype, not a different set of spellings or a different
+    default from the checkpoint tools that produced that model."""
+    scripts_root = _PROJECT_ROOT / "scripts"
+    redeclared = [
+        f"{script.relative_to(_PROJECT_ROOT)}: {flag}"
+        for script in sorted(scripts_root.rglob("*.py"))
+        if script != scripts_root / "_common.py"
+        for flag in _declared_flags(script.read_text(encoding="utf-8"))
+        if "dtype" in flag
+    ]
+    assert not redeclared, f"dtype flags declared outside scripts/_common.py's add_dtype_arg: {redeclared}"
+
+    scorer = _declared_action(build_generation_parser("test", temperature_default=0.0), "--rm_dtype")
+    shared = _declared_action(add_dtype_arg(argparse.ArgumentParser()), "--dtype")
+    assert (scorer.default, scorer.choices) == (shared.default, shared.choices)
+
+
+def test_the_prompt_row_fields_come_from_the_shared_helper():
+    """The S3 generation CLI and the reward-model scorers read the same row fields, so a prompt file
+    keyed for one is keyed for the other; one block declares them."""
+    shared = {
+        spelling
+        for action in add_prompt_field_args(argparse.ArgumentParser(add_help=False))._actions
+        for spelling in action.option_strings
+    }
+    scorer = {
+        spelling
+        for action in build_generation_parser("test", temperature_default=0.0)._actions
+        for spelling in action.option_strings
+    }
+    assert shared and shared <= scorer, f"the scorers do not carry the shared row fields {sorted(shared - scorer)}"
+
+    redeclared = [
+        f"{script.relative_to(_PROJECT_ROOT)}: {flag}"
+        for script in sorted(_INFERENCE_ROOT.rglob("*.py"))
+        if script != _INFERENCE_ROOT / "_common.py"
+        for flag in _declared_flags(script.read_text(encoding="utf-8"))
+        if flag in shared
+    ]
+    assert not redeclared, f"row-field flags declared outside add_prompt_field_args: {redeclared}"
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

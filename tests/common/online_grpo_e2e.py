@@ -14,7 +14,7 @@ lives here is the axis x adapter table, the vLLM-server ``GRPOConfig``, the two 
 TP + LoRA refusal and SDPG's OPD term.
 
 ``adapter`` puts the row on a fold no full fine-tune needs: attention PEFT reaches the engine through
-the sync's ``merge_adapter``, native grouped expert LoRA through ``merge_lora=True`` in the expert
+the sync's out-of-place PEFT fold, native grouped expert LoRA through ``merge_lora=True`` in the expert
 gather.
 
 ``resume`` covers the invariant TRL's ``_last_loaded_step`` sentinel carries: a resumed run generates
@@ -42,15 +42,16 @@ from src.distributed.parallelism_config import ParallelismConfig
 from src.trainers.distillation.sdpg import DistributedSDPGTrainer
 from src.trainers.grpo.online import DistributedGRPOTrainer
 from src.training.environment import resolve_resume_weights_source
-from tests.common.distributed import ensure_model_downloaded
+from tests.common.checkpoint_io import RestorePointSnapshot
+from tests.common.distributed import ensure_model_downloaded, shared_output_dir
 from tests.common.ep_reference import ep_layers
 from tests.common.on_policy_e2e import (
     RESUME_MAX_STEPS,
     RESUME_SAVE_STEP,
-    RestorePointSnapshot,
     adapter_file_agreement,
     expert_lora_under_etp_refusal,
     fresh_parallelism_config,
+    frozen_base_weights,
     load_policy,
     local_view,
     logged_lrs,
@@ -64,11 +65,12 @@ from tests.common.on_policy_e2e import (
     record_scheduler_restore,
     record_served_baseline,
     record_step_losses,
-    shared_output_dir,
+    served_policy_moved,
     sink_round,
 )
 from tests.common.peft_helpers import assert_only_adapters_trainable, snapshot_adapters, unwrap
 from tests.common.utils import cleanup_memory, log
+from tests.common.weight_sync import moved_parameters
 
 # Deliberately short: every step is a full engine round-trip, and the properties under test are that
 # the sync landed and that the resume pushed, neither of which needs a converged policy.
@@ -80,13 +82,6 @@ LORA_LEARNING_RATE = 1e-3
 MAX_COMPLETION_LENGTH = 64
 NUM_GENERATIONS = 2
 PER_DEVICE_BATCH_SIZE = 2
-# How far two served logprobs may sit apart and still count as the same policy, on an adapter row.
-# Phase 1's last push merges into a base that has been through the earlier steps' merge/unmerge
-# round-trips while phase 2 merges into a freshly loaded one, and each round-trip rounds the base
-# twice in bf16, so the two pushes differ by that rounding even when the adapters are bit-identical. A
-# full fine-tune restores the base itself and is compared exactly. The perturbation round moves these
-# logprobs by whole nats, well above this.
-SERVED_LOGPROB_TOL = 1e-2
 
 
 @dataclass(frozen=True)
@@ -167,6 +162,7 @@ def _grpo_config(spec: _Mode, *, output_dir, server_url, group_port, max_steps, 
         save_steps=save_steps or 0,
         save_only_model=not spec.checkpoint_optimizer,
         report_to="none",
+        logging_nan_inf_filter=False,
         use_vllm=True,
         vllm_mode="server",
         vllm_server_host=parsed.hostname or "localhost",
@@ -297,18 +293,6 @@ class _RestorePoint(RestorePointSnapshot):
         return {"weights": _weight_witnesses(self.trainer.model, self._spec)}
 
 
-def _served_policy_unchanged(after: dict, before: dict, *, exact: bool) -> bool:
-    """Whether two served-policy probes describe the same policy.
-
-    Exact for a full fine-tune, whose checkpoint restores the base itself; within
-    ``SERVED_LOGPROB_TOL`` for an adapter row, where the two pushes merge into bases a bf16
-    merge/unmerge round-trip apart.
-    """
-    if exact:
-        return after == before
-    return after.keys() == before.keys() and all(abs(after[k] - before[k]) <= SERVED_LOGPROB_TOL for k in before)
-
-
 def _perturb_and_sync(ctx, trainer, spec: _Mode, checks: dict, *, check_base_untouched: bool = True) -> None:
     """This row's :func:`perturbation_round`, pushed through the trainer's own weight sync."""
     perturbation_round(
@@ -366,7 +350,8 @@ def _lora_under_tp_refused(**build_kwargs) -> dict[str, bool]:
         log(f"  refusal: {message.splitlines()[0]}")
         return {
             "lora_under_tp_refused": True,
-            "refusal_names_tensor_parallelism": "Tensor Parallelism" in message and "tp_size > 1" in message,
+            "refusal_names_tensor_parallelism": "Tensor Parallelism" in message
+            and "tensor_parallel_size > 1" in message,
         }
     log("  a TP + LoRA trainer CONSTRUCTED: the rank-inconsistent adapter would train unnoticed")
     return {"lora_under_tp_refused": False, "refusal_names_tensor_parallelism": False}
@@ -376,7 +361,6 @@ def _run_resume(ctx, *, trainer_kind, spec: _Mode, model_name, tokenizer, server
     """Phase 1 (train, checkpoint, move the engine off it) then phase 2 (resume, prove the push)."""
     output_dir = shared_output_dir(ctx)
     checkpoint = os.path.join(output_dir, f"checkpoint-{RESUME_SAVE_STEP}")
-    exact = spec.adapter is None
 
     trainer, parallelism_config = _build_trainer(
         trainer_kind=trainer_kind,
@@ -415,15 +399,13 @@ def _run_resume(ctx, *, trainer_kind, spec: _Mode, model_name, tokenizer, server
         log(f"  checkpoint policy: { {k: round(v, 4) for k, v in checkpoint_policy.items()} }")
     ctx.barrier()
 
-    # The base-weight witness belongs to the single-phase rows: here the merge/unmerge round-trip is
-    # judged by the resumed engine landing back on the checkpoint's policy.
+    # The base-weight witness belongs to the single-phase rows: here the fold is judged by the resumed
+    # engine landing back on the checkpoint's policy.
     _perturb_and_sync(ctx, trainer, spec, checks, check_base_untouched=False)
     ctx.barrier()
     if ctx.rank == 0:
         moved_off = probe_top_logprobs(server_url, model_name)
-        checks["engine_moved_off_the_checkpoint_policy"] = not _served_policy_unchanged(
-            moved_off, checkpoint_policy, exact=exact
-        )
+        checks["engine_moved_off_the_checkpoint_policy"] = served_policy_moved(moved_off, checkpoint_policy)
         log(f"  engine moved off the checkpoint policy: {checks['engine_moved_off_the_checkpoint_policy']}")
     ctx.barrier()
 
@@ -480,9 +462,9 @@ def _run_resume(ctx, *, trainer_kind, spec: _Mode, model_name, tokenizer, server
 
     if ctx.rank == 0:
         after = probe_top_logprobs(server_url, model_name)
-        checks["resume_returned_the_engine_to_the_checkpoint_policy"] = _served_policy_unchanged(
-            after, checkpoint_policy, exact=exact
-        )
+        # Exact on every row: the checkpoint restores a full fine-tune's weights, an adapter row's
+        # adapters bit-equal over the freshly loaded base, and phase 1's syncs left its base as loaded.
+        checks["resume_returned_the_engine_to_the_checkpoint_policy"] = after == checkpoint_policy
         if not checks["resume_returned_the_engine_to_the_checkpoint_policy"]:
             log("  the resumed run's first rollout did NOT come from the checkpoint's weights")
         log(f"  post-resume: { {k: round(v, 4) for k, v in after.items()} }")
@@ -532,7 +514,7 @@ def run_online_grpo_e2e(
     if spec.rejects_expert_lora:
         refusal = expert_lora_under_etp_refusal(spec.expert_tp_size)
         checks["expert_lora_under_etp_refused"] = bool(refusal)
-        checks["etp_refusal_names_expert_tp_size"] = "expert_tp_size > 1" in refusal
+        checks["etp_refusal_names_expert_tensor_parallel_size"] = "expert_tensor_parallel_size > 1" in refusal
 
     if ctx.rank == 0:
         record_served_baseline(server_url, model_name, checks)
@@ -573,9 +555,10 @@ def run_online_grpo_e2e(
     checks["parallelism_engaged"] = parallelism_engaged(trainer, spec.ep_size, spec.tp_size, spec.expert_tp_size)
     log(f"  parallelism engaged: {checks['parallelism_engaged']} ({mode})")
 
-    adapters_before = {}
+    adapters_before, base_before = {}, {}
     if spec.adapter:
         adapters_before = snapshot_adapters(unwrap(trainer.model), expert_lora=spec.expert_lora)
+        base_before = frozen_base_weights(unwrap(trainer.model))
         ok, detail = assert_only_adapters_trainable(unwrap(trainer.model))
         checks["only_adapters_trainable"] = ok
         log(f"  frozen base: {detail}")
@@ -587,6 +570,10 @@ def run_online_grpo_e2e(
 
     if spec.adapter:
         record_adapter_training(trainer, checks, before=adapters_before, expert_lora=spec.expert_lora, trained=trained)
+        # Every step's sync folded the adapters into copies it pushed; the frozen base must come out as loaded.
+        moved = moved_parameters(base_before, frozen_base_weights(unwrap(trainer.model)))
+        checks["training_syncs_left_the_base_weights_alone"] = bool(base_before) and not moved
+        log(f"  frozen base weights the training syncs moved: {len(moved)}/{len(base_before)} {moved[:3]}")
 
     ctx.barrier()
     before = probe_top_logprobs(server_url, model_name) if ctx.rank == 0 else {}
@@ -597,9 +584,9 @@ def run_online_grpo_e2e(
 
     if ctx.rank == 0:
         after = probe_top_logprobs(server_url, model_name)
-        checks["forced_sync_moved_the_served_policy"] = after != before
-        if after == before:
-            log("  IDENTICAL logprobs after the perturbation: the weight sync did not land")
+        checks["forced_sync_moved_the_served_policy"] = served_policy_moved(after, before)
+        if not checks["forced_sync_moved_the_served_policy"]:
+            log("  IDENTICAL or non-finite logprobs after the perturbation: the weight sync did not land")
         # A failed update leaves the engine partially written, so check that it still answers.
         checks["server_usable_after_sync"] = bool(probe_top_logprobs(server_url, model_name))
     ctx.barrier()

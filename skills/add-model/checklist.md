@@ -15,14 +15,16 @@ run. Paths are relative to the repo root; anything that executes runs **inside t
 | EP wrapper | `src/distributed/expert_parallel/layers/<name>.py` — `layers/roster.py` imports the whole package, so the file's existence *is* the registration |
 | EP base / hooks | `src/distributed/expert_parallel/base_layer.py` (gather in `expert_gather.py`, balancing in `balancing.py`) |
 | Expert-LoRA coverage | `src/distributed/expert_parallel/config.py` (`LORA_PROJECTION_COVERAGE`) |
-| Non-persistent buffers | `src/models/patches/buffer_fixes.py` — extend the `fix_non_persistent_buffers` / `fix_rotary_inv_freq` fixer chains; `finalize_loaded_model` is the seam every load path calls, and a buffer no fixer covers stays on meta and is rejected at device placement |
+| Non-persistent buffers | `src/models/patches/buffer_fixes.py` — add a fixer to the `_NON_PERSISTENT_FIXERS` / `_ROTARY_FIXERS` chains; `finalize_loaded_model` is the seam every load path calls, and a buffer no fixer covers stays on meta and is rejected at device placement |
 | Liger coverage | `src/kernels/liger/families.py` (`LIGER_FAMILY_SPECS`) |
 | CP wrapper | `src/distributed/context_parallel/layers/<name>.py` |
 | Selective TP | `src/distributed/tensor_parallel/module_types.py` (`TP_SHARDABLE_ATTENTION_CLASSES`) |
+| Head transform (forward scales, caps or cuts logits around `lm_head`) | `src/models/head_transform.py` (`HeadTransformSpec`) + the family's tiny model in `tests/cpu/models/test_head_transform.py` |
+| Attention backend (auto-detection falls short) | family predicate in `src/models/patches/attention.py`, wired into `resolve_attn_implementation` or `apply_family_attention_patches` (`src/models/loading/model_preparation.py`) |
 | Vendoring | `src/models/<name>/` + a side-effect import in `src/models/loading/model_preparation.py` |
 | Configs | `examples/sft/<family>/` |
 | Tests | `tests/gpu/parallelism/ep/`, `tests/gpu/trainers/sft/`, `tests/cpu/models/`, `tests/gpu/manifest.py` |
-| Docs | `agent-docs/models/<name>.md`, `agent-docs/models/README.md`, `CLAUDE.md` |
+| Docs | the per-family page and every family roster listed in step 7 (*Wire the docs*) of `agent-docs/models/adding-a-model.md` — agent-docs, human-docs and `CLAUDE.md` |
 
 There is no registry file to edit. `MOE_LAYER_MAP` (`patching.py`) is built by walking the
 `EPMoELayerBase` subclass tree, and the CP map the same way — a duplicate HF class name raises at
@@ -43,8 +45,10 @@ Leave the YAML at `auto` and make the family resolvable:
   `output_router_logits` → `aux_loss`. Declare nothing.
 - **The wrapper selects** → `_supports_bias_balancing = True`, add `self._balancing_bias(scores)`
   to the **selection** scores before top-k (gate weights come from the *unbiased* scores), then
-  `self._record_expert_load(indices)`. `_deepseek_biased_route` does the whole pattern for
-  logit-routed families; a layer can refuse per-instance by overriding `enable_bias_balancing`.
+  `self._record_expert_load(indices)`. For logit-routed families `_deepseek_biased_route` does the
+  biased selection and the unbiased gate; call `self._record_expert_load(indices)` on its indices
+  yourself, or the bias never moves. A layer can refuse per-instance by overriding
+  `enable_bias_balancing`.
 - **`bias_update` ships only if the bias exports** — declare `_NATIVE_BALANCING_BIAS_ATTR` (plus
   `_NATIVE_BALANCING_CONFIG_FLAG` and the `_materialize_native_balancing_slot` hook for a
   config-gated slot). Without one, `_enforce_bias_export_contract` refuses `bias_update` and the
@@ -101,7 +105,8 @@ torchrun --nproc_per_node=2 tests/gpu/parallelism/ep/test_ep_vs_fsdp_<name>.py
 Required before the family counts as supported: an EP-vs-FSDP equivalence test (template
 `tests/gpu/parallelism/ep/test_ep_vs_fsdp_deepseek_v4.py`), a trainer test that saves through the
 gathered EP path and reloads the checkpoint as a plain HF model
-(`tests/gpu/trainers/sft/test_sft_deepseek_v4_moe.py`), both registered in
+(`tests/gpu/trainers/sft/test_sft_deepseek_v4_moe.py`, a thin subclass of `EPSftRoundTrip` in
+`tests/common/ep_sft_roundtrip.py` — copy it and override only the family hooks), both registered in
 `tests/gpu/manifest.py`, a CPU support test (`tests/cpu/models/test_deepseek_v4_support.py`), and —
 where you wired `bias_update` — `tests/gpu/parallelism/ep/test_gptoss_bias_balancing.py`. Add the
 Liger numerics case to `tests/gpu/kernels/test_liger_family_kernels.py`.

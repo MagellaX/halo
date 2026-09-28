@@ -6,19 +6,22 @@ tests at the end drive a fake backend instead, so the guard that rejects a diver
 pinned in every environment (including images built before the extra landed)."""
 
 import pickle
-import sys
 
+import numpy as np
 import pytest
 from datasets import Dataset
+from PIL import Image
 
 from src.data.pipeline import tokenizer_backend as tb
 from src.data.pipeline.preprocessed_metadata import PreprocessingConfig
 from src.data.pipeline.preprocessing import tokenize_dataset
 from src.data.pipeline.tokenizer_backend import (
     TOKENIZER_BACKENDS,
+    GigatokenTokenizerProxy,
     resolve_processor_backend,
     resolve_tokenizer_backend,
 )
+from src.models.loading.tokenizer_setup import setup_model_and_tokenizer
 from tests.common.models import PINNED_REVISIONS, QWEN2_5_VL_3B, QWEN3_0_6B
 from tests.common.tokenizers import load_cached_processor, load_cached_tokenizer
 
@@ -65,8 +68,6 @@ def test_vlm_processor_backend_parity():
     """A processor with the gigatoken proxy installed must produce identical input_ids
     (image pads included), pixel_values, and grid to the stock processor."""
     pytest.importorskip("gigatoken")
-    import numpy as np
-    from PIL import Image
 
     processor = load_cached_processor(VLM_MODEL_NAME, revision=VLM_MODEL_REVISION)
 
@@ -116,7 +117,6 @@ def test_verifier_catches_truncation_only_divergence(monkeypatch):
     """The startup verifier must probe truncated encodes — production paths tokenize with
     truncation=True, so a backend diverging only there must be rejected at resolve time."""
     pytest.importorskip("gigatoken")
-    from src.data.pipeline import tokenizer_backend as tb
 
     tokenizer = load_cached_tokenizer(MODEL_NAME)
     real_call = tb.GigatokenTokenizerProxy.__call__
@@ -166,8 +166,6 @@ def test_setup_model_and_tokenizer_resolves_backend():
     """setup_model_and_tokenizer must return the backend-resolved tokenizer — the single seam
     through which every training script gets the gigatoken proxy."""
     pytest.importorskip("gigatoken")
-    from src.data.pipeline.tokenizer_backend import GigatokenTokenizerProxy
-    from src.models.loading.tokenizer_setup import setup_model_and_tokenizer
 
     tokenizer = load_cached_tokenizer(MODEL_NAME)
     hf_args = PreprocessingArgsStub("hf")
@@ -177,24 +175,6 @@ def test_setup_model_and_tokenizer_resolves_backend():
     assert type(proxy) is GigatokenTokenizerProxy
     text = tokenizer.apply_chat_template(CONVERSATIONS[0], tokenize=False)
     assert list(proxy(text)["input_ids"]) == tokenizer(text)["input_ids"]
-
-
-def test_reward_preprocess_backend_parity():
-    """The Bradley-Terry reward map (shared non-SFT tokenization path) must produce identical
-    rows with the proxy."""
-    pytest.importorskip("gigatoken")
-    from src.data.pipeline.preferences import build_reward_preprocess_fn
-
-    tokenizer = load_cached_tokenizer(MODEL_NAME)
-    proxy = resolve_tokenizer_backend(tokenizer, "gigatoken")
-    examples = {
-        "prompt": [[{"role": "user", "content": "Best emoji? 🚀"}]],
-        "chosen": [[{"role": "assistant", "content": "Rocket."}]],
-        "rejected": [[{"role": "assistant", "content": "None."}]],
-    }
-    base = build_reward_preprocess_fn(tokenizer, max_length=512)(examples)
-    swapped = build_reward_preprocess_fn(proxy, max_length=512)(examples)
-    assert {k: [list(v) for v in vs] for k, vs in swapped.items()} == base
 
 
 @pytest.mark.parametrize("mode", ["chat", "text"])
@@ -225,10 +205,6 @@ def test_tokenize_dataset_backend_parity(mode):
     assert results["gigatoken"]["input_ids"] == results["hf"]["input_ids"]
     assert results["gigatoken"]["attention_mask"] == results["hf"]["attention_mask"]
     assert results["gigatoken"]["labels"] == results["hf"]["labels"]
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
 
 
 class _FakeGigatoken:
@@ -293,3 +269,7 @@ def test_a_backend_that_diverges_on_special_tokens_is_rejected(monkeypatch):
     tokenizer = load_cached_tokenizer(MODEL_NAME)
     with pytest.raises(ValueError, match="diverges"):
         tb.resolve_tokenizer_backend(tokenizer, "gigatoken")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

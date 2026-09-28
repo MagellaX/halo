@@ -9,11 +9,11 @@ Run: python tests/cpu/diagnostics/test_profiler_artifacts.py
 
 import logging
 import os
-import sys
 
 import pytest
+import torch
 
-from src.diagnostics.profiling import export_profiler_artifacts
+from src.diagnostics.profiling import export_profiler_artifacts, torch_profiler_session
 
 
 class _FakeProfile:
@@ -80,5 +80,19 @@ def test_non_empty_stacks_are_kept_and_reported(tmp_path, caplog):
     assert "trace-rank00.stacks_cuda.txt" in _written_list(log)
 
 
+def test_the_session_profiles_only_the_selected_ranks_region(tmp_path):
+    """The one-shot session profiles its region on a selected rank and writes that rank's artifacts;
+    a rank outside ``ranks`` gets ``None`` and writes nothing."""
+    with torch_profiler_session(str(tmp_path / "skipped"), ranks="1", label="region") as prof:
+        assert prof is None
+    assert not (tmp_path / "skipped").exists()
+
+    with torch_profiler_session(str(tmp_path), ranks="0", label="region", with_stack=False) as prof:
+        torch.mm(torch.ones(8, 8), torch.ones(8, 8))
+    files = sorted(os.listdir(tmp_path))
+    assert "region-rank00.trace.json.gz" in files, files
+    assert "aten::mm" in (tmp_path / "region-rank00.top_ops.txt").read_text()
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

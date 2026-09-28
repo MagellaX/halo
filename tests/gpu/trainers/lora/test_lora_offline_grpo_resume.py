@@ -14,7 +14,8 @@ Every check fails when a piece of the resume breaks:
     and the LR scheduler is back at step 2;
   - the resumed run's steps 3-4 track phase 1's, checked at the two precisions they hold: step 3 is a
     forward on the restored WEIGHTS and reproduces phase 1's loss exactly, while step 4 follows an
-    update driven by the restored MOMENTS and carries the resume's stochastic-rounding noise;
+    update driven by the restored MOMENTS, exact too except where DeepEP's dispatch order reorders
+    the expert-adapter gradient sums;
   - the resumed adapters, DISABLED, score a fixed batch as the frozen base scored it before any
     training — the reference log-probs offline GRPO computes at ``kl_beta > 0``. Anti-vacuous by the
     companion check that the same adapters ENABLED move those log-probs by orders more. The base
@@ -71,6 +72,7 @@ from tests.common.utils import (
     cleanup_memory,
     local_optimizer_state,
     log,
+    max_or_nan,
     optimizer_state_matches,
     step_losses,
 )
@@ -117,9 +119,10 @@ PROBE_MAX_TOKENS = 64
 REF_LOGP_TOL = 0.05
 ADAPTER_EFFECT_MIN = 0.25
 # Step 3 replays phase 1's forward on the restored weights: measured delta 0.0 on all four rows, the
-# band covering only the logged rounding and the bf16 combine reorder. Step 4 additionally carries
-# the stochastic-rounding stream restarting on resume — measured up to 0.067 (lora_etp) across
-# repeats — so its band is the loose one; the bit-exact optimizer comparison pins the moments.
+# band covering only the logged rounding and the bf16 combine reorder. Step 4 follows the first
+# update after the restore: 0.0 on lora, lora_ep and lora_etp, 1.4e-3 on expert_lora, where DeepEP's
+# dispatch order changes how each expert adapter's gradient is summed; the bit-exact optimizer
+# comparison pins the moments.
 RESTORED_STEP_LOSS_TOL = 2e-3
 LOSS_TOL = 0.15
 
@@ -145,6 +148,7 @@ def _config(
         save_steps=save_at or 0,
         save_only_model=False,
         report_to="none",
+        logging_nan_inf_filter=False,
         max_prompt_length=MAX_PROMPT_LENGTH,
         max_completion_length=MAX_COMPLETION_LENGTH,
         dataloader_drop_last=True,
@@ -492,13 +496,13 @@ def run(ctx) -> dict:
         phase1_tail, resumed_tail = phase1_losses[SAVE_AT_STEP:], resumed_losses[SAVE_AT_STEP:]
         deltas = [abs(a - b) for a, b in zip(phase1_tail, resumed_tail, strict=True)]
         metrics["restored_step_loss_delta"] = deltas[0]
-        metrics["resume_loss_max_delta"] = max(deltas)
+        metrics["resume_loss_max_delta"] = max_or_nan(deltas)
         log(
             f"steps {SAVE_AT_STEP + 1}-{TOTAL_STEPS}: phase1={[f'{loss:.5f}' for loss in phase1_tail]} "
             f"resumed={[f'{loss:.5f}' for loss in resumed_tail]} |deltas|={[f'{d:.5f}' for d in deltas]}"
         )
         checks["restored_weights_reproduce_the_loss"] = deltas[0] < RESTORED_STEP_LOSS_TOL
-        checks["resumed_loss_tracks_phase1"] = max(deltas) < LOSS_TOL
+        checks["resumed_loss_tracks_phase1"] = max_or_nan(deltas) < LOSS_TOL
 
     restored = live.get("restored")
     checks["resume_capture_fired"] = restored is not None

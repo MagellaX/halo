@@ -7,16 +7,20 @@ probes, and the shared state-snapshot and assertion helpers.
 import ast
 import gc
 import importlib.util
+import math
 import os
 import pathlib
 import subprocess
 import sys
+from collections.abc import Iterable
 from types import ModuleType
 
 import torch
 import torch.distributed as dist
+from accelerate.utils import extract_model_from_parallel
 from safetensors import safe_open
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
+from torch.distributed.tensor import DTensor
 
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.models.structure import unwrap_model
@@ -26,6 +30,10 @@ from tests.common.tolerances import TOL
 # than cwd-derived: the training images bake a repo copy at /workspace, so a relative path can
 # resolve against the wrong tree.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# Where a trained causal-LM loss lands: the floor catches a collapsed or masked-away objective, the ceiling
+# an untrained or garbage forward. Finiteness alone passes both.
+LM_TRAINING_LOSS_BAND = (0.05, 20.0)
 
 
 def load_script_module(relative_path: str, name: str | None = None, *, register: bool = False) -> ModuleType:
@@ -129,6 +137,14 @@ def cleanup_memory():
         torch.cuda.synchronize()
 
 
+def finish_phase(trainer) -> None:
+    """Release a finished phase's trainer before the next phase builds on the same GPUs: its DeepEP
+    buffers (``cleanup_ep``, collective, a no-op without EP layers) and the cached memory. A trainer a
+    teardown hook still references stays alive, so dropping the name alone would free neither."""
+    trainer.cleanup_ep()
+    cleanup_memory()
+
+
 def gpu_mem_gb(device=None) -> float:
     """Current GPU memory usage in GB."""
     if device is None:
@@ -165,6 +181,57 @@ def cos_sim(a: torch.Tensor, b: torch.Tensor, *, label: str) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         raise ValueError(f"{label}: cosine of a zero-norm tensor has no direction (norms {norm_a}, {norm_b})")
     return torch.dot(a, b).item() / (norm_a * norm_b)
+
+
+def max_abs_rel_err(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    """Largest elementwise error, relative to the reference's largest magnitude (fp32).
+
+    Scaled by the peak rather than elementwise, so near-zero reference entries do not dominate. The
+    floor only keeps an all-zero reference finite: any nonzero ``actual`` then reads as a huge error.
+    NaN in either operand propagates, so a ``<`` bound fails on it.
+    """
+    diff = (actual.float() - reference.float()).abs().max()
+    return (diff / reference.float().abs().max().clamp(min=1e-9)).item()
+
+
+def fro_rel_err(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    """Frobenius norm of the error relative to the reference's (fp64).
+
+    A zero-norm reference raises: a relative error against it is undefined, and a fixture that
+    produces one tests nothing.
+    """
+    reference = reference.double()
+    norm = reference.norm().item()
+    if norm == 0.0:
+        raise ValueError("relative error against a zero-norm reference is undefined")
+    return (actual.double() - reference).norm().item() / norm
+
+
+def relative_l2(actual: dict[str, torch.Tensor], reference: dict[str, torch.Tensor]) -> float:
+    """``||actual - reference|| / ||reference||`` over two tensor dicts taken as one vector (fp32).
+
+    ``inf`` when ``reference`` is empty or all zero, or the two hold different keys, so a comparison
+    of nothing fails a bound instead of passing it; NaN in either operand propagates.
+    """
+    if not reference or set(actual) != set(reference):
+        return math.inf
+    num = sum(float((actual[key].float() - value.float()).pow(2).sum()) for key, value in reference.items())
+    den = sum(float(value.float().pow(2).sum()) for value in reference.values())
+    return math.sqrt(num / den) if den else math.inf
+
+
+def max_or_nan(values: Iterable[float], *, default: float | None = None) -> float:
+    """Largest of ``values``, or NaN when any of them is NaN.
+
+    The builtin ``max`` compares with ``>``, which is false against NaN, so a NaN survives only in first
+    position and is silently dropped anywhere else; a bound checked on the result must fail on it
+    instead. ``default`` is returned for an empty ``values``; without one, an empty input raises as
+    ``max`` does.
+    """
+    values = list(values)
+    if any(math.isnan(value) for value in values):
+        return math.nan
+    return max(values) if default is None else max(values, default=default)
 
 
 def log_spectrum_matrix(rows: int, cols: int, generator: torch.Generator, decades: float = 1.0) -> torch.Tensor:
@@ -283,9 +350,74 @@ def optimizer_state_matches(saved: dict, restored: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def snapshot_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Every trainable parameter of ``model`` (framework wrappers stripped), whole and on the host:
+    FSDP2 / TP DTensors are gathered. Collective when any is a DTensor."""
+    snapshot = {}
+    for name, param in extract_model_from_parallel(model, recursive=True).named_parameters():
+        if param.requires_grad:
+            data = param.data.full_tensor() if isinstance(param.data, DTensor) else param.data
+            snapshot[name] = data.detach().cpu().clone()
+    return snapshot
+
+
+def params_off_dtype(model: torch.nn.Module, dtype: torch.dtype) -> list[str]:
+    """Names of the floating parameters of ``model`` not stored in ``dtype``."""
+    return [name for name, param in model.named_parameters() if param.is_floating_point() and param.dtype != dtype]
+
+
 def step_losses(trainer) -> list[float]:
     """Per-step training losses from a trainer's log history, eval entries and the run summary excluded."""
     return [e["loss"] for e in trainer.state.log_history if "loss" in e and "eval_loss" not in e]
+
+
+def training_run_checks(
+    train_result,
+    trainer,
+    max_steps: int,
+    *,
+    loss_band: tuple[float, float] | None = None,
+    grad_norms: bool = False,
+    loss_decreased: bool = False,
+) -> dict[str, bool]:
+    """The finished-run checks the SFT and LoRA suites share, each logged with its verdict.
+
+    ``loss_finite`` (the reported training loss), ``all_steps_finite`` (every logged step loss),
+    ``steps_completed`` (``max_steps`` optimizer steps ran), given ``loss_band`` ``loss_reasonable``
+    (the reported training loss strictly inside it), with ``grad_norms`` ``grad_norms_finite`` (at
+    least one gradient norm logged, every one finite), and with ``loss_decreased`` ``loss_decreased`` (the last logged step loss
+    below the first, which fails on fewer than two logged steps).
+    """
+    training_loss = train_result.training_loss
+    losses = step_losses(trainer)
+    checks = {
+        "loss_finite": math.isfinite(training_loss),
+        "all_steps_finite": all(math.isfinite(loss) for loss in losses),
+        "steps_completed": train_result.global_step == max_steps,
+    }
+    log(f"  Loss is finite: {'PASS' if checks['loss_finite'] else 'FAIL'} ({training_loss:.6f})")
+    log(f"  All step losses finite: {'PASS' if checks['all_steps_finite'] else 'FAIL'}")
+    log(f"  Per-step losses: {[f'{loss:.4f}' for loss in losses]}")
+    log(
+        f"  Steps completed: {'PASS' if checks['steps_completed'] else 'FAIL'} "
+        f"({train_result.global_step}/{max_steps})"
+    )
+    if loss_band is not None:
+        low, high = loss_band
+        checks["loss_reasonable"] = low < training_loss < high
+        log(f"  Loss in band ({low}, {high}): {'PASS' if checks['loss_reasonable'] else 'FAIL'} ({training_loss:.4f})")
+    if grad_norms:
+        norms = [e["grad_norm"] for e in trainer.state.log_history if "grad_norm" in e]
+        checks["grad_norms_finite"] = bool(norms) and all(math.isfinite(norm) for norm in norms)
+        log(
+            f"  All grad norms finite: {'PASS' if checks['grad_norms_finite'] else 'FAIL'} "
+            f"({[f'{norm:.2f}' for norm in norms]})"
+        )
+    if loss_decreased:
+        checks["loss_decreased"] = len(losses) >= 2 and losses[-1] < losses[0]
+        trend = f"{losses[0]:.4f} -> {losses[-1]:.4f}" if losses else "no step logged"
+        log(f"  Loss decreased: {'PASS' if checks['loss_decreased'] else 'FAIL'} ({trend})")
+    return checks
 
 
 def tensors_equal_at_narrower_dtype(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -302,3 +434,29 @@ def tensors_equal_at_narrower_dtype(a: torch.Tensor, b: torch.Tensor) -> bool:
         narrow = min(a.dtype, b.dtype, key=lambda dt: torch.finfo(dt).bits)
         a, b = a.to(narrow), b.to(narrow)
     return torch.equal(a, b.to(a.device))
+
+
+def resumed_loss_deltas(
+    uninterrupted: list[float], resumed: list[float], *, save_step: int, total_steps: int
+) -> list[float] | None:
+    """``|resumed - uninterrupted|`` at each step after ``save_step`` (``inf`` where either loss is not
+    finite), or ``None`` when either run is missing one of those steps.
+
+    Both lists are :func:`step_losses`; a resumed run's log history opens with the steps its
+    checkpoint carried, so its last ``total_steps - save_step`` entries are the resumed ones.
+    """
+    remaining = total_steps - save_step
+    tail, reference = resumed[-remaining:], uninterrupted[save_step:]
+    if not len(tail) == len(reference) == remaining:
+        log(
+            f"  resumed run logged {len(tail)} of the {remaining} steps after {save_step} (uninterrupted {len(reference)})"
+        )
+        return None
+    deltas = [
+        abs(a - b) if math.isfinite(a) and math.isfinite(b) else math.inf for a, b in zip(tail, reference, strict=True)
+    ]
+    log(
+        f"  uninterrupted {[f'{x:.6f}' for x in reference]}  resumed {[f'{x:.6f}' for x in tail]}  "
+        f"deltas {[f'{d:.2e}' for d in deltas]}"
+    )
+    return deltas

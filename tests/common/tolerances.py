@@ -21,52 +21,49 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class _Tolerances:
     # ── Cross-rank agreement ────────────────────────────────────────────────
-    # DP-averaged loss: all ranks reduce the same scalar, so only numerical noise.
-    rank_loss_consistency_abs: float = 0.01
-    # Identical broadcast batch, so only the combine reduction order varies; 1e-3 is headroom over
-    # that reorder. The 10x-looser DP band above would absorb a real mis-dispatch.
+    # Identical batch on every rank, so only a reduction order varies (the EP combine; TP's partial-sum
+    # all-reduce hands every rank one sum); 1e-3 is headroom over that reorder, and a real mis-dispatch
+    # or mis-shard moves one rank's loss well past it.
     ep_identical_batch_rank_spread_abs: float = 1e-3
-    # DTensor full-tensor norm; a spread above this means the norm came off a shard.
-    tp_grad_norm_spread_abs: float = 1e-3
+    # Identical batch through an all-reduce with no EP combine in the path (pure TP, pure ETP): the
+    # all-reduce hands every rank one sum, so ranks agree far tighter than across the combine, and a loss
+    # or grad norm read off a shard misses by orders of magnitude more.
+    all_reduced_rank_spread_abs: float = 1e-4
 
     # ── Parallel mode vs single-GPU / FSDP reference ────────────────────────
     # Step-0 loss, before optimizer drift: routing/all-to-all is not bitwise-dense.
     parallel_vs_baseline_loss_abs: float = 0.05
     # After a few steps SR and reduce order diverge the trajectories; bounds the trend.
     parallel_vs_baseline_train_loss_abs: float = 0.15
-    # Per-rank EP loss vs mean: ranks see distinct micro-batches, so this differs by data.
-    ep_rank_loss_abs: float = 0.5
     # bf16 reduction reorder flips near-tied top-k picks (gpt-oss top-4-of-32), which puts EP+TP and
     # EP+ETP past the generic bound above while still sitting several times under the shift a
     # rotated-expert control produces. The generic bound holds for modes the router never sees
     # reordered (ETP on Mistral4 matches to 1e-2); stretching it would weaken them.
     router_pick_flip_loss_abs: float = 0.1
 
-    # ── Log-probs (preference / CP aggregation) ─────────────────────────────
-    # CP-aggregated sequence log-probs vs the full-sequence reference.
+    # ── Log-probs under CP ──────────────────────────────────────────────────
+    # Per-token log-probs from Ulysses-gathered logits vs the full-sequence reference, at bf16.
     logprob_atol: float = 0.05
-    logprob_rtol: float = 0.02
 
     # ── Weights / optimizer ─────────────────────────────────────────────────
     # save→load round-trip at bf16 ULP scale.
     weight_atol: float = 1e-6
+    # A resume that restores the saved state and replays the uninterrupted run's batches: the
+    # merged-resume and embedding-resume bodies (nothing reset between the runs; the bf16 optimizer
+    # keys its rounding by step and parameter position) and the precompute-resume body's first
+    # resumed step, which precedes any update after the restore. Every compared loss and final
+    # adapter measured bit-exact on every row; 1e-4 is kernel headroom, under the 1.2e-4 first-step
+    # miss of adapters restarted from init.
+    replayed_resume_loss_abs: float = 1e-4
+    # The same comparison on the final trainable tensors, as a relative L2; a restart misses by ~1.
+    replayed_resume_weight_rtol: float = 1e-4
+
     # Loss across a resume boundary (same data, same step).
     resume_loss_abs: float = 0.05
-    grad_norm_rel: float = 0.10
-    # Norm achieved after clipping vs the max_norm asked for. The clip coefficient is applied in fp32
-    # over bf16 grads, so the re-measured norm lands a rounding step off the target, while a wrong
-    # coefficient or a missed plain-vs-DTensor scale misses by a factor.
-    clip_achieved_norm_rel: float = 1e-4
-
-    # ── Re-derived quantities (recompute / independent recount) ─────────────
-    # Same step, activation checkpointing on vs off. The recompute replays the forward with a
-    # different reduction order only, so the losses agree to bf16 accumulation noise; the bug this
-    # bounds (a corrupted checkpoint frame, such as a replayed DeepEP dispatch) moves them further.
-    gc_recompute_loss_rel: float = 1e-3
-    # A trainer-computed loss normalizer vs the same quantity recounted from the collective. Both
-    # are fp32 divisions of the same integers, so only float rounding separates them; the failure
-    # mode is a normalizer off by a whole factor (per-rank instead of stage-global, or /dp twice).
-    recomputed_normalizer_abs: float = 1e-4
+    # Fixed-batch forward loss before a save and after the resume, on a forward with no
+    # nondeterministic reduction (FSDP, TP, CP; not DeepEP's combine): bf16 round-trip noise. An
+    # unrestored or mis-gathered weight set moves it by more than 1.
+    resume_fixed_batch_loss_abs: float = 1e-2
 
     # ── Gradients through a sharded axis ────────────────────────────────────
     # Two independent bug classes a collapsed relative-L2 bound cannot separate. Scale: a missing
@@ -75,6 +72,14 @@ class _Tolerances:
     # corruption reorients the gradient at unchanged norm, which no norm ratio can see.
     grad_norm_ratio_max: float = 1.25
     grad_direction_cosine_min: float = 0.90
+
+    # ── CP gradients vs the full-sequence reference ─────────────────────────
+    # The CP-rank-averaged gradient against the single-rank full-sequence one. Ulysses re-partitions
+    # attention exactly, so only bf16 all-to-all and accumulation order separate them: each parameter's
+    # direction holds to 0.99 and the total norm to 10%. A wrong sequence split or RoPE offset reorients
+    # the attention grads, and a CP reduction that sums instead of averaging scales the norm by cp_size.
+    cp_grad_cosine_min: float = 0.99
+    cp_grad_norm_rtol: float = 0.10
 
     # ── EP gradients vs a replicated reference, tiny random-init MoE ─────────
     # bf16 grads on a ~128-token model carry real rounding noise, the paths accumulate in different

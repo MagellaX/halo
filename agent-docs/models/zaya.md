@@ -26,7 +26,7 @@ Hub `Zyphra/ZAYA1-8B` `main` is the native format: 40 layers, fused `model.layer
 
     That state is the only gradient path from layer N+1's routing loss to layer N's `router.down_proj` and `router_states_scale`, so detaching it silently trains the EP path on a different router objective than plain FSDP2. A severed edge moves those gradients by ~1e-2 relative, against the ~1e-7 floor the fp32 dispatch boundary leaves. Pinned in `tests/cpu/parallelism/test_zaya_ep_eda_gradient.py`.
 
-- **Discard slot**: the router emits `num_experts + 1` logits, the extra one a learned "send to nowhere" bucket. `ZayaRouter.forward` masks tokens routed to it (weight → 0, index → 0) before returning, so DeepEP only ever sees the real 16 experts.
+- **Discard slot**: the router emits `num_experts + 1` logits, the extra one a learned "send to nowhere" bucket. `ZayaRouter.forward` masks tokens routed to it (weight → 0, index → 0) before returning. Under EP (`ep_size > 1`) the wrapper dispatches those zero-weight picks as `-1`, DeepEP's "no expert", so they never ride the all-to-all to expert 0's rank; at ep1 nothing is dispatched and the upstream masking stands.
 - Topology: top-1 only, enforced by the config.
 - Storage: fused `gate_up_proj [E, H, 2M]` and `down_proj [E, M, H]` in matmul convention (the checkpoint is `[E, 2M, H]` / `[E, H, M]`, transposed on load). SwiGLU, Grouped GEMM compute.
 - Loading and saving both use the base fused path: lazy safetensors loading is supported (each rank reads only its expert slice), and the gathered save emits the two native fused tensors per layer, which `from_pretrained` reads back. A legacy per-expert checkpoint is still declined by the loader's structural probe.
@@ -46,9 +46,7 @@ RL weight sync is refused at construction on both engines, each for its own load
 
 **CP** — the CCA convolutions run over the sequence axis and the delayed `v_proj_delayed` shifts each token's value to the previous timestep. Both break Ulysses partitioning at chunk boundaries: the conv receptive field crosses them with no handshake, and the delay would pull a sequence element from another rank.
 
-**PP** — `ZayaPPSpec` declares `SUPPORTS_PP = False`. Two tensors cross every decoder-layer boundary: the fp32 residual stream and the EDA `prev_router_hidden_states`, which each layer's router adds to and forwards (it accumulates, so a later stage cannot recompute it). That is a two-tensor, mixed-dtype boundary the single-activation pipeline contract does not carry, and the loop selects `layer_types` by list position.
-
-The released checkpoint also ties `lm_head` to `embed_tokens` (the tie gate) ([Pipeline Parallelism](../parallelism/pipeline-parallelism.md)). Upstream ships no `base_model_pp_plan` either.
+**PP** — [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 **ETP** is supported via the shared fused-GLU helper: gate/up halves store as separate shards at `expert_tp_size > 1` so each rank holds matching intermediate positions, while the router (owning the EDA state) and the discard-slot masking stay replicated and FSDP-managed. EP+ETP without GC carries the same constraints as plain EP.
 

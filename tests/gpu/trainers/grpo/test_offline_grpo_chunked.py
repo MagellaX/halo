@@ -23,10 +23,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.distributed.parallelism_config import ParallelismConfig
 from src.trainers.grpo.offline import OfflineGRPOTrainer
+from tests.common.datasets import create_offline_grpo_dataset
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import log
-from tests.gpu.trainers.grpo.test_offline_grpo import create_offline_grpo_dataset
+from tests.common.utils import log, step_losses
 
 MODEL_NAME = QWEN3_0_6B
 MAX_STEPS = 4
@@ -99,6 +99,7 @@ def run(ctx) -> dict:
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_prompt_length=2048,
         max_completion_length=2048,
         dataloader_drop_last=True,
@@ -128,9 +129,9 @@ def run(ctx) -> dict:
 
     log("\n[2/2] Training with chunked logprobs (kl_beta > 0)...")
     train_result = trainer.train()
-    step_losses = [e["loss"] for e in trainer.state.log_history if "loss" in e and "eval_loss" not in e]
-    losses_finite = bool(step_losses) and all(math.isfinite(l) for l in step_losses)
-    log(f"  Losses: {[f'{l:.4f}' for l in step_losses]} ({'PASS' if losses_finite else 'FAIL'})")
+    losses = step_losses(trainer)
+    losses_finite = bool(losses) and all(math.isfinite(l) for l in losses)
+    log(f"  Losses: {[f'{l:.4f}' for l in losses]} ({'PASS' if losses_finite else 'FAIL'})")
     log(f"  Final training loss: {train_result.training_loss:.6f}")
 
     return {"checks": {"logprob_parity": parity_ok, "losses_finite": losses_finite}}

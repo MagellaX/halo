@@ -10,10 +10,6 @@ Phase 1: Forward loss equivalence (EP-only vs EP+CP)
   - EP+CP (EP=2, CP=2) splits sequences via Ulysses attention
   - Average loss across CP ranks must match EP-only average
   - 5 different inputs tested for statistical robustness
-  Note: per-parameter gradient comparison is NOT applicable to MoE models
-  because DeepEP's all-to-all routing is non-deterministic in bf16.
-  The dense-model test (test_cp_train_correctness.py on Qwen3) validates
-  per-parameter gradient exactness; this test validates loss equivalence.
 
 Phase 2: Attention backend comparison
   - When CP is active, flex_attention is auto-switched to a flash-family
@@ -26,8 +22,9 @@ Phase 2: Attention backend comparison
     kernel is identical, so the losses must match exactly.
 
 Phase 3: Full EP+CP training via DistributedSFTTrainer (15 steps)
-  - Validates: loss decrease, mean_token_accuracy increase, loss not
-    exploding, finite grad norms, cross-rank loss consistency
+  - Validates: the model carries the EP expert split and the Ulysses attention
+    layers, every step logged, loss decrease, mean_token_accuracy increase,
+    loss not exploding, finite losses and grad norms
 
 Usage:
     torchrun --nproc_per_node=2 \
@@ -40,29 +37,23 @@ Requirements:
 """
 
 import math
-import sys
-import traceback
 
 import torch
-import torch.distributed as dist
-from accelerate import PartialState
 from transformers import AutoTokenizer
+from trl import SFTConfig
 
 from src.distributed.context_parallel.validation import SUPPORTED_ATTN_IMPLEMENTATIONS
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.runtime import barrier
+from src.trainers.sft import DistributedSFTTrainer
 from tests.common.datasets import create_sft_dataset
-from tests.common.distributed import (
-    cleanup_dirs,
-    ensure_model_downloaded,
-    init_distributed,
-    setup_cache_dirs,
-    teardown_distributed,
-)
+from tests.common.distributed import ensure_model_downloaded, world_mean
 from tests.common.ep_reference import fixed_chat_batch
+from tests.common.harness import gpu_test_main
 from tests.common.models import GPT_OSS_20B
-from tests.common.utils import cleanup_memory, gpu_mem_gb, log, log_all
+from tests.common.parallel_shape import parallel_shape_checks
+from tests.common.utils import cleanup_memory, gpu_mem_gb, log, log_all, max_or_nan, step_losses, training_run_checks
 
 MODEL_NAME = GPT_OSS_20B
 EP_SIZE = 2
@@ -80,6 +71,10 @@ NUM_TRAIN_STEPS = 15
 MAX_SEQ_LENGTH = 4096
 BATCH_SIZE = 1
 LEARNING_RATE = 2e-5
+# Steps averaged at each end of the run for the loss and accuracy trends.
+TREND_WINDOW = 3
+# A later step loss this many times the first reads as divergence.
+LOSS_EXPLOSION_FACTOR = 2.0
 
 
 def _forward_losses(model, inputs):
@@ -92,21 +87,17 @@ def _forward_losses(model, inputs):
     return losses
 
 
-def _avg_loss_across_ranks(local_loss, device, world_size):
-    """All-gather a scalar loss and return the average across ranks."""
-    t = torch.tensor([local_loss], device=device)
-    gathered = [torch.zeros(1, device=device) for _ in range(world_size)]
-    dist.all_gather(gathered, t)
-    return sum(x.item() for x in gathered) / world_size
+def _compare_losses(ep_losses, cp_losses, device):
+    """Compare the world-mean EP-only and EP+CP loss of each sample, return (all_match, sample_results).
 
-
-def _compare_losses(ep_losses, cp_losses, device, world_size, label_a="EP", label_b="EP+CP"):
-    """Compare two sets of losses, return (all_match, sample_results)."""
+    The CP side is the full-sequence loss too: under no_grad the CP wrapper returns the group mean on
+    every rank.
+    """
     sample_results = []
     all_match = True
     for i in range(len(ep_losses)):
-        ep_avg = _avg_loss_across_ranks(ep_losses[i], device, world_size)
-        cp_avg = _avg_loss_across_ranks(cp_losses[i], device, world_size)
+        ep_avg = world_mean(ep_losses[i], device)
+        cp_avg = world_mean(cp_losses[i], device)
         abs_diff = abs(ep_avg - cp_avg)
         rel_diff = abs_diff / ep_avg if ep_avg > 1e-6 else float("inf")
         match = abs_diff < LOSS_ABS_TOL or rel_diff < LOSS_REL_TOL
@@ -114,20 +105,18 @@ def _compare_losses(ep_losses, cp_losses, device, world_size, label_a="EP", labe
             all_match = False
         sample_results.append((ep_avg, cp_avg, abs_diff, rel_diff, match))
         log(
-            f"      Sample {i}: {label_a}={ep_avg:.6f}, {label_b}={cp_avg:.6f}, "
+            f"      Sample {i}: EP={ep_avg:.6f}, EP+CP={cp_avg:.6f}, "
             f"abs={abs_diff:.6f}, rel={rel_diff:.4%} {'OK' if match else 'MISMATCH'}"
         )
     return all_match, sample_results
 
 
-def test_loss_equivalence(device, local_rank):
+def test_loss_equivalence(device):
     """
     Compare EP-only vs EP+CP forward loss on multiple inputs.
 
-    Returns (passed, details_dict).
+    Returns this phase's checks.
     """
-    world_size = dist.get_world_size()
-
     log(f"\n{'=' * 70}")
     log("  Phase 1: Forward Loss Equivalence")
     log(f"  EP-only (EP={EP_SIZE}) vs EP+CP (EP={EP_SIZE}, CP={CP_SIZE})")
@@ -184,21 +173,21 @@ def test_loss_equivalence(device, local_rank):
 
     log("\n  --- Results ---")
 
-    all_match, sample_results = _compare_losses(ep_losses, cp_losses, device, world_size)
+    all_match, sample_results = _compare_losses(ep_losses, cp_losses, device)
 
     all_finite = all(math.isfinite(l) for l in ep_losses + cp_losses)
     passed = all_match and all_finite
 
-    max_abs = max(r[2] for r in sample_results)
-    max_rel = max(r[3] for r in sample_results)
+    max_abs = max_or_nan(r[2] for r in sample_results)
+    max_rel = max_or_nan(r[3] for r in sample_results)
     log(f"      Max abs diff: {max_abs:.6f} (tol: {LOSS_ABS_TOL})")
     log(f"      Max rel diff: {max_rel:.4%} (tol: {LOSS_REL_TOL:.0%})")
     log(f"      Phase 1: {'PASS' if passed else 'FAIL'}")
 
-    return passed, {"max_abs": max_abs, "max_rel": max_rel}
+    return {"ep_vs_ep_cp_losses_match": all_match, "forward_losses_finite": all_finite}
 
 
-def test_attention_backends(device, local_rank):
+def test_attention_backends(device):
     """
     Compare forward losses across different attn_implementation settings.
 
@@ -208,10 +197,8 @@ def test_attention_backends(device, local_rank):
     the same, so auto-detected and explicit settings must give identical finite
     losses.
 
-    Returns (passed, details_dict).
+    Returns this phase's checks.
     """
-    world_size = dist.get_world_size()
-
     log(f"\n{'=' * 70}")
     log("  Phase 2: Attention Backend Comparison")
     log("  Comparing attn_implementation settings under EP+CP")
@@ -300,65 +287,37 @@ def test_attention_backends(device, local_rank):
         f"{'PASS' if checks['resolved_flash_family'] else 'FAIL'}"
     )
 
-    log("\n      Explicit FA2 vs flex→flash:")
-    ab_match, ab_results = _compare_losses(
-        losses_a,
-        losses_b,
-        device,
-        world_size,
-        label_a="FA2",
-        label_b="flex→flash",
-    )
-    max_ab_diff = max(r[2] for r in ab_results)
-    checks["fa2_vs_flex_match"] = ab_match
-    log(f"      Max diff: {max_ab_diff:.8f} {'(identical)' if max_ab_diff == 0.0 else ''}")
-
-    log("\n      flex→flash vs auto-detect:")
-    bc_match, bc_results = _compare_losses(
-        losses_b,
-        losses_c,
-        device,
-        world_size,
-        label_a="flex→flash",
-        label_b="auto",
-    )
-    max_bc_diff = max(r[2] for r in bc_results)
-    checks["flex_vs_auto_match"] = bc_match
-    log(f"      Max diff: {max_bc_diff:.8f} {'(identical)' if max_bc_diff == 0.0 else ''}")
+    # Under CP the kernel comes from get_flash_attn_func's arch probe, never from the label, and the
+    # three loads hold the same weights, so the settings must reproduce each loss bit for bit.
+    checks["fa2_vs_flex_identical"] = all(a == b for a, b in zip(losses_a, losses_b, strict=True))
+    checks["flex_vs_auto_identical"] = all(b == c for b, c in zip(losses_b, losses_c, strict=True))
+    log_all(f"      Explicit FA2 vs flex→flash identical: {checks['fa2_vs_flex_identical']}")
+    log_all(f"      flex→flash vs auto-detect identical: {checks['flex_vs_auto_identical']}")
 
     all_losses = losses_a + losses_b + losses_c
-    checks["all_finite"] = all(math.isfinite(l) for l in all_losses)
+    checks["backend_losses_finite"] = all(math.isfinite(l) for l in all_losses)
 
     passed = all(checks.values())
     log(f"\n      Phase 2: {'PASS' if passed else 'FAIL'}")
     if not passed:
         log(f"      Failed checks: {[k for k, v in checks.items() if not v]}")
 
-    return passed, checks
+    return checks
 
 
-def test_ep_cp_training(device, local_rank):
+def test_ep_cp_training(ctx):
     """
     Full EP+CP training test using DistributedSFTTrainer.
 
-    Verifies that training completes, losses decrease, metrics are computed
-    correctly, and results are consistent across ranks.
+    Verifies that EP and CP took effect on the model, that training completes,
+    losses decrease, and metrics are logged and finite on every step.
 
-    Returns (passed, details_dict).
+    Returns this phase's checks.
     """
-    from trl import SFTConfig
-
-    from src.trainers.sft import DistributedSFTTrainer
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
     log(f"\n{'=' * 70}")
     log(f"  Phase 3: EP+CP Training ({NUM_TRAIN_STEPS} steps)")
     log(f"  Model: {MODEL_NAME}, EP={EP_SIZE}, CP={CP_SIZE}")
     log(f"{'=' * 70}")
-
-    output_dir, cache_dir = setup_cache_dirs("ep_cp_train_correctness", rank)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -382,7 +341,7 @@ def test_ep_cp_training(device, local_rank):
     log(f"  GPU memory after load: {gpu_mem_gb():.1f} GB")
 
     sft_config = SFTConfig(
-        output_dir=output_dir,
+        output_dir=ctx.output_dir,
         max_steps=NUM_TRAIN_STEPS,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=1,
@@ -393,6 +352,7 @@ def test_ep_cp_training(device, local_rank):
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=MAX_SEQ_LENGTH,
         dataloader_drop_last=True,
         dataloader_num_workers=0,
@@ -409,218 +369,81 @@ def test_ep_cp_training(device, local_rank):
         processing_class=tokenizer,
         parallelism_config=parallelism_config,
     )
+    ctx.on_teardown(trainer.cleanup_ep)
 
-    checks = {}
-
-    checks["ep_mode_active"] = trainer.is_ep_mode
-    checks["cp_mode_active"] = trainer.is_cp_mode
-    log(f"  EP mode: {'PASS' if checks['ep_mode_active'] else 'FAIL'}")
-    log(f"  CP mode: {'PASS' if checks['cp_mode_active'] else 'FAIL'}")
+    checks = parallel_shape_checks(model, parallelism_config)
 
     log(f"\n  Training ({NUM_TRAIN_STEPS} steps)...")
     train_result = trainer.train()
+    checks |= training_run_checks(train_result, trainer, NUM_TRAIN_STEPS, grad_norms=True)
 
-    training_loss = train_result.training_loss
     log_history = trainer.state.log_history
-    step_losses = [e["loss"] for e in log_history if "loss" in e and "eval_loss" not in e]
+    losses = step_losses(trainer)
     grad_norms = [e["grad_norm"] for e in log_history if "grad_norm" in e]
     token_accuracies = [e["mean_token_accuracy"] for e in log_history if "mean_token_accuracy" in e]
+    log(f"  Token accuracies: {[f'{t:.4f}' for t in token_accuracies]}")
 
-    log("\n  --- Metrics ---")
-    log(f"  Final training loss: {training_loss:.6f}")
-    log(f"  Step losses: {[f'{l:.4f}' for l in step_losses]}")
-    if grad_norms:
-        log(f"  Grad norms: {[f'{g:.2f}' for g in grad_norms]}")
-    if token_accuracies:
-        log(f"  Token accuracies: {[f'{t:.4f}' for t in token_accuracies]}")
+    # logging_steps=1, so a completed run logs loss, grad norm and accuracy on every step: a short
+    # series fails here rather than skipping the trend checks below.
+    checks["every_step_logged"] = len(losses) == len(grad_norms) == len(token_accuracies) == NUM_TRAIN_STEPS
+    log(f"  Every step logged: {'PASS' if checks['every_step_logged'] else 'FAIL'}")
 
-    log("\n  --- Checks ---")
+    # Window averages, so one noisy step cannot decide the trend.
+    first_avg = sum(losses[:TREND_WINDOW]) / TREND_WINDOW
+    last_avg = sum(losses[-TREND_WINDOW:]) / TREND_WINDOW
+    checks["loss_decreased"] = last_avg < first_avg
+    log(
+        f"  Loss decreased (first{TREND_WINDOW}={first_avg:.4f} -> last{TREND_WINDOW}={last_avg:.4f}): "
+        f"{'PASS' if checks['loss_decreased'] else 'FAIL'}"
+    )
 
-    checks["training_completed"] = len(step_losses) == NUM_TRAIN_STEPS
-    log(f"  Training completed: {'PASS' if checks['training_completed'] else 'FAIL'}")
+    max_step = max_or_nan(losses[1:])
+    explosion_ceiling = losses[0] * LOSS_EXPLOSION_FACTOR
+    checks["no_loss_explosion"] = max_step < explosion_ceiling
+    log(
+        f"  No loss explosion (max={max_step:.4f} < {LOSS_EXPLOSION_FACTOR}x first={explosion_ceiling:.4f}): "
+        f"{'PASS' if checks['no_loss_explosion'] else 'FAIL'}"
+    )
 
-    all_finite = all(math.isfinite(l) for l in step_losses + [training_loss])
-    checks["losses_finite"] = all_finite
-    log(f"  Losses finite: {'PASS' if all_finite else 'FAIL'}")
+    first_acc = sum(token_accuracies[:TREND_WINDOW]) / TREND_WINDOW
+    last_acc = sum(token_accuracies[-TREND_WINDOW:]) / TREND_WINDOW
+    checks["accuracy_increased"] = last_acc > first_acc
+    log(
+        f"  Accuracy increased (first{TREND_WINDOW}={first_acc:.4f} -> last{TREND_WINDOW}={last_acc:.4f}): "
+        f"{'PASS' if checks['accuracy_increased'] else 'FAIL'}"
+    )
 
-    losses_reasonable = all(0 < l < 100 for l in step_losses)
-    checks["losses_reasonable"] = losses_reasonable
-    log(f"  Losses reasonable (0-100): {'PASS' if losses_reasonable else 'FAIL'}")
-
-    # First-3 vs last-3 average, so one noisy step cannot decide the trend.
-    if len(step_losses) >= 6:
-        first_avg = sum(step_losses[:3]) / 3
-        last_avg = sum(step_losses[-3:]) / 3
-        loss_decreased = last_avg < first_avg
-        checks["loss_decreased"] = loss_decreased
-        log(
-            f"  Loss decreased (first3={first_avg:.4f} -> last3={last_avg:.4f}): "
-            f"{'PASS' if loss_decreased else 'FAIL'}"
-        )
-    elif len(step_losses) >= 2:
-        loss_decreased = step_losses[-1] < step_losses[0]
-        checks["loss_decreased"] = loss_decreased
-        log(
-            f"  Loss decreased ({step_losses[0]:.4f} -> {step_losses[-1]:.4f}): {'PASS' if loss_decreased else 'FAIL'}"
-        )
-
-    if len(step_losses) >= 2:
-        max_step = max(step_losses[1:])
-        no_explosion = max_step < step_losses[0] * 2.0
-        checks["no_loss_explosion"] = no_explosion
-        log(
-            f"  No loss explosion (max={max_step:.4f} < 2x first={step_losses[0] * 2:.4f}): "
-            f"{'PASS' if no_explosion else 'FAIL'}"
-        )
-
-    if len(token_accuracies) >= 6:
-        first_acc = sum(token_accuracies[:3]) / 3
-        last_acc = sum(token_accuracies[-3:]) / 3
-        acc_increased = last_acc > first_acc
-        checks["accuracy_increased"] = acc_increased
-        log(
-            f"  Accuracy increased (first3={first_acc:.4f} -> last3={last_acc:.4f}): "
-            f"{'PASS' if acc_increased else 'FAIL'}"
-        )
-    elif len(token_accuracies) >= 2:
-        acc_increased = token_accuracies[-1] > token_accuracies[0]
-        checks["accuracy_increased"] = acc_increased
-        log(
-            f"  Accuracy increased ({token_accuracies[0]:.4f} -> {token_accuracies[-1]:.4f}): "
-            f"{'PASS' if acc_increased else 'FAIL'}"
-        )
-
-    if grad_norms:
-        grad_ok = all(math.isfinite(g) for g in grad_norms)
-        checks["grad_finite"] = grad_ok
-        log(f"  Grad norms finite: {'PASS' if grad_ok else 'FAIL'}")
-
-    loss_tensor = torch.tensor([training_loss], device=device)
-    all_losses = [torch.zeros_like(loss_tensor) for _ in range(world_size)]
-    dist.all_gather(all_losses, loss_tensor)
-    if rank == 0:
-        losses_list = [l.item() for l in all_losses]
-        spread = max(losses_list) - min(losses_list)
-        checks["loss_consistent"] = spread < 0.01
-        log(f"  Cross-rank loss consistency (spread={spread:.6f}): {'PASS' if checks['loss_consistent'] else 'FAIL'}")
-    else:
-        checks["loss_consistent"] = True
-
-    if token_accuracies:
-        acc_tensor = torch.tensor([token_accuracies[-1]], device=device)
-        all_accs = [torch.zeros_like(acc_tensor) for _ in range(world_size)]
-        dist.all_gather(all_accs, acc_tensor)
-        if rank == 0:
-            acc_list = [a.item() for a in all_accs]
-            acc_spread = max(acc_list) - min(acc_list)
-            checks["accuracy_consistent"] = acc_spread < 0.01
-            log(
-                f"  Cross-rank accuracy consistency (spread={acc_spread:.6f}): "
-                f"{'PASS' if checks['accuracy_consistent'] else 'FAIL'}"
-            )
-        else:
-            checks["accuracy_consistent"] = True
-
-    all_passed = all(checks.values())
-    log(f"\n  Phase 3: {'PASS' if all_passed else 'FAIL'}")
-
-    del trainer, model
-    cleanup_memory()
-    cleanup_dirs(output_dir, cache_dir)
-
-    return all_passed, {
-        "training_loss": training_loss,
-        "step_losses": step_losses,
-        "grad_norms": grad_norms,
-        "token_accuracies": token_accuracies,
-    }
+    log(f"\n  Phase 3: {'PASS' if all(checks.values()) else 'FAIL'}")
+    return checks
 
 
-# Main
-
-
-def main():
-    rank, world_size, local_rank = init_distributed()
-    device = f"cuda:{local_rank}"
-
-    PartialState()
+@gpu_test_main(min_world_size=EP_SIZE, prefix="ep_cp_train_correctness")
+def run(ctx):
+    device = f"cuda:{ctx.local_rank}"
 
     log(f"\n{'#' * 70}")
     log("  EP+CP Training Correctness Test")
-    log(f"  World: {world_size}, EP: {EP_SIZE}, CP: {CP_SIZE}")
+    log(f"  World: {ctx.world_size}, EP: {EP_SIZE}, CP: {CP_SIZE}")
     log(f"  Model: {MODEL_NAME}")
-    log(f"  GPU: {torch.cuda.get_device_name(local_rank)}")
+    log(f"  GPU: {torch.cuda.get_device_name(ctx.local_rank)}")
     log(f"{'#' * 70}")
-
-    if world_size < EP_SIZE:
-        log(f"\nERROR: Need at least {EP_SIZE} GPUs, got {world_size}")
-        teardown_distributed()
-        return 1
 
     assert SEQ_LEN % CP_SIZE == 0, f"SEQ_LEN ({SEQ_LEN}) not divisible by CP_SIZE ({CP_SIZE})"
 
     log("\nEnsuring model is downloaded...")
-    ensure_model_downloaded(MODEL_NAME, rank)
+    ensure_model_downloaded(MODEL_NAME, ctx.rank)
 
-    results = {}
-
-    # Phase 1: Forward loss equivalence
-    try:
-        loss_ok, info = test_loss_equivalence(device, local_rank)
-        results["loss_equivalence"] = loss_ok
-    except Exception as e:
-        log(f"\n  Phase 1 FAILED with exception: {e}")
-        if rank == 0:
-            traceback.print_exc()
-        results["loss_equivalence"] = False
-
+    checks = test_loss_equivalence(device)
     barrier()
     cleanup_memory()
 
-    # Phase 2: Attention backend comparison
-    try:
-        attn_ok, info = test_attention_backends(device, local_rank)
-        results["attention_backends"] = attn_ok
-    except Exception as e:
-        log(f"\n  Phase 2 FAILED with exception: {e}")
-        if rank == 0:
-            traceback.print_exc()
-        results["attention_backends"] = False
-
+    checks |= test_attention_backends(device)
     barrier()
     cleanup_memory()
 
-    # Phase 3: EP+CP training
-    try:
-        train_ok, info = test_ep_cp_training(device, local_rank)
-        results["training"] = train_ok
-    except Exception as e:
-        log(f"\n  Phase 3 FAILED with exception: {e}")
-        if rank == 0:
-            traceback.print_exc()
-        results["training"] = False
-
-    # Summary
-    all_passed = all(results.values())
-
-    log(f"\n{'#' * 70}")
-    log("  SUMMARY")
-    log(f"{'#' * 70}")
-    for name, passed in results.items():
-        log(f"    {name}: {'PASS' if passed else 'FAIL'}")
-
-    log(f"\n{'#' * 70}")
-    if all_passed:
-        log("  EP+CP TRAINING CORRECTNESS TEST PASSED")
-    else:
-        failed = [k for k, v in results.items() if not v]
-        log(f"  EP+CP TRAINING CORRECTNESS TEST FAILED: {failed}")
-    log(f"{'#' * 70}\n")
-
-    barrier()
-    teardown_distributed()
-    return 0 if all_passed else 1
+    checks |= test_ep_cp_training(ctx)
+    return {"checks": checks}
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()

@@ -9,25 +9,31 @@ These pin the *numerical* properties that justify SR over nearest rounding:
   2. The eager Adam step keeps ``exp_avg`` (the signed first moment) on NEAREST
      rounding -> bit-identical across two runs from identical state, while the
      weight and ``exp_avg_sq`` differ run-to-run (SR noise).
-  3. SR on ``exp_avg_sq`` removes the systematic +~50% upward bias that nearest
-     rounding inflicts on the always-positive second-moment accumulator near the
-     bf16 underflow floor. THIS is the test that bites if SR is dropped from the
-     second moment: AdamWBF16's exp_avg_sq tracks fp32 Adam, whereas a
-     nearest-rounded reference overshoots.
+  3. SR on ``exp_avg_sq`` removes the systematic bias, tens of percent with a
+     regime-dependent sign, that nearest rounding inflicts on the always-positive
+     second-moment accumulator near the bf16 underflow floor. THIS is the test that
+     bites if SR is dropped from the second moment: AdamWBF16's exp_avg_sq tracks
+     fp32 Adam, whereas a nearest-rounded reference misses it by more than 15%.
+  4. The rounding noise is keyed by the parameter's step and position, not drawn: a
+     replica missing another param's grad rounds alike, and an optimizer rebuilt and
+     restored from a state dict rounds exactly as the uninterrupted one.
 
 Run: python tests/cpu/optimizers/test_optimizer_sr.py  (or pytest)
 """
 
+import copy
 import math
 
 import pytest
 import torch
+from torch.distributed.checkpoint.state_dict import _init_optim_state
 
 import src.optimizers.adamw_bf16 as adamw_mod
 import src.optimizers.muon as muon_mod
 from src.optimizers.adamw_bf16 import (
     AdamWBF16,
     _eager_adam_bf16_step,
+    sr_seed_pair,
     stochastic_round_to_bf16,
 )
 
@@ -51,7 +57,6 @@ def test_sr_unbiased_between_grid_points():
     standard error of the mean is ~ulp/(2*sqrt(N)), so a 0.3-ulp constant bias
     would be ~50 sigma away and fail loudly.
     """
-    torch.manual_seed(0)
     base = torch.tensor(1.0, dtype=torch.bfloat16).float()  # exact bf16 grid point
     ulp = _bf16_ulp(1.0)
     x = float(base) + 0.3 * ulp
@@ -64,7 +69,7 @@ def test_sr_unbiased_between_grid_points():
     # without paying torch's per-op CPU thread-pool overhead 20000x — which is minutes on a many-core
     # host. This is also the way SR is actually applied in the optimizer: to whole tensors, not scalars.
     n = 20000
-    samples = stochastic_round_to_bf16(torch.full((n,), x, dtype=torch.float32)).float()
+    samples = stochastic_round_to_bf16(torch.full((n,), x, dtype=torch.float32), seed=0).float()
 
     # Only the two bracketing grid points may appear.
     uniq = torch.unique(samples)
@@ -83,7 +88,7 @@ def test_sr_exact_on_grid_point():
     """A value exactly on a bf16 grid point rounds to itself every time (no noise)."""
     x = torch.tensor(2.0, dtype=torch.bfloat16).float().item()  # exactly representable
     # Vectorized: 2000 independent SR draws of an on-grid value in one call (see the unbiased test).
-    rs = stochastic_round_to_bf16(torch.full((2000,), x, dtype=torch.float32)).float()
+    rs = stochastic_round_to_bf16(torch.full((2000,), x, dtype=torch.float32), seed=0).float()
     assert torch.all(rs == x), f"on-grid value {x} rounded off-grid: {torch.unique(rs).tolist()}"
 
 
@@ -98,11 +103,10 @@ def _fresh_state(p):
 
 
 def _run_eager_step(seed, p0, grad):
-    """Run one eager Adam+SR step from identical inputs under a fixed RNG seed.
+    """Run one eager Adam+SR step from identical inputs under the SR seed pair ``(seed, seed + 1)``.
 
     Returns (param, exp_avg, exp_avg_sq) clones after the step.
     """
-    torch.manual_seed(seed)
     p = p0.clone()
     state = _fresh_state(p)
     _eager_adam_bf16_step(
@@ -116,13 +120,15 @@ def _run_eager_step(seed, p0, grad):
         wd_factor=1.0,
         beta1=0.9,
         beta2=0.999,
+        sr_seeds=(seed, seed + 1),
     )
     return p.clone(), state["exp_avg"].clone(), state["exp_avg_sq"].clone()
 
 
 def test_exp_avg_nearest_weight_and_easq_stochastic():
-    """Two eager steps from identical state under DIFFERENT RNG seeds:
-    exp_avg is bit-identical (nearest), while the weight and exp_avg_sq differ (SR).
+    """Two eager steps from identical state under DIFFERENT SR seeds:
+    exp_avg is bit-identical (nearest), while the weight and exp_avg_sq differ (SR) — and a rerun
+    under the SAME seed reproduces them, so the difference is the seed's noise.
     """
     torch.manual_seed(1234)
     p0 = (torch.randn(4096, dtype=torch.float32) * 0.02).to(torch.bfloat16)
@@ -131,6 +137,7 @@ def test_exp_avg_nearest_weight_and_easq_stochastic():
 
     p_a, ea_a, easq_a = _run_eager_step(11, p0, grad)
     p_b, ea_b, easq_b = _run_eager_step(99, p0, grad)
+    p_a2, _, easq_a2 = _run_eager_step(11, p0, grad)
 
     # exp_avg: nearest rounding -> deterministic regardless of the SR RNG state.
     assert torch.equal(ea_a, ea_b), "exp_avg must be bit-identical (nearest rounding, no SR)"
@@ -138,19 +145,16 @@ def test_exp_avg_nearest_weight_and_easq_stochastic():
     # weight + exp_avg_sq: stochastic rounding -> the two runs must differ somewhere.
     assert not torch.equal(p_a, p_b), "weight write must carry SR noise (differs across RNG seeds)"
     assert not torch.equal(easq_a, easq_b), "exp_avg_sq write must carry SR noise (differs across seeds)"
+    assert torch.equal(p_a, p_a2) and torch.equal(easq_a, easq_a2), "the SR seed must fully determine the noise"
 
 
-# 3. SR on exp_avg_sq removes the +~50% second-moment bias (THE bite test)
+# 3. SR on exp_avg_sq removes the nearest-rounding second-moment bias (THE bite test)
 
 
-def _adam_easq_reference(grad_val, n_steps, beta2, sr=False, seed=0):
-    """fp32-accumulated second moment, then stored as bf16 each step.
-
-    sr=False -> nearest rounding (the buggy path that over-estimates).
-    sr=True  -> stochastic rounding (matches AdamWBF16's eager path).
-    Returns the mean of the final bf16 exp_avg_sq.
+def _adam_easq_reference(grad_val, n_steps, beta2):
+    """fp32-accumulated second moment, then stored as nearest-rounded bf16 each step (the biased
+    path). Returns the mean of the final bf16 exp_avg_sq.
     """
-    torch.manual_seed(seed)
     size = 8192
     grad = torch.full((size,), grad_val, dtype=torch.bfloat16)
     easq = torch.zeros(size, dtype=torch.bfloat16)
@@ -158,7 +162,7 @@ def _adam_easq_reference(grad_val, n_steps, beta2, sr=False, seed=0):
         easq_fp32 = easq.float()
         g = grad.float()
         easq_fp32.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-        easq = stochastic_round_to_bf16(easq_fp32) if sr else easq_fp32.to(torch.bfloat16)  # nearest
+        easq = easq_fp32.to(torch.bfloat16)
     return float(easq.float().mean())
 
 
@@ -182,7 +186,6 @@ def test_sr_removes_second_moment_bias():
     n_steps = 500
 
     # fp32 ground truth: no rounding of the state at all.
-    torch.manual_seed(0)
     size = 8192
     g = torch.full((size,), grad_val, dtype=torch.float32)
     easq_fp32 = torch.zeros(size, dtype=torch.float32)
@@ -191,10 +194,10 @@ def test_sr_removes_second_moment_bias():
     fp32_mean = float(easq_fp32.mean())
     assert fp32_mean > 0.0
 
-    nearest_mean = _adam_easq_reference(grad_val, n_steps, beta2, sr=False)
+    nearest_mean = _adam_easq_reference(grad_val, n_steps, beta2)
 
-    # AdamWBF16 eager path: step the real optimizer many times with a constant grad.
-    torch.manual_seed(7)
+    # AdamWBF16 eager path: step the real optimizer many times with a constant grad, so each step's
+    # noise must be fresh for the average to come out unbiased.
     p = torch.nn.Parameter(torch.zeros(size, dtype=torch.bfloat16))
     opt = AdamWBF16([p], lr=1e-3, betas=(0.9, beta2), weight_decay=0.0, use_triton=False)
     for _ in range(n_steps):
@@ -223,61 +226,117 @@ def test_sr_removes_second_moment_bias():
     )
 
 
-# 4. SR seed stream is STRUCTURAL: a grad-None param must not shift it
-#    (rank-nonuniform grad presence would silently drift replicated bf16 params)
+# 4. SR seeds are keyed by (step, param position): replicas and resumes round alike
 
 
-def _resync_sr_rng(module, seed=1234567):
-    """Simulate rank-synchronized _SR_RNG state: both 'ranks' start from the same seed."""
-    module._SR_RNG.seed(seed)
+def test_seed_pairs_differ_across_steps_and_params():
+    """Each (step, position) draws its own seeds, inside the kernel's int32-safe range, and the two
+    optimizers' keys give separate streams: a key that ignored the step would replay one step's noise
+    on the next and bias the rounding, one that ignored the position would share it across params."""
+    key = adamw_mod._SR_KEY
+    seeds = [sr_seed_pair(key, step, index) for step in range(1, 21) for index in range(10)]
+    assert len({pair[0] for pair in seeds}) == len(seeds), "two (step, param) pairs share a kernel seed"
+    assert all(pair[0] != pair[1] for pair in seeds), "the eager step's two SR writes share a seed"
+    assert all(0 <= seed < 2**30 for pair in seeds for seed in pair)
+    assert sr_seed_pair(key, 7, 3) == sr_seed_pair(key, 7, 3)
+    assert sr_seed_pair(key, 7, 3) != sr_seed_pair(muon_mod._SR_KEY, 7, 3), "the keys do not separate the streams"
 
 
-def test_adamw_seed_stream_survives_missing_grad():
-    """Two 'ranks' (fresh optimizers with re-synced _SR_RNG) hold p0 (grad present on rank A only)
-    and p1 (replicated, identical grads). p1 must round BIT-IDENTICALLY on both ranks: skipping the
-    seed draws for grad-None params makes rank B consume p0's seeds for p1, silently drifting the
-    replicated param apart."""
+def test_adamw_missing_grad_leaves_the_replicated_params_rounding_alone():
+    """Two 'ranks' hold p0 (grad present on rank A only) and p1 (replicated, identical grads). p1 must
+    round BIT-IDENTICALLY on both: its seed is keyed by its own position and step, which a grad-None p0
+    ahead of it does not shift."""
     torch.manual_seed(0)
     p0_init = (torch.randn(2048) * 0.02).to(torch.bfloat16)
     p1_init = (torch.randn(2048) * 0.02).to(torch.bfloat16)
     g1 = torch.full((2048,), 3e-4, dtype=torch.bfloat16)
 
     def run_rank(p0_has_grad: bool):
-        _resync_sr_rng(adamw_mod)
         p0 = torch.nn.Parameter(p0_init.clone())
         p1 = torch.nn.Parameter(p1_init.clone())
-        p0.grad = torch.full_like(p0, 1e-4) if p0_has_grad else None
-        p1.grad = g1.clone()
         opt = AdamWBF16([p0, p1], lr=1e-3, use_triton=False)
-        opt.step()
+        for _ in range(3):
+            p0.grad = torch.full_like(p0, 1e-4) if p0_has_grad else None
+            p1.grad = g1.clone()
+            opt.step()
         return p1.detach().clone(), opt.state[p1]["exp_avg_sq"].clone()
 
     p1_a, easq_a = run_rank(p0_has_grad=True)
     p1_b, easq_b = run_rank(p0_has_grad=False)
-    assert torch.equal(p1_a, p1_b), "replicated param drifted: grad-None param shifted the SR seed stream"
-    assert torch.equal(easq_a, easq_b), "exp_avg_sq drifted: grad-None param shifted the SR seed stream"
+    assert torch.equal(p1_a, p1_b), "replicated param drifted: a grad-None param shifted its rounding"
+    assert torch.equal(easq_a, easq_b), "exp_avg_sq drifted: a grad-None param shifted its rounding"
 
 
-def test_adamw_all_grads_present_ranks_identical():
-    """Sanity control for the two-rank harness: with identical grad presence the ranks match."""
+def test_a_param_rounds_by_its_position():
+    """The same param and grad at another position in the optimizer draws other noise, so the
+    position really keys the seed (else every param would share one noise pattern)."""
     torch.manual_seed(1)
     p_init = (torch.randn(1024) * 0.02).to(torch.bfloat16)
 
-    def run_rank():
-        _resync_sr_rng(adamw_mod)
+    def run(leading: int):
+        pads = [torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16)) for _ in range(leading)]
         p = torch.nn.Parameter(p_init.clone())
         p.grad = torch.full_like(p, 2e-4)
-        opt = AdamWBF16([p], lr=1e-3, use_triton=False)
-        opt.step()
+        AdamWBF16([*pads, p], lr=1e-3, use_triton=False).step()
         return p.detach().clone()
 
-    assert torch.equal(run_rank(), run_rank())
+    assert torch.equal(run(0), run(0))
+    assert not torch.equal(run(0), run(1))
 
 
-def test_muon_seed_draws_are_structural():
-    """Muon's per-group collection must draw one SR seed per param in group order regardless of
-    grad presence: a rank whose param lacks a grad must still consume that param's seed, so the
-    surviving params' seeds match the all-grads rank."""
+def _optimizer(params: list[torch.nn.Parameter]) -> AdamWBF16:
+    """Two groups, so the restored positions span a group boundary."""
+    groups = [{"params": params[:2]}, {"params": params[2:], "weight_decay": 0.0}]
+    return AdamWBF16(groups, lr=1e-3, use_triton=False)
+
+
+def _train(opt: AdamWBF16, params: list[torch.nn.Parameter], grads: list[list[torch.Tensor]]) -> None:
+    for step_grads in grads:
+        for p, g in zip(params, step_grads, strict=True):
+            p.grad = g.clone()
+        opt.step()
+
+
+def test_restored_adamw_rounds_like_the_uninterrupted_one():
+    """Resume in one process, the way the trainer restores: a rebuilt optimizer materializes its state
+    with torch's zero-LR ``_init_optim_state`` step, then loads the saved state. The steps after the
+    restore must be bit-identical to the uninterrupted run's with nothing reset in between, and an
+    unrelated optimizer stepping in the same process meanwhile changes nothing."""
+    torch.manual_seed(3)
+    inits = [(torch.randn(512) * 0.02).to(torch.bfloat16) for _ in range(3)]
+    grads = [[torch.randn(512, dtype=torch.bfloat16) * 1e-3 for _ in inits] for _ in range(6)]
+
+    def fresh_params(values):
+        return [torch.nn.Parameter(t.clone()) for t in values]
+
+    uninterrupted = fresh_params(inits)
+    uninterrupted_opt = _optimizer(uninterrupted)
+    _train(uninterrupted_opt, uninterrupted, grads)
+
+    first = fresh_params(inits)
+    first_opt = _optimizer(first)
+    _train(first_opt, first, grads[:3])
+    saved_state = copy.deepcopy(first_opt.state_dict())
+
+    bystander = fresh_params(inits)
+    _train(_optimizer(bystander), bystander, grads[:2])
+
+    resumed = fresh_params(first)
+    resumed_opt = _optimizer(resumed)
+    _init_optim_state(resumed_opt)
+    assert all(torch.equal(p, s) for p, s in zip(resumed, first, strict=True)), "the zero-LR step moved a weight"
+    resumed_opt.load_state_dict(saved_state)
+    _train(resumed_opt, resumed, grads[3:])
+
+    for index, (a, b) in enumerate(zip(uninterrupted, resumed, strict=True)):
+        assert torch.equal(a, b), f"param {index} rounded differently after the restore"
+        assert torch.equal(uninterrupted_opt.state[a]["exp_avg_sq"], resumed_opt.state[b]["exp_avg_sq"])
+
+
+def test_muon_seeds_are_keyed_by_step_and_position():
+    """Muon's matrix step keys each seed by the param's step count and its flat position: a rank whose
+    param lacks a grad still counts that param's step, so the surviving params' seeds match the
+    all-grads rank's, and a later step draws new ones."""
 
     def params(grad_flags):
         out = []
@@ -287,17 +346,24 @@ def test_muon_seed_draws_are_structural():
             out.append(p)
         return out
 
-    _resync_sr_rng(muon_mod)
-    with_grad_all, seeds_all = muon_mod._collect_params_with_sr_seeds(params([True, True, True]))
+    all_grads = params([True, True, True])
+    state_all: dict = {p: {} for p in all_grads}
+    with_grad_all, seeds_all = muon_mod._collect_params_with_sr_seeds(state_all, all_grads, 5)
     assert len(with_grad_all) == 3 and len(seeds_all) == 3
 
-    _resync_sr_rng(muon_mod)
-    with_grad_skip, seeds_skip = muon_mod._collect_params_with_sr_seeds(params([True, False, True]))
+    skipped = params([True, False, True])
+    state_skip: dict = {p: {} for p in skipped}
+    with_grad_skip, seeds_skip = muon_mod._collect_params_with_sr_seeds(state_skip, skipped, 5)
     assert len(with_grad_skip) == 2
-    assert seeds_skip[0] == seeds_all[0]
-    assert seeds_skip[1] == seeds_all[2], (
-        "the grad-None param did not consume its seed — surviving params' SR streams desync across ranks"
-    )
+    assert seeds_skip == [seeds_all[0], seeds_all[2]], "a grad-None param shifted its neighbours' seeds"
+    assert [state_skip[p]["step"] for p in skipped] == [1, 1, 1], "the grad-None param did not count the step"
+    assert "momentum" not in state_skip[skipped[1]], "a param with no grad was given a momentum buffer"
+
+    _, seeds_next = muon_mod._collect_params_with_sr_seeds(state_all, all_grads, 5)
+    assert not set(seeds_next) & set(seeds_all), "the next step replayed a seed"
+    # The group offset keys the seed: shifted by one, each param draws its right neighbour's seed.
+    _, seeds_shifted = muon_mod._collect_params_with_sr_seeds({p: {} for p in all_grads}, all_grads, 6)
+    assert seeds_shifted[:2] == seeds_all[1:] and seeds_shifted[0] != seeds_all[0]
 
 
 if __name__ == "__main__":

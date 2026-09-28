@@ -102,7 +102,7 @@ No hook may allocate state sized by `world_size` either — invisible at 8 GPUs,
     Undeclared, the export writes keys vLLM silently skips and the lazy loader leaves that submodule randomly initialized (Laguna's `shared_expert` ↔ `shared_experts`).
 
 - `_supports_weight_sync` / `_supports_gradient_checkpointing` / `_supports_lazy_loading` — all default `True`. Set one `False` and the owning gate rejects loudly instead of corrupting silently. Which family switches off which flag is published, pinned against the classes, in [Per-family EP restrictions](../parallelism/expert-parallelism.md#per-family-ep-restrictions).
-- `_supports_bias_balancing` — `True` when routing *selection* happens in-layer: add `self._balancing_bias(scores)` before top-k, gather gate weights from the **unbiased** scores, and call `self._record_expert_load(indices)` (`_deepseek_biased_route` does the whole pattern for logit-routed families).
+- `_supports_bias_balancing` — `True` when routing *selection* happens in-layer: add `self._balancing_bias(scores)` before top-k, gather gate weights from the **unbiased** scores, and call `self._record_expert_load(indices)`. For logit-routed families `_deepseek_biased_route` does the biased selection and the unbiased gate; the caller still records the load on its indices.
 
     A layer can refuse per-instance by overriding `enable_bias_balancing` (DeepSeek-V4 hash layers). Leave `False` when the router sits outside the wrapper (Gemma4) or the family's own gate owns a native balancing buffer (Zaya). An explicit `bias_update` on a model where no layer accepts the bias raises.
 
@@ -144,9 +144,9 @@ The merge itself is `merge_shards_to_hf` on the class. The base fused-GLU implem
 
 **5. Buffers.** `finalize_loaded_model()` (`src/models/patches/buffer_fixes.py`) is the post-load repair every load path runs: it walks two fixer chains — `_ROTARY_FIXERS` for `inv_freq`, `_NON_PERSISTENT_FIXERS` for the rest — and re-ties shared weights. transformers 5 re-materializes every non-persistent buffer as `torch.empty_like`, so add a fixer to the matching chain for any the family carries; an uncovered one reaches device placement still on meta, where the trainer raises rather than training on uninitialized memory.
 
-**6. Tests.** The DeepSeek-V4 trio is the template: an EP-vs-FSDP equivalence test (`tests/gpu/parallelism/ep/test_ep_vs_fsdp_deepseek_v4.py`), a trainer test that saves via the gathered EP path and reloads the checkpoint as a plain HF model (`tests/gpu/trainers/sft/test_sft_deepseek_v4_moe.py`), both registered in `tests/gpu/manifest.py`, plus a CPU test covering registration, gather/merge layout, and balancing resolution (`tests/cpu/models/test_deepseek_v4_support.py`).
+**6. Tests.** The DeepSeek-V4 trio is the template: an EP-vs-FSDP equivalence test (`tests/gpu/parallelism/ep/test_ep_vs_fsdp_deepseek_v4.py`), a trainer test that saves via the gathered EP path and reloads the checkpoint as a plain HF model (`tests/gpu/trainers/sft/test_sft_deepseek_v4_moe.py`, a thin subclass of `EPSftRoundTrip` in `tests/common/ep_sft_roundtrip.py` — copy it and override only the family hooks), both registered in `tests/gpu/manifest.py`, plus a CPU test covering registration, gather/merge layout, and balancing resolution (`tests/cpu/models/test_deepseek_v4_support.py`). The family's tiny model also goes into `TINY_MOE_FAMILIES` (`tests/common/tiny_models.py`), keyed by its `model_type`, and its name into `_TINY_MOE_FAMILIES` in the manifest: the merge-on-save and precompute-resume sweeps run every entry, and `tests/cpu/conventions/test_tiny_family_roster.py` fails on a registered EP family missing from either.
 
-**7. Wire the docs.** A supported family gets `agent-docs/models/<name>.md`, a matrix row in [Supported Models](README.md), an entry in the models `README.md`, the `CLAUDE.md` model lists, and an `examples/sft/<family>/` config.
+**7. Wire the docs.** A supported family gets `agent-docs/models/<name>.md`, an `examples/sft/<family>/` config, and a row in every family roster: the compatibility matrix and per-family list in [Supported Models](README.md), the supported-models tables in [Expert Parallelism](../parallelism/expert-parallelism.md) and [Grouped GEMM](../optimization/grouped-gemm.md), the wrapped-families list in [Parallelism](../parallelism/README.md), the human guide's [Supported Models](../../human-docs/models.md) and [Supported Matrix](../../human-docs/supported-matrix.md#model-families) tables, and the `CLAUDE.md` family list and Models index.
 
 ## Add CP support
 
@@ -180,7 +180,7 @@ The wrapper must split Q/K/V into the local-rank slice before all-to-all, apply 
 If a model isn't in transformers yet, or its `trust_remote_code` conflicts with the v5 pin, vendor it — and remove the vendoring at step 5 once upstream ships the family.
 
 1. **Copy `configuration_*.py` and `modeling_*.py`** into `src/models/<name>/`.
-2. **Register in a module**, not in the package `__init__.py` — every package init under `src/` carries a docstring only (`tests/cpu/conventions/test_package_inits.py`). Put the calls in `src/models/<name>/registration.py`:
+2. **Register in a module**, not in the package `__init__.py` — every package init under `src/` but the `src/__init__.py` bootstrap carries a docstring only (`tests/cpu/conventions/test_package_inits.py`). Put the calls in `src/models/<name>/registration.py`:
 
     ```python
     AutoConfig.register("<name>", YourConfig)

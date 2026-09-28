@@ -41,7 +41,7 @@ from src.trainers.sft import DistributedSFTTrainer
 from tests.common.datasets import create_sft_dataset
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import cleanup_memory, log
+from tests.common.utils import cleanup_memory, log, max_or_nan
 
 MODEL_NAME = QWEN3_0_6B
 MAX_STEPS = 4
@@ -114,6 +114,7 @@ def run_sft(reshard_after_backward, tokenizer, train_dataset, output_dir):
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=MAX_SEQ_LENGTH,
         dataloader_drop_last=True,
         dataloader_num_workers=0,
@@ -205,7 +206,9 @@ def run(ctx) -> dict:
 
     default_losses, lever_losses = arms["default"]["losses"], arms["lever"]["losses"]
     aligned = len(default_losses) == len(lever_losses) and bool(default_losses)
-    max_dev = max(abs(a - b) for a, b in zip(default_losses, lever_losses, strict=True)) if aligned else float("inf")
+    max_dev = (
+        max_or_nan(abs(a - b) for a, b in zip(default_losses, lever_losses, strict=True)) if aligned else float("inf")
+    )
     checks["curves_match"] = max_dev <= CURVE_ABS_TOL
     metrics["max_curve_deviation"] = max_dev
 

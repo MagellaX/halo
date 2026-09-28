@@ -4,10 +4,10 @@ Environmental GRPO (:mod:`tests.common.env_grpo_e2e`) and online GRPO / SDPG
 (:mod:`tests.common.online_grpo_e2e`) drive different trainers over different rollout paths but assert
 the same properties about the policy an inference engine serves. This module holds that
 trainer-agnostic half: the served-policy probe, the policy loader, the parallelism verdict, the
-perturbation round (move what the sync must carry, push it, then check an adapter fold gave the base
-weights back), the sink round the dense delta cannot cover, the restore-point snapshot a two-phase
-resume compares, and the constants those need. Each body keeps what differs: its trainer classes, its
-config, its rollout wiring and the refusals only it exercises.
+perturbation round (move what the sync must carry, push it, then check an adapter fold left the base
+weights untouched), the sink round the dense delta cannot cover, and the constants those need. Each
+body keeps what differs: its trainer classes, its config, its rollout wiring and the refusals only it
+exercises.
 
 Both phases of a resume row run in one process against one server on the same weight-transfer group
 port: a second ``init_communicator`` after ``close_communicator`` succeeds and its sync lands (on vLLM
@@ -27,13 +27,11 @@ import torch
 from datasets import Dataset
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
-from transformers.trainer_callback import TrainerCallback
 
 from src.distributed.expert_parallel.config import ExpertLoraSpec
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
-from src.distributed.runtime import broadcast_from_rank0
 from src.models.patches.gpt_oss_sinks import has_live_attention_sinks, is_sink_key
 from tests.common.ep_reference import ep_layers
 from tests.common.peft_helpers import (
@@ -45,7 +43,8 @@ from tests.common.peft_helpers import (
     snapshot_adapters,
     unwrap,
 )
-from tests.common.utils import local_optimizer_state, log, optimizer_state_matches, step_losses
+from tests.common.utils import log, max_or_nan, optimizer_state_matches, step_losses
+from tests.common.weight_sync import local_parameters, moved_parameters
 
 # Greedy, one token, top-k: the assertion is "these numbers moved", so the probe must be the least
 # noisy generation an engine can give. Every supported engine returns this exact shape from
@@ -63,7 +62,7 @@ RESUME_SAVE_STEP = 2
 RESUME_MAX_STEPS = RESUME_SAVE_STEP + 1
 
 # Full fine-tuning moves the weights themselves; an adapter run moves the zero-init half of the
-# adapter, whose only route into the engine is the sync's merge. Additive there because a freshly
+# adapter, whose only route into the engine is the sync's fold. Additive there because a freshly
 # trained lora_B can still be small enough that a scale factor moves nothing.
 WEIGHT_PERTURBATION = 1.05
 ADAPTER_PERTURBATION = 0.05
@@ -72,10 +71,6 @@ ADAPTER_PERTURBATION = 0.05
 SINK_PERTURBATION = 1.0
 # Tokens in the throwaway forward that puts the FSDP2 modules back in their end-of-step state.
 UNSHARD_FORWARD_TOKENS = 8
-# Ceiling on how far the sync's merge/unmerge round-trip may leave a base weight from where it found
-# it, relative to that tensor's own scale. bf16 rounds twice across the round-trip (~2^-8 each); an
-# adapter that stayed merged writes the whole perturbed delta in, orders of magnitude above this.
-BASE_MERGE_DRIFT = 0.01
 
 _QA_PAIRS = (
     ("What is 2 + 2?", "4"),
@@ -119,7 +114,8 @@ def probe_top_logprobs(server_url: str, model_name: str) -> dict[str, float]:
 
 
 def served_policy_delta(after: dict[str, float], before: dict[str, float]) -> float:
-    """Largest logprob gap between two probes over the tokens they share; ``inf`` when they share none.
+    """Largest logprob gap between two probes over the tokens they share; ``inf`` when they share none,
+    NaN when any gap is NaN, so no comparison against it passes.
 
     Two probes of the same policy are bit-identical, so this is zero for them and a real number
     otherwise. It is a magnitude to compare against another magnitude, not a tolerance to pass.
@@ -127,7 +123,16 @@ def served_policy_delta(after: dict[str, float], before: dict[str, float]) -> fl
     shared = after.keys() & before.keys()
     if not shared:
         return float("inf")
-    return max(abs(after[token] - before[token]) for token in shared)
+    return max_or_nan(abs(after[token] - before[token]) for token in shared)
+
+
+def served_policy_moved(after: dict[str, float], before: dict[str, float]) -> bool:
+    """Whether ``after`` probes a different policy from ``before``: both probes finite and not identical.
+
+    A NaN compares unequal to itself, so a probe of an engine serving NaN would otherwise read as moved.
+    """
+    finite = all(bool(probe) and all(math.isfinite(v) for v in probe.values()) for probe in (after, before))
+    return finite and after != before
 
 
 def record_served_baseline(server_url: str, model_name: str, checks: dict[str, bool]) -> dict[str, float]:
@@ -146,15 +151,6 @@ def record_served_baseline(server_url: str, model_name: str, checks: dict[str, b
         f"  {server_url} serves {served} (need {model_name}); baseline { {k: round(v, 4) for k, v in baseline.items()} }"
     )
     return baseline
-
-
-def shared_output_dir(ctx) -> str:
-    """Rank 0's output dir, on every rank.
-
-    The EP/FSDP2 saver writes one directory; a per-rank ``mkdtemp`` would leave every peer with no
-    checkpoint to resume from, leaving the restore untested.
-    """
-    return broadcast_from_rank0(ctx.output_dir if ctx.rank == 0 else None)
 
 
 def fresh_parallelism_config(ep_size: int, tp_size: int = 1, expert_tp_size: int = 1) -> ParallelismConfig:
@@ -311,35 +307,22 @@ def _unshard_with_a_forward(model, device: torch.device) -> None:
         model(input_ids=torch.ones(1, UNSHARD_FORWARD_TOKENS, dtype=torch.long, device=device))
 
 
-def _frozen_base_handles(model) -> list[tuple[str, torch.nn.Parameter]]:
-    """The layer-0 base weights the sync's adapter fold must give back untouched.
+def frozen_base_weights(model) -> dict[str, torch.Tensor]:
+    """This rank's copy of the frozen weights an adapter fold must leave bit-identical, compared
+    across the syncs by :func:`~tests.common.weight_sync.moved_parameters`: every PEFT-wrapped base
+    weight (what the fold reads, in whichever layers the targets hit) and the rest of layer 0
+    (expert banks included), rather than a second copy of a full-size policy.
 
-    No served-policy probe can see a merge that never unmerged, since the engine is meant to receive
-    base+adapter, so the only witness is the trainer's own weights before and after the push.
+    No served-policy probe can see a fold that wrote into the base, since the engine is meant to
+    receive base+adapter, so the only witness is the trainer's own weights before and after the
+    syncs.
     """
-    return [
-        (name, param)
-        for name, param in model.named_parameters()
-        if "layers.0." in name and "lora_" not in name and param.dtype.is_floating_point
-    ]
-
-
-def _worst_relative_drift(handles: list[tuple[str, torch.nn.Parameter]], before: list[torch.Tensor]) -> float:
-    """Largest change in ``handles`` since ``before``, relative to each tensor's own scale.
-
-    Rank-local, so a parameter narrower in dim 0 than the DP mesh (Qwen3.5-MoE's ``[1, hidden]``
-    ``shared_expert_gate``) leaves the trailing ranks an empty shard with nothing to witness; the
-    ranks holding its rows still grade it.
-    """
-    worst = 0.0
-    for (_, param), reference in zip(handles, before, strict=True):
-        if reference.numel() == 0:
-            continue
-        moved = (local_view(param.data) - reference).abs().max()
-        drift = float((moved / reference.abs().max().clamp(min=1e-6)).item())
-        # max() keeps its first argument over a NaN, so a non-finite drift is made the worst outright.
-        worst = max(worst, drift) if math.isfinite(drift) else math.inf
-    return worst
+    return local_parameters(
+        model,
+        keep=lambda name, param: ("layers.0." in name or ".base_layer." in name)
+        and not param.requires_grad
+        and param.dtype.is_floating_point,
+    )
 
 
 def perturbation_round(
@@ -362,12 +345,11 @@ def perturbation_round(
 
     ``expert_stream`` says this policy's sync must carry expert tensors, which is where the
     non-vacuity count goes; a dense policy has none and counts the tensors it does move.
-    ``check_base_untouched`` adds the adapter fold's other half (:func:`_base_weight_witnesses`).
+    ``check_base_untouched`` adds the adapter fold's other half (:func:`frozen_base_weights`).
     """
     reshard_fsdp2_modules(unwrap(model))
     what, targets, stream_count = _perturbation_targets(model, adapter)
-    base_handles = _frozen_base_handles(model) if adapter is not None and check_base_untouched else []
-    base_before = [local_view(param.data) for _, param in base_handles]
+    base = frozen_base_weights(model) if adapter is not None and check_base_untouched else {}
     _unshard_with_a_forward(model, ctx.device)
     _apply_perturbation(targets, adapter)
     # Guard on the number that can go missing: a full fine-tune of a MoE policy has to move expert
@@ -380,10 +362,10 @@ def perturbation_round(
 
     push()
 
-    if base_handles:
-        drift = _worst_relative_drift(base_handles, base_before)
-        checks["sync_left_the_base_weights_alone"] = drift <= BASE_MERGE_DRIFT
-        log(f"  base-weight drift across the merge/unmerge round-trip: {drift:.2e} (max {BASE_MERGE_DRIFT})")
+    if base:
+        moved = moved_parameters(base, frozen_base_weights(model))
+        checks["sync_left_the_base_weights_alone"] = not moved
+        log(f"  frozen base weights the push moved: {len(moved)}/{len(base)} {moved[:3]}")
     return what
 
 
@@ -399,9 +381,11 @@ def _push_moves_served_policy(
     ctx.barrier()
     if ctx.rank == 0:
         after = probe_top_logprobs(server_url, model_name)
-        checks[check] = after != before
-        if after == before:
-            log(f"  IDENTICAL logprobs after a {stream}-only perturbation: the {stream} stream did not land")
+        checks[check] = served_policy_moved(after, before)
+        if not checks[check]:
+            log(
+                f"  IDENTICAL or non-finite logprobs after a {stream}-only perturbation: the {stream} stream did not land"
+            )
         log(f"  post-{stream}-sync: { {k: round(v, 4) for k, v in after.items()} }")
     ctx.barrier()
 
@@ -511,61 +495,6 @@ def record_adapter_training(
     ok, detail = assert_adapters_moved(before, snapshot_adapters(model, expert_lora=expert_lora))
     checks["adapters_moved_when_the_run_had_a_gradient"] = ok or not trained
     log(f"  adapters: {detail} (run had a gradient: {trained}); optimizer owns {owned}/{len(live_adapters)}")
-
-
-class RestorePointSnapshot(TrainerCallback):
-    """Trainer/optimizer/scheduler state at one lifecycle point.
-
-    ``"save"`` fires when the checkpoint is written, ``"train_begin"`` after the resume restore and
-    before the first resumed step, so the two snapshots describe the same step and a warm-restarted
-    optimizer cannot hide behind the steps that follow.
-
-    The first occurrence wins: a run that stops on ``max_steps`` writes a final checkpoint too, and a
-    snapshot overwritten there would describe a step the resume never restores.
-
-    ``capture_optimizer`` is off for a full fine-tune of a large policy: ``local_optimizer_state``
-    offloads the whole state to host RAM, which is 6 B/param of AdamWBF16 moments. ``expert_lora``
-    is the adapter-gather flag (``None`` = do not capture adapters); the capture has to happen here
-    because a resumed run takes a step of its own before the body can look. A subclass adds its own
-    entries through :meth:`extra`.
-    """
-
-    def __init__(self, event: str, trainer, *, capture_optimizer: bool, expert_lora: bool | None = None):
-        self.event = event
-        self.trainer = trainer
-        self.capture_optimizer = capture_optimizer
-        self.expert_lora = expert_lora
-        self.captured: dict | None = None
-
-    def extra(self) -> dict:
-        """Extra entries for the snapshot, taken at the same point. Empty here."""
-        return {}
-
-    def _capture(self, state) -> None:
-        if self.captured is not None:
-            return
-        # Every reader below goes by parameter identity, and a hook can fire while the FSDP2 modules
-        # still hold the transient unsharded params an eval-only forward left registered.
-        reshard_fsdp2_modules(unwrap(self.trainer.model))
-        self.captured = {
-            "global_step": state.global_step,
-            "sched_last_epoch": self.trainer.lr_scheduler.last_epoch,
-            "optimizer": local_optimizer_state(self.trainer.model, self.trainer.optimizer)
-            if self.capture_optimizer
-            else None,
-            "adapters": snapshot_adapters(unwrap(self.trainer.model), expert_lora=self.expert_lora)
-            if self.expert_lora is not None
-            else None,
-            **self.extra(),
-        }
-
-    def on_save(self, args, state, control, **kwargs):
-        if self.event == "save":
-            self._capture(state)
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        if self.event == "train_begin":
-            self._capture(state)
 
 
 def logged_lrs(trainer) -> dict[int, float]:

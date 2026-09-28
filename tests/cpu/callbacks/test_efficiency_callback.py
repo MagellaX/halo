@@ -2,12 +2,16 @@
 """Tests for EfficiencyCallback. Run: python tests/cpu/callbacks/test_efficiency_callback.py"""
 
 import logging
-import sys
 
 import pytest
 import torch
 
 from src.callbacks import efficiency
+from src.callbacks.efficiency import _PRECISION_KEY_BY_LOWP, EfficiencyCallback, _detect_precision
+from src.callbacks.model_flops import _is_expert_param, compute_expert_params, estimate_linear_flops_per_token
+from src.distributed.parallelism_config import LOWP_PRECISIONS
+from src.hardware import GPU_PEAK_FLOPS, _classify_gpu_name, get_gpu_peak_flops
+from src.models.moe_balancing import detect_moe_experts_topk
 from tests.common.parallelism import make_parallelism_config
 
 # Single-process topology: a test that exercises no parallel axis still owes the callback a real
@@ -88,8 +92,6 @@ class MockTrainerState:
 
 
 def test_classify_gpu_name():
-    from src.hardware import _classify_gpu_name
-
     cases = [
         ("NVIDIA H100 80GB HBM3", "H100_SXM"),
         ("NVIDIA H100 PCIE", "H100_PCIE"),
@@ -107,40 +109,30 @@ def test_classify_gpu_name():
 
 
 def test_detect_precision_bf16_arg():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs(bf16=True)
     model = MockModel()
     assert _detect_precision(model, args) == "bf16"
 
 
 def test_detect_precision_fp16_arg():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs(fp16=True)
     model = MockModel()
     assert _detect_precision(model, args) == "fp16"
 
 
 def test_detect_precision_tf32_arg():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs(tf32=True)
     model = MockModel()
     assert _detect_precision(model, args) == "tf32"
 
 
 def test_detect_precision_model_dtype():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs()
     model = MockModel(dtype=torch.bfloat16)
     assert _detect_precision(model, args) == "bf16"
 
 
 def test_detect_precision_param_fallback():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs()
     p = MockParam(100, dtype=torch.float16)
     model = MockModel(named_params=[("w", p)])
@@ -150,8 +142,6 @@ def test_detect_precision_param_fallback():
 
 
 def test_detect_precision_empty_model():
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs()
     model = MockModel()  # no dtype, no params
     result = _detect_precision(model, args)
@@ -166,8 +156,6 @@ def test_detect_precision_fp32_is_tf32_aware():
     true-fp32 peak then yields MFU > 100% (the achieved TF32 FLOPs exceed the fp32
     peak). 'highest' is true fp32; 'medium' uses bf16.
     """
-    from src.callbacks.efficiency import _detect_precision
-
     args = MockTrainingArgs()
     model = MockModel(dtype=torch.float32)
     prev = torch.get_float32_matmul_precision()
@@ -187,9 +175,6 @@ def test_detect_precision_fp32_is_tf32_aware():
 def test_every_low_precision_mode_has_a_peak_key():
     """A ``lowp_precision`` the peak table does not spell falls back to the parameter dtype — i.e.
     silently to the bf16 peak, the very mis-scaling the map exists to prevent, one mode later."""
-    from src.callbacks.efficiency import _PRECISION_KEY_BY_LOWP
-    from src.distributed.parallelism_config import LOWP_PRECISIONS
-
     assert set(_PRECISION_KEY_BY_LOWP) == set(LOWP_PRECISIONS) - {"bf16"}
 
 
@@ -204,8 +189,6 @@ def test_low_precision_compute_scores_against_its_own_peak(monkeypatch, lowp_pre
     from the parameter dtype charges an fp8 run against the bf16 peak and every reported utilization
     reads ~2x high (4x for fp4). nvfp4 and mxfp4 share the 4-bit MMA, hence one peak.
     """
-    from src.hardware import GPU_PEAK_FLOPS
-
     monkeypatch.setattr(efficiency, "detect_gpu_model", lambda: "B300")
     callback = efficiency.EfficiencyCallback(
         make_parallelism_config(world_size=1, gpus_per_node=1, lowp_precision=lowp_precision)
@@ -233,15 +216,11 @@ def test_a_detected_gpu_without_a_peak_for_the_precision_warns(monkeypatch, capl
 
 
 def test_get_gpu_peak_flops():
-    from src.hardware import get_gpu_peak_flops
-
     assert get_gpu_peak_flops("A100", "fp8") is None  # No FP8 on Ampere
     assert get_gpu_peak_flops("Unknown", "bf16") is None
 
 
 def test_is_expert_param():
-    from src.callbacks.model_flops import _is_expert_param
-
     # EP fused expert params -- True
     assert _is_expert_param("model.layers.0.mlp.gate_up_proj") is True
     assert _is_expert_param("model.layers.0.mlp.down_proj") is True
@@ -279,8 +258,6 @@ def test_is_expert_param():
 
 
 def test_detect_moe_config_num_local_experts():
-    from src.models.moe_balancing import detect_moe_experts_topk
-
     config = MockConfig(num_local_experts=32, num_experts_per_tok=4)
     model = MockModel(config=config)
     ne, tk = detect_moe_experts_topk(model)
@@ -289,8 +266,6 @@ def test_detect_moe_config_num_local_experts():
 
 
 def test_detect_moe_config_num_experts():
-    from src.models.moe_balancing import detect_moe_experts_topk
-
     config = MockConfig(num_experts=16, top_k=2)
     model = MockModel(config=config)
     ne, tk = detect_moe_experts_topk(model)
@@ -299,8 +274,6 @@ def test_detect_moe_config_num_experts():
 
 
 def test_detect_moe_config_no_moe():
-    from src.models.moe_balancing import detect_moe_experts_topk
-
     config = MockConfig(hidden_size=4096)  # no MoE attrs
     model = MockModel(config=config)
     ne, tk = detect_moe_experts_topk(model)
@@ -308,30 +281,24 @@ def test_detect_moe_config_no_moe():
 
 
 def test_detect_moe_config_no_config():
-    from src.models.moe_balancing import detect_moe_experts_topk
-
     model = MockModel()  # no config attribute at all
     model.config = None
     ne, tk = detect_moe_experts_topk(model)
     assert ne == 0 and tk == 0, f"Expected (0, 0), got ({ne}, {tk})"
 
 
-def test_estimate_model_flops():
-    from src.callbacks.model_flops import estimate_model_flops_per_token
-
+def test_estimate_linear_flops():
     # 1B trainable params -> 6e9 flops per token
     num_params = 1_000_000_000
     # Create a single large parameter to represent ~1B params
     # We use a small tensor but override numel via a wrapper
     p = MockParam(num_params, dtype=torch.bfloat16, requires_grad=True)
     model = MockModel(named_params=[("weight", p)])
-    flops = estimate_model_flops_per_token(model)
+    flops = estimate_linear_flops_per_token(model)
     assert flops == 6 * num_params, f"Expected {6 * num_params}, got {flops}"
 
 
 def test_compute_expert_params():
-    from src.callbacks.model_flops import compute_expert_params
-
     expert_p1 = MockParam(1000, requires_grad=True)
     expert_p2 = MockParam(2000, requires_grad=True)
     shared_p = MockParam(500, requires_grad=True)
@@ -349,8 +316,6 @@ def test_compute_expert_params():
 
 
 def test_efficiency_callback_init():
-    from src.callbacks.efficiency import EfficiencyCallback
-
     parallelism = make_parallelism_config(ep_size=2, tp_size=2)
     cb = EfficiencyCallback(
         parallelism,
@@ -363,8 +328,6 @@ def test_efficiency_callback_init():
 
 
 def test_warmup_skipping():
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM, n_warmup_steps=5)
     cb.state.global_start_step = 0
 
@@ -378,41 +341,39 @@ def test_warmup_skipping():
     assert cb.state.elapsed_step == 0, f"Expected elapsed_step=0 during warmup, got {cb.state.elapsed_step}"
 
 
-# Core accounting: estimate_model_flops_per_token, MFU, S-MFU, throughput.
+# Core accounting: FLOPS/token, MFU, S-MFU, throughput.
 # These pin the *values* of the numbers the callback reports to wandb.
 
 
 def test_estimate_model_flops_includes_attention():
     """6N param term PLUS the 12*L*S*H attention term when a config is present."""
-    from src.callbacks.model_flops import estimate_model_flops_per_token
-
     n_params = 1_000_000
     p = MockParam(n_params, requires_grad=True)
     config = MockConfig(num_hidden_layers=4, hidden_size=128)
     model = MockModel(named_params=[("w", p)], config=config)
 
     seq_len = 512
-    flops = estimate_model_flops_per_token(model, seq_length=seq_len)
+    cb = EfficiencyCallback(_NO_PARALLELISM)
+    cb._initialize_model_flops(model, seq_len)
+    flops = cb.state.model_flops_per_token
     expected = 6 * n_params + 12 * 4 * seq_len * 128
     assert flops == expected, f"expected {expected}, got {flops}"
 
 
 def test_estimate_model_flops_config_fallback():
     """When param counting yields zero AND no requires_grad params, fall to 6N over all params."""
-    from src.callbacks.model_flops import estimate_model_flops_per_token
-
     # All params frozen → requires_grad sum is 0, falls to all-params sum.
     p = MockParam(2000, requires_grad=False)
     model = MockModel(named_params=[("w", p)], config=MockConfig())
-    flops = estimate_model_flops_per_token(model, seq_length=128)
+    cb = EfficiencyCallback(_NO_PARALLELISM)
+    cb._initialize_model_flops(model, 128)
+    flops = cb.state.model_flops_per_token
     # No num_hidden_layers/hidden_size on the bare config → 0 attention flops.
     assert flops == 6 * 2000
 
 
 def test_compute_mfu_value():
     """MFU% = (tokens * flops_per_token / step_time) / peak * 100, exactly."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM)
     cb.state.model_flops_per_token = 6.0e9  # 6 GFLOP/token
     cb.state.gpu_peak_flops = 1.0e15  # 1 PFLOP/s
@@ -431,8 +392,6 @@ def test_compute_mfu_value():
 
 def test_compute_mfu_distributed_efficiency():
     """params_ratio > 1.05 turns MFU into a distributed-efficiency speedup figure."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM)
     cb.state.model_flops_per_token = 6.0e9
     cb.state.gpu_peak_flops = 1.0e15
@@ -446,8 +405,6 @@ def test_compute_mfu_distributed_efficiency():
 
 def test_compute_mfu_zeroed_when_unconfigured():
     """No peak flops / no model flops → all MFU fields zeroed (not stale)."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM)
     cb.state.model_flops_per_token = None
     cb.state.gpu_peak_flops = None
@@ -458,8 +415,6 @@ def test_compute_mfu_zeroed_when_unconfigured():
 
 def test_compute_smfu_sparse_value():
     """S-MFU uses the active (sparse) flops/token, which is lower than dense MFU."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM)
     cb.state.active_model_flops_per_token = 1.5e9  # quarter of the dense below
     cb.state.gpu_peak_flops = 1.0e15
@@ -473,8 +428,6 @@ def test_compute_smfu_sparse_value():
 
 def test_compute_token_metrics_per_gpu_and_cluster(monkeypatch):
     """Per-GPU tokens = cluster/world; cluster tokens = per_gpu * data_parallel_size * cp."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(make_parallelism_config(tp_size=2, world_size=4, gpus_per_node=4))
     cb.training_args = MockTrainingArgs()
     # Pretend world_size is 4 (no real dist init → patch the helper).
@@ -496,8 +449,6 @@ def test_compute_token_metrics_per_gpu_and_cluster(monkeypatch):
 
 def test_compute_token_metrics_cp_divides_per_gpu(monkeypatch):
     """Under CP the Trainer over-counts (full sequence per rank) → divide by cp_size."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(make_parallelism_config(cp_size=2, world_size=4, gpus_per_node=4))
     cb.training_args = MockTrainingArgs()
     monkeypatch.setattr(efficiency, "get_global_world_size", lambda: 4)  # dp = 4 / cp(2) = 2
@@ -515,8 +466,6 @@ def test_compute_token_metrics_cp_divides_per_gpu(monkeypatch):
 
 def test_on_log_gates_diagnostics():
     """MFU diagnostics stay OUT of the headline log unless report_mfu_diagnostics=True."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM, n_warmup_steps=0)
     cb.state.global_start_step = 0
     cb.tps.step_tokens_per_second = 1234.0
@@ -536,15 +485,12 @@ def test_on_log_gates_diagnostics():
 def test_initialize_metrics_survives_unmeasurable_model():
     """A model the estimator cannot measure disables MFU instead of killing the run.
 
-    ``estimate_model_flops_per_token`` fails loud (no parameters AND no hidden_size /
+    ``estimate_linear_flops_per_token`` fails loud (no parameters AND no hidden_size /
     num_hidden_layers in the config); the callback is observability, so it must degrade.
     """
-    from src.callbacks.efficiency import EfficiencyCallback
-    from src.callbacks.model_flops import estimate_model_flops_per_token
-
     shell = MockModel(named_params=[], config=MockConfig(model_type="mystery"))
     with pytest.raises(ValueError):  # the estimator itself stays fail-loud
-        estimate_model_flops_per_token(shell)
+        estimate_linear_flops_per_token(shell)
 
     cb = EfficiencyCallback(_NO_PARALLELISM)
     cb.model_ref = shell
@@ -556,8 +502,6 @@ def test_initialize_metrics_survives_unmeasurable_model():
 
 def test_initialize_metrics_measures_normal_model():
     """The degrade path must not swallow the normal case: a countable model still gets FLOPS/token."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     model = MockModel(
         named_params=[("model.layers.0.self_attn.q_proj.weight", MockParam(1_000_000))],
         config=MockConfig(hidden_size=128, num_hidden_layers=2),
@@ -572,8 +516,6 @@ def test_initialize_metrics_measures_normal_model():
 
 def test_on_log_skips_during_warmup():
     """Within the warmup window on_log emits nothing."""
-    from src.callbacks.efficiency import EfficiencyCallback
-
     cb = EfficiencyCallback(_NO_PARALLELISM, n_warmup_steps=3)
     cb.state.global_start_step = 0
     cb.tps.step_tokens_per_second = 999.0
@@ -584,4 +526,4 @@ def test_on_log_skips_during_warmup():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -126,7 +126,7 @@ EP distributes experts; DP = world_size = 8. Small-batch pure EP is **communicat
 
 Rows are the grouped-GEMM path (default); the ep1 rows here hold experts replicated per rank (`fsdp_shard_ep1_experts: false`) — the fixed config the b1 golden baselines in `tests/baselines/` measure. Nothing reads those files automatically: `tokens_per_second` and `peak_allocated_gb` are diffed by hand ([Golden performance baselines](../contributing/README.md#golden-performance-baselines)).
 
-`fsdp_shard_ep1_experts` (the ep1 default) shards the replicated experts across the DP group, cutting ep1 b1 to **8,414 tok/s/GPU · 60.3 GB** (−59% memory for −10.6% throughput at b1; the all-gather overlaps better at larger batch — −3.5% at b4) — the dense-EP1 config in the [achieved-TFLOPS table](#maximizing-achieved-tflops).
+`fsdp_shard_ep1_experts` (the ep1 default) shards the replicated experts across the DP group, cutting ep1 b1 to **8,414 tok/s/GPU · 60.3 GB** (−59% memory for −10.5% throughput at b1; the all-gather overlaps better at larger batch — −3.5% at b4) — the dense-EP1 config in the [achieved-TFLOPS table](#maximizing-achieved-tflops).
 
 Grouped beats the per-expert loop (`use_grouped_gemm: false`) at low EP and at high EP up to moderate batch; the loop edges ahead only at high EP with large batches. The crossover is set by local experts per rank, modulated by batch — the authoritative A/B is in [grouped-gemm](grouped-gemm.md#when-the-loop-path-wins).
 
@@ -161,7 +161,7 @@ On one 8-GPU node, full-EP (`ep8`) combines with `tp2`, `tp4`, or `tp8` (all val
 
 Achieved TFLOPS rises with sequence length (amortizes the TP all-gather/reduce-scatter). TP width is a minor lever: at s4096 the three widths are within ~1% (`ep8tp2` 7,715 ≈ `ep8tp4` 7,714 > `ep8tp8` 7,641 tok/s/GPU); at s16384 `ep8tp4` leads (10,009 vs `ep8tp2` 9,559, `ep8tp8` 9,557).
 
-### Why MoE utilization reads low {#why-moe-utilization-reads-low}
+### Why MoE utilization reads low
 
 It is not idle hardware. gpt-oss-20b fires top-4 of 32 experts (3.5B active of 20.7B), so a sparse MoE cannot
 approach a dense model's plain MFU. Higher EP also shrinks `N_local` (ep2 = 11.36B → ep8 = 4.19B) at similar
@@ -184,8 +184,9 @@ Keep more params local (low EP), then drop GC if activations fit, then add batch
 | qwen3.5-35b-a3b | ep8 | b8, s4096 | 10,012 | 396 | 132.9 GB |
 
 - **Local params decide the ceiling.** ep1 keeps all 20.7B local and tops the table; ep2 ~11.4B; ep8 ~4.2B;
-  qwen3.5-35b ep2 ~17.5B. Choose the lowest EP that fits. (The ep1 row counts every local expert as active,
-  so it over-reads as a utilization fraction for sparse MoE.)
+  qwen3.5-35b ep2 ~17.5B. Choose the lowest EP that fits. (The ep1 rows count every local expert as active,
+  so their TFLOPS are nominal — above what the silicon can issue — and over-read as a utilization fraction
+  for sparse MoE.)
 - **Sequence length raises ep8's floor** but does not close the gap to ep1/ep2 — ep8 is the memory topology.
 - **Drop GC where activations fit** — the largest single throughput lever. Past the GC-off memory wall, the
   largest batch that fits under GC-on is the recipe.
@@ -212,7 +213,7 @@ construction.
 5. **Measure**: `enable_efficiency_metrics: true` logs per-step tokens/s/GPU (add
    `report_mfu_diagnostics: true` for achieved-TFLOPS and S-MFU); sweep `(seq, batch)` until it plateaus.
 
-### Where the EP step's time goes (gpt-oss-20b ep8, b1/s4096, 8× B300, FA4) {#measured-bottleneck-case-study--gpt-oss-20b-ep-on-8-b300}
+### Where the EP step's time goes (gpt-oss-20b ep8, b1/s4096, 8× B300, FA4)
 
 The per-MoE-layer CUDA self-time at b1/s4096 (serialized attribution via `benchmark_sft_ep.py --comm_profile`) is **dispatch all-to-all 88%, expert GEMM 6.6%, combine all-to-all 5.5%** — communication is ~93% of the layer step.
 
@@ -234,15 +235,15 @@ Raising batch or sequence grows the compute term against the fixed comm cost; th
 | flex attention | 1,916 | 0.19× | FA4 ~5.2× faster; flex runs the unfused math path |
 | fp8 / fp4 | net-slower | — | bf16 is the throughput path at these shapes ([low-precision](low-precision-moe-kernels.md)) |
 
-`sdpa` silently drops GptOss attention sinks, so `validate_attn_implementation` orders it below flex and FA
-in the fallback chain; use FA4 or flex.
+SDPA runs GptOss only with the sinks reset (the neutralized column contributes 0) and raises with live
+sinks ([Flash Attention](flash-attention.md#model-specific-handling)); use FA4.
 
 The roofline crossover (gpt-oss expert K=N=2880: weight-bandwidth-bound below ≈256–512 tokens/expert,
 compute-bound above; ridge AI ≈ 275 on B300) is why bf16 stays optimal: the small-`M` experts sit in the
 bandwidth-bound regime where fp8/fp4 quant overhead only loses.
 
-`CUDA_DEVICE_MAX_CONNECTIONS=1` (baked into the image) is free as a default: neutral on dense/ep2, **+9.7%
-on ep8** ([DeepEP](../infrastructure/deepep.md#environment-variables)).
+`CUDA_DEVICE_MAX_CONNECTIONS=1` (baked into the image) is a free default that helps wide EP
+([DeepEP](../infrastructure/deepep.md#environment-variables)).
 
 > **Profiling EP.** `torch.profiler` (CUPTI) does not complete a step of a multi-GPU EP run with Flash
 > Attention active (the FA4 CuTe-DSL JIT interacts badly with CUPTI). Use `--attn_implementation sdpa`, a
@@ -262,7 +263,9 @@ on ep8** ([DeepEP](../infrastructure/deepep.md#environment-variables)).
 
 † s65536 GC-on uses `ep_buffer_backend=legacy` (DeepEP CUDA-IPC). The default elastic transport completes the forward but its ep8 backward combine all-gather races the DeepEP NVLink barrier at 65,536 tokens/rank and faults (`symmetric.hpp` Cuda 719); legacy's token-count-independent intranode buffer trains it clean. s49152 trains on either transport.
 
-GC-off is +27–28% but ~2× memory; it fits to 16k (117 GB) and **does not fit 32k**. Use GC-off for max
+GC-off is +27–28% but ~2× memory; on the default elastic transport it fits to 16k (117 GB) and **does not
+fit 32k**, which `ep_buffer_backend: legacy` trains at 9,694 tok/s/GPU
+([Halo vs stock TRL](halo-vs-stock-trl.md#gradient-checkpointing-on-vs-off)). Use GC-off for max
 throughput at ≤16k; GC-on for long context — pure ep8 GC-on streams to 64k (135 GB) without Context
 Parallelism, tapering past 32k as the per-rank sequence grows.
 
@@ -283,7 +286,7 @@ GC-off: communication ≈93% @ s4096 → ≈88% @ s16384). Compute–comm overla
 | 8 | 1 | 6,401 | 253 | 41.1 GB | 0.64s |
 | 8 | 4 | 9,408 | 372 | 81.0 GB | 1.74s |
 
-ep2 keeps ~17.5B params local and reaches **1,410 TFLOPS at batch 4** — the highest of the MoE rosters here, consistent with [local params setting the ceiling](#maximizing-achieved-tflops). ep8 trades achieved TFLOPS for memory: 41 GB at batch 1 vs 128 GB for ep2. Batch is the dominant lever (ep2 b1→b4 = 2.1×; ep8 b1→b4 = 1.5×), since small-batch pure EP is all-to-all-bound.
+ep2 keeps ~17.5B params local and reaches **1,410 TFLOPS at batch 4** — the highest `ep ≥ 2` figure in the table, below only gpt-oss-20b at ep1, consistent with [local params setting the ceiling](#maximizing-achieved-tflops). ep8 trades achieved TFLOPS for memory: 41 GB at batch 1 vs 128 GB for ep2. Batch is the dominant lever (ep2 b1→b4 = 2.1×; ep8 b1→b4 = 1.5×), since small-batch pure EP is all-to-all-bound.
 
 At ep2 batch 4 the per-MoE-layer step splits ≈ **77% DeepEP dispatch all-to-all / 21% expert GEMM / 2% combine** (`--comm_profile`) — dispatch-bound on the top_k=8 token-count exchange. Raising sequence to 8192 amortizes the all-to-all to **13,484 tok/s/GPU** (b4).
 
@@ -316,7 +319,7 @@ Batch is the dominant lever — raise it with GC off while it fits (Qwen3-4B b1�
 
 ## Using EfficiencyCallback
 
-Set `enable_efficiency_metrics: true` in any YAML; every standard training script wires the callback through `build_perf_callbacks`, deriving EP/TP/CP sizes from `ParallelismConfig` and setting `include_num_input_tokens_seen="all"`. Off by default because multi-sequence trainers (DPO / SMPO / Reward / Distillation) report a misleading utilization. See [Performance & Balancing Flags](../reference/configuration-reference.md#performance-balancing-flags).
+Set `enable_efficiency_metrics: true` in any YAML; every standard training script wires the callback through `build_perf_callbacks`, deriving EP/TP/CP sizes from `ParallelismConfig` and setting `include_num_input_tokens_seen="all"`. Off by default because multi-sequence trainers (DPO / SMPO / Reward / Distillation) report a misleading utilization. See [Performance & Balancing Flags](../reference/configuration-reference.md#performance--balancing-flags).
 
 For benchmark scripts outside `build_perf_callbacks`, construct `EfficiencyCallback` directly (`src/callbacks/efficiency.py`) with the run's `ParallelismConfig` plus `num_full_model_params` (the expert count and top-k come from the model config); read `callback.tps.avg_tokens_per_second`, `callback.mfu.avg_tflops_per_sec`, `callback.memory.peak_allocated_gb`.
 

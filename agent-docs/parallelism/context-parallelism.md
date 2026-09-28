@@ -86,7 +86,7 @@ GLM-4 MoE Lite) — and calls FA2 instead (`model_fa4_backward_nan_prone`).
 Leave `attn_implementation` at its auto-detected default: CP calls the non-varlen forward, which FA2
 serves poorly on both architectures, and the arch-matched kernel is worth 1.2–3× at ≥32k tokens on
 B300. Bailing is the exception — it needs an explicit `sdpa`, since transformers refuses the
-auto-detected FA4 at model build and the CP loader has no SDPA retry.
+auto-detected FA4 at model build.
 
 **Head divisibility** — `cp_size` must divide both the Q and the KV head count. GPT-OSS (64 Q, 8 KV):
 CP=8 → 8 Q / 1 KV; CP=4 → 16 Q / 2 KV; CP=3 rejected.
@@ -166,13 +166,16 @@ model would pay that cost for no speedup. Dense models under CP get no EP config
 ```bash
 # CP-only (any supported model, long sequences)
 torchrun --nproc_per_node=4 scripts/training/sft.py \
-    examples/sft/qwen3/qwen3-4b-ultrachat.yaml --context_parallel_size=4
+    examples/sft/qwen3/qwen3-4b-ultrachat.yaml --context_parallel_size=4 --packing=false
 
-# EP+CP (MoE, ep_group_size must equal the NVLink domain)
+# EP+CP (MoE, node-local EP with ep_group_size equal to the NVLink domain)
 torchrun --nproc_per_node=8 scripts/training/sft.py \
     examples/sft/gptoss/gptoss-20b-multinode-ep.yaml \
-    --expert_parallel_size=8 --context_parallel_size=2
+    --expert_parallel_size=8 --ep_scope=node --context_parallel_size=2 --packing=false
 ```
+
+Both example configs set `packing: true` (refused under CP), and the gpt-oss one sets
+`ep_scope: global` (refused under CP), so the commands override them.
 
 Programmatic: `parallelism_config=ParallelismConfig(ep_size=8, cp_size=8)`.
 
@@ -216,7 +219,7 @@ Qwen3-8B, CP=2, seq 16384, 2 GPUs (Blackwell)). Use Liger (default on).
 **Trainers.** CP is declare-to-enable (`_supports_cp`, default `False`): only
 `DistributedSFTTrainer` and `SmoothMarginPOTrainer` declare it. Every other trainer raises at
 construction, and its entry script rejects `--context_parallel_size > 1` earlier through
-`parallelism_config_from_args(..., supports_cp=False)`. Full matrix:
+`parallelism_config_from_args(..., trainer_cls=...)`, which reads the same flag. Full matrix:
 [Trainer Compatibility](../reference/trainer-architecture.md#trainer-compatibility). Nothing
 inspects a trainer's loss for CP-safety, so a new trainer must verify its own objective before
 declaring the flag.

@@ -94,7 +94,15 @@ _SAFETENSORS_DTYPE_BYTES = {
 }
 
 
-def save_full_checkpoint(model, output_dir: str, processing_class=None, source_dir=None, **save_kwargs) -> None:
+def save_full_checkpoint(
+    model,
+    output_dir: str,
+    processing_class=None,
+    source_dir=None,
+    *,
+    include_resume_sidecars: bool = True,
+    **save_kwargs,
+) -> None:
     """``save_pretrained`` plus the non-weight files a conversion tool's output directory needs.
 
     Order matters: ``source_dir``'s non-weight files are carried over before the save so the live
@@ -107,6 +115,10 @@ def save_full_checkpoint(model, output_dir: str, processing_class=None, source_d
     first, because the recorded conversions carry quantizer rewrites ``save_pretrained`` cannot
     invert. ``source_dir`` doubles as the config schema source when the caller passes one.
 
+    ``include_resume_sidecars`` is :func:`~src.checkpoint.format.copy_checkpoint_aux_files`'s: a tool
+    whose output is a new base model rather than the source run's weights passes ``False``, so no
+    resume of that output restores the source run's state over it.
+
     Full-model saves only: an unmerged ``PeftModel`` save writes adapter files alone.
     """
     if is_peft_model(model):
@@ -118,7 +130,7 @@ def save_full_checkpoint(model, output_dir: str, processing_class=None, source_d
         _restore_pristine_weight_conversions(model)
     os.makedirs(output_dir, exist_ok=True)
     if source_dir is not None and os.path.isdir(source_dir):
-        copy_checkpoint_aux_files(source_dir, output_dir)
+        copy_checkpoint_aux_files(source_dir, output_dir, include_resume_sidecars=include_resume_sidecars)
     sanitize_generation_config(model)
     model.save_pretrained(output_dir, **save_kwargs)
     if not model.can_generate():
@@ -247,7 +259,6 @@ def finalize_merged_checkpoint(
     output_dir: str,
     shard_files: list[str],
     *,
-    kind: str,
     verbose: bool,
     delete_input_shards: bool,
 ) -> None:
@@ -269,7 +280,7 @@ def finalize_merged_checkpoint(
         if verbose:
             print(f"Deleted {len(shard_files)} input shard files (--delete_input_shards)")  # noqa: T201 — CLI-facing
 
-    print(f"\n✓ Merged {kind} checkpoint saved to: {output_dir}")  # noqa: T201 — CLI-facing
+    print(f"\n✓ Merged EP checkpoint saved to: {output_dir}")  # noqa: T201 — CLI-facing
 
 
 def reject_sharded_checkpoint(checkpoint_dir: str) -> None:
@@ -469,19 +480,32 @@ def _read_checkpoint_tensors(checkpoint_dir: str, wanted: Callable[[str], bool])
         return {}
 
 
+def detect_model_types(checkpoint_dir: str) -> list[str]:
+    """The ``model_type`` spellings a checkpoint's ``config.json`` declares, most specific first.
+
+    A composite (VLM) config nests the language model's under ``text_config``, and that is the family
+    fixing the expert layout, so it leads the top-level one. ``[]`` when the file is absent; an
+    unreadable one raises, since read as "no family" it would skip every family gate.
+    """
+    config_path = os.path.join(checkpoint_dir, CONFIG_NAME)
+    if not os.path.isfile(config_path):
+        return []
+    with open(config_path) as f:
+        config = json.load(f)
+    candidates = ((config.get("text_config") or {}).get("model_type"), config.get("model_type"))
+    return [candidate for candidate in candidates if candidate]
+
+
 def detect_model_type(checkpoint_dir: str) -> str:
-    """``config.model_type`` from a checkpoint's ``config.json`` (``""`` when absent or unreadable).
+    """``config.model_type`` from a checkpoint's ``config.json`` (``""`` when absent): the least
+    specific of :func:`detect_model_types`.
 
     Used by every family gate here, so a tool resolves the family the way the sharded merge does
     instead of sniffing key spellings. A composite VLM config with no top-level ``model_type`` falls
     back to its ``text_config``, where the language family lives.
     """
-    config_path = os.path.join(checkpoint_dir, CONFIG_NAME)
-    if not os.path.isfile(config_path):
-        return ""
-    with open(config_path) as f:
-        config = json.load(f)
-    return config.get("model_type") or config.get("text_config", {}).get("model_type", "") or ""
+    model_types = detect_model_types(checkpoint_dir)
+    return model_types[-1] if model_types else ""
 
 
 def checkpoint_shard_files(checkpoint_dir: str) -> list[str]:

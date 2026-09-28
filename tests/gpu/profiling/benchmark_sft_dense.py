@@ -38,18 +38,20 @@ Usage:
 """
 
 import sys
+import traceback
 
 import torch
 from accelerate import PartialState
 from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig
 
 from src.callbacks.efficiency import EfficiencyCallback
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.runtime import barrier
-from src.kernels.liger.orchestrator import apply_liger_kernel_for_direct_loading
+from src.kernels.liger.orchestrator import apply_liger_kernel
+from src.models.loading.model_preparation import finalize_liger_after_direct_load
 from src.trainers.sft import DistributedSFTTrainer
 from tests.common.benchmark_args import create_benchmark_parser, pp_topology_kwargs, resolve_benchmark_attn
 from tests.common.datasets import create_benchmark_dataset
@@ -164,6 +166,7 @@ def main() -> int:
             logging_steps=1,
             save_strategy="no",
             report_to="none",
+            logging_nan_inf_filter=False,
             max_length=args.seq,
             padding_free=args.padding_free,
             packing=args.packing,
@@ -213,10 +216,13 @@ def main() -> int:
             sft_config.use_liger_kernel = False  # Applied via load_distributed_model
         else:
             parallelism_config = ParallelismConfig(**pp_kwargs)
+            model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             # Apply Liger BEFORE model loading so RMSNorm/SwiGLU patches take effect
-            apply_liger_kernel_for_direct_loading(model_name, sft_config, trust_remote_code=True)
+            if use_liger:
+                apply_liger_kernel(model_config, liger_kernel_config=liger_kernel_config)
 
             load_kwargs = {
+                "config": model_config,
                 "dtype": torch.bfloat16,
                 "trust_remote_code": True,
                 "attn_implementation": resolve_benchmark_attn(model_name, args.attn_implementation),
@@ -229,13 +235,7 @@ def main() -> int:
                     bnb_4bit_use_double_quant=True,
                 )
             model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-
-        # FusedLinearCE: logits are None, need use_liger_kernel=True for TRL's
-        # entropy guard (skips logits access). The mixin defers the flag to
-        # prevent TRL from re-applying Liger to EP-wrapped modules.
-        if liger_kernel_config and liger_kernel_config.get("fused_linear_cross_entropy"):
-            sft_config.use_liger_kernel = True
-            sft_config.liger_kernel_config = liger_kernel_config
+            finalize_liger_after_direct_load(sft_config, use_liger, model)
 
         # Under PP the Liger class patches are already applied (direct loading above); TRL's
         # instance re-application would run on the pipeline stage module, so defer the flag —
@@ -304,8 +304,6 @@ def main() -> int:
         failed = True
         log(f"\nBENCHMARK FAILED: {e}")
         if rank == 0:
-            import traceback
-
             traceback.print_exc()
 
     finally:

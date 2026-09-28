@@ -6,8 +6,9 @@ CP is not supported: embedding models require full-sequence pooling.
 import dataclasses
 import inspect
 import json
+import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import sentence_transformers
@@ -15,10 +16,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
-from accelerate.logging import get_logger
 from datasets import Dataset, DatasetDict, IterableDataset
-from peft.tuners.lora import LoraLayer
+from peft import LoraConfig
+from peft.tuners.tuners_utils import BaseTunerLayer
+from safetensors.torch import save_file
 from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer
+from sentence_transformers.base.sampler import BatchSamplers
 from sentence_transformers.evaluation import SentenceEvaluator
 from sentence_transformers.losses import (
     AnglELoss,
@@ -33,6 +36,7 @@ from sentence_transformers.losses import (
     OnlineContrastiveLoss,
     TripletLoss,
 )
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import DataCollator
@@ -40,22 +44,48 @@ from transformers.trainer_callback import TrainerCallback
 from trl.trainer.utils import disable_dropout_in_model
 
 import src.trainers.embedding.sentence_transformers_compat  # noqa: F401  installs ST's gradient-checkpointing signatures
-from src.checkpoint.format import write_gathered_checkpoint
+from src.checkpoint.adapters import lora_scaling_mismatch, read_adapter_file
+from src.checkpoint.format import (
+    ADAPTER_SAFETENSORS_FILE,
+    RESUME_ADAPTER_DIR,
+    RESUME_ADAPTER_MARKER_FILE,
+    adapter_weight_paths,
+    missing_resume_adapter_reason,
+    resume_adapter_dir,
+    resume_adapter_on_own_weights_reason,
+    unmarked_merged_checkpoint_reason,
+    write_gathered_checkpoint,
+)
 from src.configs.embedding_config import EmbeddingConfig
 from src.distributed.checkpoint.context import CheckpointContext
-from src.distributed.checkpoint.save import save_checkpoint
-from src.distributed.checkpoint.write import gather_saveable_tensors
+from src.distributed.checkpoint.coordination import consensus_read
+from src.distributed.checkpoint.loader import CheckpointLoader, built_from_checkpoint, weights_read_from
+from src.distributed.checkpoint.save import mark_resume_adapter_complete, save_checkpoint
+from src.distributed.checkpoint.write import gather_saveable_tensors, resolve_retained
+from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.runtime import (
     barrier_on_exit,
+    broadcast_from_rank0,
+    copy_full_tensor,
     fs_aware_makedirs,
     fs_aware_save_rank,
+    is_global_main_process,
+    reject_across_ranks,
 )
+from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.config_levels import restore_special_token_ids
 from src.models.loading.tokenizer_setup import pristine_model_max_length
+from src.models.structure import (
+    lora_fold_targets,
+    lora_folded_data,
+    persistent_buffers,
+    strip_base_layer_segment,
+    tuner_adapter_param_ids,
+)
 from src.trainers.mixins.base import DistributedTrainerMixin
 
-logger = get_logger(__name__, log_level="INFO")
+logger = logging.getLogger(__name__)
 
 # Metric encoding is a diagnostic re-forward under no_grad; a full batch would double peak activations.
 _METRIC_MAX_SAMPLES = 256
@@ -105,35 +135,51 @@ def create_loss(model: SentenceTransformer, config: EmbeddingConfig) -> nn.Modul
     return loss
 
 
-def _merge_injected_lora_state_dict(state_dict: dict, scaling: float) -> dict:
-    """Fold ``inject_adapter_in_model`` LoRA into base weights within a gathered state dict.
+def _folded_backbone_items(backbone: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """The backbone's saveable tensors with its injected LoRA folded in, under the base model's names.
 
     The injected model is not a ``PeftModel``, so a plain save would write the adapter keys verbatim
-    and reload as random base weights. Emit plain ``<m>.weight = base + scaling * (B @ A)`` and drop
-    the adapter/base_layer keys. DoRA unsupported (non-linear magnitude reparam).
+    and reload as random base weights. Each base tensor a LoRA layer adapts is folded out of place
+    with PEFT's merge (:func:`~src.models.structure.lora_folded`), the tensors the tuner layers own are
+    dropped (by identity, so a backbone's own ``lora_``-named parameters stay) and ``base_layer`` is
+    spelled out, one tensor at a time. Under FSDP2 each fold is a DTensor collective, issued in
+    ``named_parameters`` order on every rank.
     """
-    if any(".lora_magnitude_vector." in k for k in state_dict):
-        raise NotImplementedError("Merging DoRA adapters on save is not supported for embedding training.")
+    folds = lora_fold_targets(backbone)
+    adapters = tuner_adapter_param_ids(backbone)
+    for name, param in backbone.named_parameters():
+        if id(param) not in adapters:
+            yield strip_base_layer_segment(name), lora_folded_data(param, folds)
+    for name, buffer in persistent_buffers(backbone):
+        yield strip_base_layer_segment(name), buffer
 
-    lora_a = {k.split(".lora_A.")[0]: v for k, v in state_dict.items() if ".lora_A." in k}
-    lora_b = {k.split(".lora_B.")[0]: v for k, v in state_dict.items() if ".lora_B." in k}
 
-    merged: dict[str, torch.Tensor] = {}
-    for k, v in state_dict.items():
-        if ".lora_A." in k or ".lora_B." in k:
-            continue
-        if k.endswith(".base_layer.weight"):
-            prefix = k[: -len(".base_layer.weight")]
-            w = v
-            if prefix in lora_a and prefix in lora_b:
-                delta = scaling * (lora_b[prefix].float() @ lora_a[prefix].float())
-                w = (v.float() + delta).to(v.dtype)
-            merged[f"{prefix}.weight"] = w
-        elif k.endswith(".base_layer.bias"):
-            merged[f"{k[: -len('.base_layer.bias')]}.bias"] = v
-        else:
-            merged[k] = v
-    return merged
+def _trainable_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
+    """The tensors an injected-LoRA run trains, which its fold cannot give back: every parameter with
+    ``requires_grad``, the same set the optimizer steps. Structural, so rank-uniform in name and order."""
+    return {name: param.data for name, param in model.named_parameters() if param.requires_grad}
+
+
+def _resume_adapter_mismatch(saved: dict[str, torch.Tensor], live: dict[str, torch.Tensor], path: str) -> str | None:
+    """Why the resume adapter at ``path`` cannot restore ``live`` exactly, or None.
+
+    Names and full shapes must match one for one: a tensor left out would resume from
+    initialization, and ``copy_`` would broadcast a saved rank-1 adapter into a wider one.
+    """
+    missing = sorted(live.keys() - saved.keys())
+    unexpected = sorted(saved.keys() - live.keys())
+    reshaped = [
+        f"{name}: saved {tuple(saved[name].shape)}, live {tuple(live[name].shape)}"
+        for name in sorted(live.keys() & saved.keys())
+        if saved[name].shape != live[name].shape
+    ]
+    if not (missing or unexpected or reshaped):
+        return None
+    return (
+        f"the resume adapter at {path} does not match this run's trainable tensors (was the run "
+        f"relaunched with other lora_target_modules or lora_r?): missing {missing[:KEY_PREVIEW_COUNT]}, "
+        f"unexpected {unexpected[:KEY_PREVIEW_COUNT]}, reshaped {reshaped[:KEY_PREVIEW_COUNT]}"
+    )
 
 
 class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
@@ -182,6 +228,7 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
             dataset_presharded=dataset_presharded,
             moe_balancing=moe_balancing,
         )
+        self._reject_batch_sampler_on_toolkit_loader(args)
 
         if loss is None and model is not None and args is not None:
             loss = create_loss(model, args)
@@ -211,13 +258,33 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         self._in_eval_loop: bool = False
         self._eval_embedding_accum: dict[str, list[float]] = {}
         self._setup_distributed_modes()
+        self._validate_modules_outside_backbone()
         self._validate_injected_lora_parallelism()
+        self._validate_injected_lora_foldable()
+
+    def _reject_batch_sampler_on_toolkit_loader(self, args: EmbeddingConfig | None) -> None:
+        """Refuse a batch sampler the toolkit's loader would drop.
+
+        The runs :meth:`get_train_dataloader` hands to the mixin's DP-sharded loader (TP/ETP, a
+        pre-sharded dataset) batch a plain sampler and never read ``batch_sampler``, so
+        ``no_duplicates`` would let in-batch duplicates through as false negatives, silently.
+        """
+        if args is None or not self._needs_custom_dataloader():
+            return
+        if BatchSamplers(args.batch_sampler) is BatchSamplers.BATCH_SAMPLER:
+            return
+        raise ValueError(
+            f"batch_sampler: {BatchSamplers(args.batch_sampler).value} is not applied under tensor or "
+            "expert-tensor parallelism or on a pre-sharded dataset: those runs batch through the toolkit's "
+            "DP-sharded loader, which builds plain batches. Set batch_sampler: batch_sampler, or train on "
+            "plain DP / pure EP, where the sentence-transformers loader applies it."
+        )
 
     def _validate_injected_lora_parallelism(self) -> None:
         """Reject in-place-injected LoRA under EP, where the save path cannot fold it.
 
-        The injected-LoRA branch of :meth:`_save_distributed_embedding_model` merges the adapters out
-        of a plain gathered state dict, which under EP holds this rank's expert shards under their
+        The injected-LoRA branch of :meth:`_save_distributed_embedding_model` folds the adapters into
+        the backbone's own parameter walk, which under EP holds this rank's expert shards under their
         local names, producing a checkpoint no loader accepts. TP is rejected one level up by the
         mixin's LoRA gate. Runs after wrapping, on the live model.
         """
@@ -225,14 +292,65 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         if not config.is_ep_mode or not self._has_injected_lora():
             return
         raise ValueError(
-            "LoRA for embedding training is not supported with Expert Parallelism: the EP save path "
-            "gathers the expert layout directly and has no adapter-merge step, so the checkpoint "
-            "would carry adapter keys that reload as random base weights. Drop "
-            "--expert_parallel_size, or full fine-tune this model."
+            "LoRA for embedding training is not supported with Expert Parallelism (EP or expert-TP): the "
+            "save folds the adapters over the backbone's own parameters, which there hold this rank's "
+            "expert shards under their local names, so the checkpoint would load nowhere. Drop "
+            "--expert_parallel_size / --expert_tensor_parallel_size, or full fine-tune this model."
         )
 
+    def _validate_modules_outside_backbone(self) -> None:
+        """Refuse what the save and resume cannot carry outside the ``auto_model`` backbone.
+
+        Checkpoints fold and resume the backbone's adapters alone, so a tuner layer anywhere else is
+        refused. Under FSDP2, TP or EP the save also writes the other pipeline modules through their
+        own rank-local ``save()`` and resume restores the backbone alone, so a parameter outside it
+        that trains, or that FSDP2 sharded, is refused too; a frozen one FSDP2 leaves whole (a
+        dtype exclusion) passes. A single process and DDP save the whole pipeline. Structural, so
+        every rank raises alike.
+        """
+        model = self._top_level_model()
+        backbone = self._get_unwrapped_model()
+        backbone_modules = {id(module) for module in backbone.modules()}
+        tuners = [
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, BaseTunerLayer) and id(module) not in backbone_modules
+        ]
+        if tuners:
+            raise ValueError(
+                f"LoRA adapters outside the SentenceTransformer's transformer backbone ({tuners[:KEY_PREVIEW_COUNT]}): "
+                f"checkpoints fold and resume the backbone's adapters only, so these would leave the export "
+                f"and the resume state. Inject into model[0].auto_model, as the embedding script does."
+            )
+        config = self.parallelism_config
+        if not (self._fsdp_wrapped or config.is_tp_mode or config.is_ep_mode):
+            return
+        backbone_params = {id(param) for param in backbone.parameters()}
+        outside = [
+            name
+            for name, param in model.named_parameters()
+            if id(param) not in backbone_params and (param.requires_grad or isinstance(param.data, DTensor))
+        ]
+        if outside:
+            raise ValueError(
+                f"Parameters outside the SentenceTransformer's transformer backbone that train or that FSDP2 "
+                f"shards ({outside[:KEY_PREVIEW_COUNT]}) are not supported under FSDP2 (torchrun), TP or EP: "
+                f"the save writes their modules rank-locally, so a sharded one is saved as this rank's shard, "
+                f"and resume restores the backbone alone. Train this pipeline on a single GPU or with DDP "
+                f"(accelerate launch with a MULTI_GPU config)."
+            )
+
+    def _validate_injected_lora_foldable(self) -> None:
+        """Refuse an injected adapter the save cannot fold (:func:`~src.models.structure.lora_fold_targets`:
+        ``nn.MultiheadAttention`` LoRA, trainable tokens, a variant other than DoRA). Structural, so it
+        raises here on every rank rather than on the save rank alone at the first checkpoint, where its
+        peers would block in the save's next collective.
+        """
+        lora_fold_targets(self._get_unwrapped_model())
+
     def _get_unwrapped_model(self) -> nn.Module:
-        """Return the backbone the mixin needs (EP grad-norm, TP FSDP2 setup, etc.).
+        """The SentenceTransformer's transformer backbone (``auto_model``), for the backbone-specific
+        introspection the base contract limits this to; whole-model work uses ``_top_level_model``.
 
         SentenceTransformer is an ``nn.Sequential`` whose first module is the
         Transformer (carrying ``.auto_model``), followed by Pooling/Normalize.
@@ -248,25 +366,21 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         return super()._get_unwrapped_model()
 
     def _has_injected_lora(self, backbone: nn.Module | None = None) -> bool:
-        """True if ``inject_adapter_in_model`` added LoRA layers (in-place, so not a PeftModel)."""
+        """True if ``inject_adapter_in_model`` added tuner layers to the backbone (in place, so not a
+        PeftModel). Structural: a remote-code backbone's own ``lora_``-named parameters (jina's LoRA
+        parametrizations) are base weights, not injected adapters."""
         backbone = backbone if backbone is not None else self._get_unwrapped_model()
-        return any((".lora_A." in n) or (".lora_B." in n) for n, _ in backbone.named_parameters())
+        return any(isinstance(module, BaseTunerLayer) for module in backbone.modules())
 
-    def _lora_scaling(self, backbone: nn.Module) -> float:
-        """Active-adapter LoRA scaling read from a live LoraLayer (same factor the forward used).
-
-        Raises when no LoraLayer carries one: folding at a guessed 1.0 would export wrong merged
-        weights whenever ``lora_alpha != r``.
-        """
-        for module in backbone.modules():
-            if isinstance(module, LoraLayer) and getattr(module, "scaling", None):
-                adapters = list(module.active_adapters) or list(module.scaling.keys())
-                if adapters:
-                    return float(module.scaling[adapters[0]])
+    def _injected_lora_config(self) -> LoraConfig:
+        """The ``LoraConfig`` ``inject_adapter_in_model`` stamped on the module it injected into."""
+        for module in self._top_level_model().modules():
+            configs = getattr(module, "peft_config", None)
+            if isinstance(configs, dict) and isinstance(configs.get("default"), LoraConfig):
+                return configs["default"]
         raise RuntimeError(
-            "The backbone carries injected LoRA weights but no LoraLayer with an adapter scaling, so "
-            "the factor to fold them into the base weights is unknown; folding at 1.0 would export "
-            "wrong weights whenever lora_alpha != r."
+            "The backbone carries injected LoRA layers but no module holds the LoraConfig "
+            "inject_adapter_in_model stamps, so the scaling the adapters train at cannot be recorded."
         )
 
     def compute_loss(
@@ -459,6 +573,9 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         Single-GPU, DDP, accelerate-managed FSDP keep plain params → delegate to ST.
         """
         output_dir = output_dir or self.args.output_dir
+        # A forward's transient unsharded params predate the last optimizer step; the resume adapter
+        # written after this save reads the resharded ones, and the fold must read the same tensors.
+        reshard_fsdp2_modules(self._top_level_model())
         fs_aware_makedirs(output_dir)
 
         # align_special_tokens collapsed the backbone eos list at train start; the mixin restore covers one branch.
@@ -475,6 +592,119 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         # This override bypasses the mixin's sidecar; without it a resumed MoE run re-inits balancing.
         self._persist_router_balancing_biases(output_dir)
         self._mark_model_save_collectives_done()
+
+    def _save_merged_checkpoint_resume_adapter(self, checkpoint_dir: str) -> None:
+        """Write what an injected-LoRA checkpoint resumes from; the mixin's hook for any other run.
+
+        Every injected-LoRA save folds the adapters into the weights it writes, and a fold cannot
+        resume: it rounds the delta to the save dtype and leaves no adapter tensors for the restored
+        optimizer moments to belong to. Each training checkpoint therefore also carries the run's
+        trainable tensors unfolded, at their live dtype and under the top-level model's parameter
+        names, in :data:`~src.checkpoint.format.RESUME_ADAPTER_DIR`; each save rank writes the marker
+        the resume classifies on once its own copy is complete. With any older marker removed before
+        the save began (:func:`~src.distributed.checkpoint.save.remove_stale_resume_marker`), a failed
+        write leaves the checkpoint unmarked. The final ``save_model`` export carries neither.
+        Collective.
+        """
+        if not self._has_injected_lora():
+            super()._save_merged_checkpoint_resume_adapter(checkpoint_dir)
+            return
+        model = self._top_level_model()
+        reshard_fsdp2_modules(model)
+        is_save_rank = fs_aware_save_rank()
+        state = resolve_retained(_trainable_tensors(model).items(), retain=is_save_rank)
+        # The scaling the adapters trained at, which the resume holds its own to.
+        peft_config = self._injected_lora_config()
+        adapter_dir = os.path.join(checkpoint_dir, RESUME_ADAPTER_DIR)
+        fs_aware_makedirs(adapter_dir)
+        with barrier_on_exit():
+            if is_save_rank:
+                peft_config.save_pretrained(adapter_dir)
+                save_file(state, os.path.join(adapter_dir, ADAPTER_SAFETENSORS_FILE))
+        del state
+        mark_resume_adapter_complete(checkpoint_dir, is_save_rank=is_save_rank)
+
+    def _load_from_checkpoint(
+        self, resume_from_checkpoint: str, model: nn.Module = None, *, for_best_model: bool = False
+    ) -> None:
+        """Resume an injected-LoRA run from its checkpoint's resume adapter; the mixin's loader otherwise.
+
+        The checkpoint's weights are the fold and already hold the delta, so they are never read:
+        the run was rebuilt from the base with fresh adapters, and its trainable tensors are
+        restored exactly from :data:`RESUME_ADAPTER_DIR` before the optimizer state resumes onto
+        them. The marker is the verdict, decided on rank 0: a run without injected LoRA refuses a
+        marked checkpoint, and an injected-LoRA run refuses an unmarked one.
+        """
+        marked = broadcast_from_rank0(
+            is_global_main_process() and resume_adapter_dir(resume_from_checkpoint) is not None
+        )
+        if not self._has_injected_lora():
+            if marked:
+                raise ValueError(
+                    f"{resume_from_checkpoint} is an injected-LoRA checkpoint ({RESUME_ADAPTER_MARKER_FILE}): "
+                    f"it resumes by restoring {RESUME_ADAPTER_DIR}/ onto the base model, but this run trains "
+                    f"no injected adapters. Resume with the same use_peft / lora_* settings, or start a new "
+                    f"run from its folded weights (model_name_or_path: {resume_from_checkpoint}, without "
+                    f"resume_from_checkpoint)."
+                )
+            # The loader reshards what it is handed, the backbone; the FSDP2 root group is the whole
+            # SentenceTransformer, whose eval forward before a best-model load leaves it unsharded.
+            reshard_fsdp2_modules(self._top_level_model())
+            super()._load_from_checkpoint(resume_from_checkpoint, model, for_best_model=for_best_model)
+            return
+        if not marked:
+            raise ValueError(unmarked_merged_checkpoint_reason(resume_from_checkpoint))
+        self._restore_injected_lora(resume_from_checkpoint)
+        self._restore_router_balancing_biases(resume_from_checkpoint)
+
+    def _restore_injected_lora(self, checkpoint: str) -> None:
+        """Copy the resume adapter into the live trainable tensors, bit-exact at an unchanged dtype.
+
+        Refuses a model built from the checkpoint itself (its fold already holds the delta, so the
+        restored adapters would apply it twice), a marked checkpoint whose adapter file is absent,
+        an adapter trained at another LoRA scaling (:func:`~src.checkpoint.adapters.lora_scaling_mismatch`),
+        and a file whose tensors differ from the live trainable set in name or shape (another
+        ``lora_target_modules`` / ``lora_r``). Every verdict is rank-uniform. Each rank reads its own
+        node's copy; plain tensors restore from it, and FSDP2 DTensors take mesh rank 0's through
+        ``distribute_tensor``, a mesh collective issued in sorted key order on every rank.
+        """
+        adapter_dir = os.path.join(checkpoint, RESUME_ADAPTER_DIR)
+        # realpath resolves node-locally, so rank 0's verdict is the world's.
+        if broadcast_from_rank0(built_from_checkpoint(weights_read_from(self._get_unwrapped_model()), checkpoint)):
+            raise ValueError(resume_adapter_on_own_weights_reason(checkpoint))
+        saved, path = consensus_read(
+            adapter_weight_paths(adapter_dir), read_adapter_file, what="Resume adapter", checkpoint=checkpoint
+        )
+        if path is None:
+            raise RuntimeError(missing_resume_adapter_reason(checkpoint))
+        reject_across_ranks(
+            lora_scaling_mismatch(adapter_dir, self._injected_lora_config().to_dict()),
+            "Injected-LoRA resume",
+            ValueError,
+        )
+        model = self._top_level_model()
+        # Best-model loads follow an eval forward that left the FSDP2 tree unsharded.
+        reshard_fsdp2_modules(model)
+        live = _trainable_tensors(model)
+        reject_across_ranks(_resume_adapter_mismatch(saved, live, path), "Injected-LoRA resume", ValueError)
+        with torch.no_grad():
+            for name in sorted(live):
+                copy_full_tensor(live[name], saved[name])
+        del saved
+        if is_global_main_process():
+            logger.info(f"Restored {len(live)} injected-LoRA tensors from {path}")
+
+    def _checkpoint_loader(self) -> CheckpointLoader:
+        """The mixin's weight loader, re-pointed at the backbone the savers write.
+
+        Every save writes the ``auto_model`` backbone's names (:meth:`_checkpoint_context`), so a
+        loader handed the ``SentenceTransformer``, whose names carry its ``0.<module>.`` prefix, would
+        match none of them, and the FSDP2 / TP coverage gates would refuse every full fine-tune reload.
+        The optimizer store keeps the ``SentenceTransformer``, whose parameters the optimizer steps.
+        """
+        return CheckpointLoader(
+            dataclasses.replace(self._checkpoint_load_context(), model=self._get_unwrapped_model())
+        )
 
     def _checkpoint_context(self) -> CheckpointContext:
         """The mixin's context, re-pointed at the backbone.
@@ -495,8 +725,8 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
 
         Everything but in-place-injected LoRA goes through the shared ``save_checkpoint`` ladder, so
         embedding exports get the same save dtype, hub expert layout, shard size and ``.bin``
-        fallback as other trainers. Injected LoRA is not a ``PeftModel``, so its adapters must be
-        folded into the gathered dict before it is written.
+        fallback as other trainers. Injected LoRA is not a ``PeftModel``, so its adapters are folded
+        into the tensors as they are gathered (:func:`_folded_backbone_items`).
 
         Every branch gathers on every rank (collectives) and writes only on the save rank.
         """
@@ -507,9 +737,10 @@ class EmbeddingTrainer(DistributedTrainerMixin, SentenceTransformerTrainer):
         with barrier_on_exit():
             if self._has_injected_lora(backbone):
                 # Gather on all ranks (collective); only the writer retains (else N× host RAM per node).
-                state_dict = gather_saveable_tensors(backbone, retain=ctx.is_save_rank)
+                state_dict = gather_saveable_tensors(
+                    backbone, retain=ctx.is_save_rank, items=_folded_backbone_items(backbone)
+                )
                 if ctx.is_save_rank:
-                    state_dict = _merge_injected_lora_state_dict(state_dict, self._lora_scaling(backbone))
                     write_gathered_checkpoint(backbone, state_dict, output_dir, max_shard_size=ctx.max_shard_size)
                     if ctx.tokenizer is not None:
                         ctx.tokenizer.save_pretrained(output_dir)

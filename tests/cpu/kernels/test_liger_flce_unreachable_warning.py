@@ -11,13 +11,16 @@ fires spuriously, or the GRPO trainers stop declaring the flag that routes to it
 """
 
 import logging
-import sys
 from types import SimpleNamespace
 
 import pytest
 from accelerate import PartialState
 
 from src.kernels.liger.orchestrator import warn_if_flce_unreachable
+from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer
+from src.trainers.grpo.offline import OfflineGRPOTrainer
+from src.trainers.grpo.online import DistributedGRPOTrainer
+from src.trainers.mixins.base import DistributedTrainerMixin
 
 # The orchestrator logs through accelerate's rank-aware logger, which requires an initialized state.
 PartialState()
@@ -53,15 +56,10 @@ def test_silent_when_flce_not_applied(caplog, applied):
 def test_grpo_family_declares_the_flag():
     # The warning only reaches users through _setup_distributed_modes' gate on this flag; a trainer
     # silently dropping it re-opens the inert-FLCE trap.
-    from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer
-    from src.trainers.grpo.offline import OfflineGRPOTrainer
-    from src.trainers.grpo.online import DistributedGRPOTrainer
-    from src.trainers.mixins.base import DistributedTrainerMixin
-
     assert DistributedTrainerMixin._loss_outside_model_forward is False  # SFT-shaped trainers keep FLCE
     for trainer in (OfflineGRPOTrainer, DistributedGRPOTrainer, DistributedAsyncEnvironmentalGRPOTrainer):
         assert trainer._loss_outside_model_forward is True, trainer.__name__
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

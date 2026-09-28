@@ -13,7 +13,7 @@ use PEFT (``ref_model=None``) or ``precompute_ref_log_probs`` — the reference 
 Usage:
     # Text or VLM (auto-detected) — EP / TP via torchrun
     torchrun --nproc_per_node=8 scripts/training/preference/dpo.py \\
-        examples/preference/qwen3_5/dpo-qwen3.5-9b-tulu3-prefmix.yaml --expert_parallel_size=8
+        examples/preference/gptoss/dpo-gptoss-20b-tulu3-prefmix-ep.yaml
 
 Dataset: text → {"prompt", "chosen", "rejected"} message lists; VLM → the same plus an
 ``images``/``image`` column (TRL applies the chat template and threads pixel_values), or
@@ -25,7 +25,6 @@ from trl import DPOConfig, ModelConfig
 from src.args.distributed_args import DistributedArguments
 from src.args.dpo_args import DPOScriptArguments
 from src.data.sources.loading import alias_images_column
-from src.data.vlm import is_vlm_run
 from src.distributed.loading.frozen_models import load_reference_model_for_preference
 from src.distributed.loading.peft_setup import setup_peft_model
 from src.distributed.loading.vlm_setup import load_model_for_training
@@ -45,8 +44,8 @@ from src.training.script_runner import (
     load_script_datasets,
     padded_workload_attn_implementation,
     prepare_script_preference_data,
-    reject_images_under_text_only_model,
     reject_unsupported_args,
+    resolve_vlm_run,
     run_trainer,
 )
 
@@ -64,10 +63,25 @@ def main():
         dist_args,
         script_prefix="dpo",
         trainer_cls=DistributedDPOTrainer,
-        supports_cp=False,
         sync_tokens=("pad_token",),
     )
     parallelism_config = runtime.parallelism_config
+
+    ds, dataset_presharded = load_script_datasets(args, parallelism_config)
+    # Ahead of the dispatch: is_vlm_run reads images_field while TRL's vision probe reads the column
+    # name, so a declared column has to carry TRL's spelling before either verdict is taken.
+    ds = alias_images_column(ds, args.images_field, str(args.dataset))
+
+    # Vision routing keys on the dataset, not the model: natively-multimodal models train on text
+    # preference data through the normal text pipeline, and only an image-carrying dataset takes TRL's
+    # vision path. There the rows pass through untouched: TRL tokenizes them, auto-selects
+    # DataCollatorForVisionPreference and applies no hub-shape normalization of its own. Decided
+    # before the model load, which requires the checkpoint's processor for a vision run.
+    is_vlm_data = resolve_vlm_run(args, model_config, ds, text_only_model=dist_args.text_only_model)
+    if is_vlm_data:
+        # TRL's DataCollatorForVisionPreference templates the rows without `tools=`, so a declared
+        # tools column would survive the signature filter and render toolless.
+        reject_unsupported_args("DPO VLM mode", tools_field=args.tools_field)
 
     # --- Model (text or VLM, auto-detected); padded preference takes the shared padded-workload
     # backend (SDPA, dropped under live sinks). The reference load uses the same binding: a logratio
@@ -77,6 +91,7 @@ def main():
         model_config,
         dpo_config,
         parallelism_config,
+        vlm_run=is_vlm_data,
         attn_default=attn_default,
         reset_sinks=dist_args.reset_sinks,
         train_sinks=dist_args.train_sinks,
@@ -100,24 +115,9 @@ def main():
     )
 
     tokenizer = apply_max_length(dpo_config, args, model, tokenizer)
-    processing_class = install_resolved_tokenizer(processing_class, tokenizer, is_vlm)
+    processing_class = install_resolved_tokenizer(processing_class, tokenizer)
     log_model_info(model, tokenizer)
 
-    ds, dataset_presharded = load_script_datasets(args, parallelism_config)
-    reject_images_under_text_only_model(args, ds, text_only_model=dist_args.text_only_model)
-    # Ahead of the dispatch: is_vlm_run reads images_field while TRL's vision probe reads the column
-    # name, so a declared column has to carry TRL's spelling before either verdict is taken.
-    ds = alias_images_column(ds, args.images_field, str(args.dataset))
-
-    # Vision routing keys on the dataset, not the model: natively-multimodal models train on text
-    # preference data through the normal text pipeline, and only an image-carrying dataset takes TRL's
-    # vision path. There the rows pass through untouched: TRL tokenizes them, auto-selects
-    # DataCollatorForVisionPreference and applies no hub-shape normalization of its own.
-    is_vlm_data = is_vlm_run(args, model_config.model_name_or_path, ds, config=model.config)
-    if is_vlm_data:
-        # TRL's DataCollatorForVisionPreference templates the rows without `tools=`, so a declared
-        # tools column would survive the signature filter and render toolless.
-        reject_unsupported_args("DPO VLM mode", tools_field=args.tools_field)
     enforce_text_path_padding_side(tokenizer, is_vlm_data)
     train_dataset, eval_dataset, generate_callback = prepare_script_preference_data(
         args,
@@ -145,6 +145,8 @@ def main():
         processing_class=processing_class,
         peft_config=peft_config,
         callbacks=callbacks,
+        resume_checkpoint=runtime.resume_checkpoint,
+        policy_from_checkpoint=runtime.policy_from_checkpoint,
         **distributed_trainer_kwargs(args, dist_args, parallelism_config, dataset_presharded=dataset_presharded),
     )
     run_trainer(

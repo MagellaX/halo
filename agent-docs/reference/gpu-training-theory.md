@@ -1,6 +1,6 @@
 # GPU Training Theory
 
-Every "should I use X?" reduces to one question: which bottleneck does X attack, and is that the one you have? The **roofline** ([§2](#2-the-roofline-arithmetic-intensity-and-the-ridge-point)) answers it; [§3](#3-the-four-bottlenecks-a-step-can-hit) names the four bottlenecks a step can hit. The [Optimization](../optimization/README.md) pages each describe one lever — this page describes the machine they pull on.
+Every "should I use X?" reduces to one question: which bottleneck does X attack, and is that the one you have? The **roofline** ([§2](#2-the-roofline--arithmetic-intensity-and-the-ridge-point)) answers it; [§3](#3-the-four-bottlenecks-a-step-can-hit) names the four bottlenecks a step can hit. The [Optimization](../optimization/README.md) pages each describe one lever — this page describes the machine they pull on.
 
 **How to read it.** §1–§2 build the one tool the rest of the page uses (the roofline); §3–§8 apply it on a single GPU; §9 adds GPUs and the communication wall; §10–§11 cover inference vs training and how to measure your own step. Read in order once; afterwards §3's table and the [rules of thumb](#rules-of-thumb) are the index.
 
@@ -29,7 +29,7 @@ Two capabilities scale independently, and almost every performance question is w
 
 1. **Arithmetic throughput** (tensor cores): **~1818 TFLOP/s** bf16 measured on a large square GEMM (B300).
 
-    The die's architectural ceiling is 148 SMs x 2.032 GHz x 8192 FLOP/SM/clk = **2464 TFLOP/s**, so that measurement is 74% of what the silicon can physically issue — a normal large-GEMM cuBLAS efficiency. Any quoted bf16 figure above 2464 is impossible, whatever the benchmark claims.
+    The die's architectural ceiling is 148 SMs x 2.032 GHz x 8192 FLOP/SM/clk = **2464 TFLOP/s**, so that measurement is 74% of what the silicon can physically issue — a normal large-GEMM cuBLAS efficiency. No step executes more than 2464 bf16 TFLOP/s; a higher quoted figure counts FLOPs that never ran, like the nominal `6·N` achieved TFLOPS of a sparse MoE, which credits every local expert ([Throughput Benchmarks](../optimization/throughput-benchmarks.md#maximizing-achieved-tflops)).
 
 2. **Memory bandwidth** (HBM ↔ chip): ~6.6 TB/s (B300, large device-to-device copy).
 
@@ -54,7 +54,7 @@ A kernel therefore reaches its ceiling only once the problem is big enough to fi
 
 ---
 
-## 2. The roofline — arithmetic intensity and the ridge point {#2-the-roofline-arithmetic-intensity-and-the-ridge-point}
+## 2. The roofline — arithmetic intensity and the ridge point
 
 Everything below runs on one operation: the matrix multiply (**GEMM**) inside every linear layer. Its three dimensions recur on every page, so fix them now.
 
@@ -122,7 +122,7 @@ A step is thousands of kernels, and at any moment one of four resources limits i
 
 | Bottleneck | Signature | Lever |
 |---|---|---|
-| **Compute-bound** | tensor cores saturated, power near board limit | bigger dims, lower precision if it pays ([§7](#7-precision-low-precision-compute-and-bf16-numerics)) |
+| **Compute-bound** | tensor cores saturated, power near board limit | bigger dims, lower precision if it pays ([§7](#7-precision--low-precision-compute-and-bf16-numerics)) |
 | **Memory-bound** | high util %, **low power** (~50–70%), AI below ridge | move fewer bytes: **fusion**, **bigger M**, **flash attention** |
 | **Latency / launch-bound** | many tiny kernels, gaps between them | **batch** the work: grouped GEMM, CUDA graphs |
 | **Communication-bound** | GPUs idle on NCCL, util drops in bursts | bigger M, smaller parallel degree, compute–comm overlap |
@@ -181,7 +181,7 @@ A step leans on a handful of kernel kinds: standard matmuls (projections), fused
 - **CUTLASS** — open-source C++ GEMM building blocks for what cuBLAS doesn't ship: grouped GEMM, fused activations, block-scaled fp8/fp4. The bf16 grouped path (`torch.nn.functional.grouped_mm`) dispatches here.
 - **CuTe** — the layout abstraction inside CUTLASS 3.x; the **CuTe DSL** is its Python frontend, and FA4 is written in it.
 - **Triton** — a Python kernel DSL, easier than CUTLASS and right for elementwise/fusion (Liger is Triton). A hand-written Triton dense matmul tops out at ~0.6–0.7× cuBLAS on Blackwell: it cannot express the warp-specialized pipeline plus cluster MMA.
-- **DeepGEMM** — DeepSeek's fp8/fp4 grouped-GEMM library for MoE; the verdict on it waits for [§7](#7-precision-low-precision-compute-and-bf16-numerics).
+- **DeepGEMM** — DeepSeek's fp8/fp4 grouped-GEMM library for MoE; the verdict on it waits for [§7](#7-precision--low-precision-compute-and-bf16-numerics).
 
 ### Streams, launches, CUDA graphs
 
@@ -248,7 +248,7 @@ The versions are arch-tuning of one algorithm, each pairing the same math with i
 
 ---
 
-## 7. Precision — low-precision compute and bf16 numerics {#7-precision-low-precision-compute-and-bf16-numerics}
+## 7. Precision — low-precision compute and bf16 numerics
 
 ### When low-precision compute helps
 
@@ -280,7 +280,7 @@ DeepGEMM removes that wall (expert per token-row resolved on-device from an int3
 Training runs in bf16 rather than fp16 because gradients span an enormous dynamic range that fp16's narrow exponent overflows (fp16 needs loss scaling). bf16 keeps fp32's range and pays for it in precision, roughly 2 significant digits. That's survivable only because the precision-sensitive steps stay fp32:
 
 - **Reductions accumulate in fp32.** Summing thousands of bf16 numbers (softmax, RMSNorm denominator, loss, long dot product) would otherwise swamp the small terms. Tensor cores already accumulate every matmul in fp32 and round the result to bf16.
-- **The optimizer keeps the update honest.** A step often nudges a weight by less than the bf16 ULP (the gap between neighboring representable values), which round-to-nearest would drop. **AdamWBF16** uses stochastic rounding on the weight write and on the always-positive `exp_avg_sq`, where nearest-rounding also biased upward ~50%. [BF16 Optimizer](../optimization/bf16-optimizer.md).
+- **The optimizer keeps the update honest.** A step often nudges a weight by less than the bf16 ULP (the gap between neighboring representable values), which round-to-nearest would drop. **AdamWBF16** uses stochastic rounding on the weight write and on the always-positive `exp_avg_sq`, where nearest rounding biases the running variance by tens of percent ([BF16 Optimizer](../optimization/bf16-optimizer.md#stochastic-rounding)).
 
 **Master weights** are the textbook version of that second defense: keep the authoritative copy of every weight and both moments in fp32, and cast down to bf16 only for the forward and backward. That state costs 12 B/param, with the transient bf16 copy on top.
 
@@ -478,7 +478,7 @@ That is why low precision pays there: quantizing weights halves (fp8) or quarter
 | Low precision | mostly a *memory* lever; bf16 compute at these MoE shapes | a real *speed* lever |
 | Optimize | bigger M, fusion, GC trade-off, comm overlap | weight quant, KV compression, batching |
 
-Hence `scripts/after_training/quantize_to_lowp.py`, which converts a trained bf16 checkpoint to mxfp8/nvfp4: fp8/fp4 is an inference and memory capability here, and training stays bf16.
+Hence `scripts/after_training/quantize_to_lowp.py`, which converts a trained bf16 checkpoint to mxfp8/mxfp4/nvfp4: fp8/fp4 is an inference and memory capability here, and training stays bf16.
 
 ### RL is both at once
 

@@ -1,9 +1,9 @@
 # Architecture
 
 Halo extends HuggingFace — Transformers, Accelerate, TRL — with Expert, Context, Tensor, and
-Expert-Tensor parallelism plus alignment methods TRL does not ship (SMPO, Offline GRPO, Async GRPO
-with Environments). Every trainer subclasses a TRL, Transformers, or SentenceTransformers trainer
-and adds one mixin.
+Expert-Tensor parallelism plus alignment methods TRL does not ship (SMPO, Offline GRPO) and Async
+GRPO with Environments. Every trainer subclasses a TRL, Transformers, or SentenceTransformers trainer
+and adds `DistributedTrainerMixin`.
 
 The default save is a standard HuggingFace checkpoint and there is no Megatron conversion step; the
 one opt-in per-rank format (`save_sharded_ep`) needs a merge script before reload.
@@ -41,7 +41,7 @@ Leaf modules keep those imports one-way, each holding a contract several layers 
 | `src/models/segment_markers.py` | which families' conv / linear-attention mixers read per-document segment markers, the GatedDeltaNet kernel refusal, and the markers built from a row's `position_ids` | the collator factory, the packing and padding-free collators, and SMPO's padding-free forward |
 | `src/models/attention_layout.py` | per-layer attention cost rules off `layer_types` and head geometry — the MFU attention term | the token-metrics mixin and the efficiency callbacks |
 | `src/models/head_transform.py` | the head-path contract: each family's declared transform around `lm_head` (scale, softcap, vocabulary cut), verified against its own forward on a meta-device shell | the chunked GRPO log-prob sweep and the last pipeline stage, which apply the same verdict |
-| `src/checkpoint/format.py` | the on-disk checkpoint spellings, save-dtype casts, config/state-dict read-write — torch + safetensors only, no `torch.distributed` | the parallel save paths and the standalone `scripts/after_training/` tools |
+| `src/checkpoint/format.py` | the on-disk checkpoint spellings, save-dtype casts, config/state-dict read-write — torch, safetensors, transformers and `huggingface_hub`, no `torch.distributed` | the parallel save paths and the standalone `scripts/after_training/` tools |
 | `src/data/sources/paths.py` | S3 / Hub / local classification of a dataset source or destination, pure string rules | the loader, the preprocessing pipeline and the scripts — without a boto3 import |
 | `src/data/sources/dataset_cache.py` | the local cache-publish protocol (lock, completion marker, content fingerprint, atomic publish, stale-temp sweep) — `os`/`shutil`/`filelock`, the fetch injected | the S3 dataset cache and the per-shard cache of a sharded pre-processed dataset, so their crash and staleness semantics cannot drift |
 | `src/data/sources/s3_client.py` | the boto3 `S3Client`, the s3fs control-file reads and the default-bucket helpers | the loader, the preprocessing pipeline, `ShardedDatasetLoader`, the inference scripts and the `scripts/before_training/s3_datasets.py` CLI |
@@ -52,6 +52,7 @@ Leaf modules keep those imports one-way, each holding a contract several layers 
 | `src/data/vlm.py` | the VLM chat render, the processor call and the over-length refusal | the runtime collators, the offline bake and the run-intent probe, so a batch and a bake of one row tokenize identically |
 | `src/data/pipeline/preprocessed_metadata.py` | the `metadata.json` contract: the recorded `PreprocessingConfig`, the stamp and the compatibility verdicts | the training entry points and the loader, which read the stamp without importing the bake that wrote the rows |
 | `src/configs/rollout_config.py` | `RolloutConfig` | built by `AsyncTrainingConfig`, received pickled by the Ray rollout actors — keeping the Ray import out of `src.configs` |
+| `src/distributed/nccl/addresses.py` | host-address classification (`is_loopback`) — standard library only | the weight-sync clients and the Ray rollout actors — without pulling the client's torch, DTensor and NCCL transport into the actors |
 
 `src/distributed/runtime.py` therefore holds rank/world state, barriers, the cross-rank
 rejection/consensus seams, the process-group timeouts and DTensor resolution only; anything a
@@ -72,7 +73,7 @@ Thirteen trainers share this shape: SFT, SMPO, DPO, KTO, offline/online/async en
 online SDPG, teacher and self distillation, reward, classification, and
 embedding. All support EP, TP, and ETP. CP is limited to SFT and SMPO. PP is
 [not yet available in this release](../parallelism/pipeline-parallelism.md); `_supports_pp` marks
-SFT, SMPO, DPO, KTO, reward, classification, and offline GRPO for when it lands. The per-trainer
+SFT, SMPO, DPO, KTO, reward, classification, and offline GRPO. The per-trainer
 matrix and the reason behind each exclusion are in
 [Trainer Architecture](trainer-architecture.md#trainer-compatibility).
 
@@ -114,13 +115,14 @@ planner, fuser, per-family conversion/rename resolution.
 
 The FSDP2, HSDP, and TP axes ride a torch `DeviceMesh` (`src/distributed/mesh.py`); EP and CP use
 hand-built `dist.new_group` groups whose all-to-all patterns do not map to a mesh. The trainer reads
-every group through one `ParallelDims` view (`src/distributed/mesh.py`), and the bucketed
+the mesh groups (DP, TP) through the `ParallelDims` view (`src/distributed/mesh.py`) and the expert
+groups (dispatch, expert-TP, expert-replica) off `EPConfig`. The bucketed
 gradient all-reduce every post-backward sweep shares — deferred EP cross-replica, TP replicated,
 QLoRA — is a torch-only leaf (`src/distributed/grad_reduce.py`) that imports no parallelism
 implementation.
 
 Which axis combinations may run is an allowlist, not a denylist — see
-[Parallelism](../parallelism/README.md#communication-and-data-flow).
+[Parallelism](../parallelism/README.md#supported-combinations).
 
 ## A training step
 
@@ -138,7 +140,7 @@ load_distributed_model            src/distributed/loading/model_loading.py
    │  • load_pp_stage_model → this stage's decoder layers only (when pp_size > 1)
    ▼
 DistributedTrainerMixin._setup_distributed_modes
-   │  • FSDP2 fully_shard (EP modules in ignored_params)
+   │  • FSDP2 fully_shard (EP modules in ignored_params, except at ep_group_size == 1)
    │  • router/expert grad-sync hooks already attached at EP-wrapper construction (load);
    │    PEFT modules_to_save router copies re-hooked here
    ▼
@@ -159,13 +161,14 @@ error. See the [Configuration Guide](../getting-started/configuration.md).
 `resolve_attn_implementation` (`src/models/patches/attention.py`) auto-selects the attention
 backend from compute capability: `flash_attention_4` on SM100+ when `flash_attn.cute` imports,
 `flash_attention_3` on Hopper, FA2 otherwise. Per-model overrides then redirect the families whose
-head geometry or sinks a flash kernel cannot serve — Qwen3.5/3.6/Qwen3-Next, GLM-4 MoE Lite and
-Gemma4 to SDPA, DeepSeek-V4 to eager. See [Flash Attention](../optimization/flash-attention.md) for
-the per-model table and the reason behind each redirect.
+head geometry or sinks a flash kernel cannot serve; the per-model table and the reason behind each
+redirect are on [Flash Attention](../optimization/flash-attention.md).
 
 For MoE models the loader replaces each MoE block with the per-family EP wrapper holding this
 rank's expert slice. FSDP2 `fully_shard` then shards the non-expert params, with EP modules in
-`ignored_params` so their gradients sync through the manual hooks instead. Saving gathers the
+`ignored_params` so their gradients sync through the manual hooks instead — except at
+`ep_group_size == 1`, where `fsdp_shard_ep1_experts` (default on) has FSDP2 shard the experts too
+and its reduce-scatter is their only sync. Saving gathers the
 distributed shards back into a standard HuggingFace checkpoint — see
 [Checkpoints & Resume](checkpoints.md).
 

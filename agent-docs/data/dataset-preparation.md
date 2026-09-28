@@ -36,8 +36,8 @@ artifacts render no template and skip the render check entirely. A training conf
 
 `--mode` is validated on the config, not only by the CLI's choices: an unvalidated typo like `txt`
 falls through every `mode == "text"` branch and chat-templates a raw pretraining corpus. A knob belonging
-to the other mode (`--system-prompt` with `--mode text`, `--text-field` with `--mode chat`) is
-rejected rather than silently ignored; each field declares which modes consume it.
+to the other mode set to a non-default value (`--system-prompt` with `--mode text`, `--text-field` with
+`--mode chat`) is rejected rather than silently ignored; each field declares which modes consume it.
 
 Over-length rows are dropped, not truncated in `chat` and `--vlm` mode. `--mode text` instead
 truncates each document to `--max-length` (reserving the last slot for the appended EOS), unless
@@ -71,6 +71,7 @@ python scripts/before_training/prepare_dataset.py \
     --output "s3://bucket/preprocessed/my_dataset" \
     --model-name "Qwen/Qwen3-8B" \
     --max-length 8192 \
+    --test-size 0.01 \
     --num-shards 64 \
     --pack-sequences \
     --conversation-field prompt \
@@ -87,6 +88,11 @@ e.g. `HuggingFaceH4/ultrachat_200k@train_sft`), or a local path. `--output` acce
 `hf://org/name`, or a local path (add `--private` for a private Hub dataset). Only the explicit
 `hf://` prefix uploads to the Hub — unlike `--input`, a bare `org/name` output is a **local**
 directory, so a relative path such as `preprocessed/my_dataset` is never published.
+
+The output holds two splits, `train` and `test`. A multi-split input must carry `train`; with no
+`test` split its `validation` split is baked as `test`. Any other split (`validation` next to
+`test`, an `unsupervised` split) is left out, with a warning that names it. To prepare one of those,
+point `--input` at it with an `@split` suffix.
 
 **VLM mode** (`--vlm`, e.g. Qwen2.5-VL / Qwen3-VL; packing not supported) stores `input_ids` with
 vision placeholders expanded, `attention_mask`, `labels` (image tokens masked to -100),
@@ -120,9 +126,9 @@ artifact would carry `is_vlm: true` over rows holding no pixels, which training 
 |-----------|---------|-------------|
 | `--input`, `-i` | *required* | Input: S3 URI, Hub ID, or local path |
 | `--output`, `-o` | *required* | Output: S3 URI, `hf://org/name`, or local path |
-| `--model-name`, `-m` | *required* | Model name/path for the tokenizer |
+| `--model-name`, `-m` | *required* | Model name/path for the tokenizer; completion-only masking also reads its `config.json` for the turn-terminator ids, so it must be the model checkpoint, not a bare tokenizer |
 | `--max-length` | `8192` | Maximum sequence length |
-| `--trust_remote_code` / `--no-trust_remote_code` | `True` | Execute the tokenizer/processor's own code when loading it — on, the default every tool reading a local artifact shares ([Scripts](../reference/scripts-reference.md#input-guards)) |
+| `--trust_remote_code` / `--no-trust_remote_code` | `True` | Execute the checkpoint's own tokenizer/processor and config code when loading them — on, the default every tool reading a local artifact shares ([Scripts](../reference/scripts-reference.md#input-guards)) |
 | `--mode` | `chat` | `chat` = apply chat template to `--conversation-field` (SFT); `text` = raw-text causal-LM for (continued) pre-training (tokenize `--text-field`, append EOS per document). See [Pre-training](../training-methods/pretraining.md). |
 | `--text-field` | `text` | (mode=text) column holding raw text |
 | `--no-append-eos` | `False` | (mode=text) skip the per-document EOS appended to preserve document boundaries |
@@ -138,19 +144,32 @@ artifact would carry `is_vlm: true` over rows holding no pixels, which training 
 | `--vlm` | `False` | VLM mode (stores `pixel_values`, `image_grid_thw`) |
 | `--images-field` | `None` | (`--vlm`) column holding the row's image(s) for datasets that keep them outside the conversation; merged into the messages like the runtime path. An image column named by nothing is refused |
 | `--min-pixels` / `--max-pixels` | `None` | VLM image pixel bounds |
-| `--num-shards` | `1` | Number of shards (1 = no sharding) |
+| `--num-shards` | `1` | `1` writes an unsharded dataset that trains at any data-parallel size. Above `1` see [Sharded loading](#sharded-loading) |
 | `--num-proc` | `HALO_DATASET_NUM_PROC` | Processes for dataset map. Unset, it resolves per host to `max(1, min(cpu_count // 4, 4))`; set `HALO_DATASET_NUM_PROC` to pin one value across nodes, since HF keys its map cache on `num_proc` |
 | `--tokenizer-backend` | `hf` | `hf` = the model's tokenizer; `gigatoken` = Rust bulk encoder (see above) |
-| `--test-size` | `None` | Test split fraction (e.g. `0.01`), cut from `train`. Refused when the input already carries a `test`/`validation` split — point `--input` at the train split alone. Without it the output is train-only: a **sharded** output is then rejected at startup naming the missing split and the re-prepare fix, while an unsharded one loads with the first 100 train rows warned in as a placeholder test split. As one entry of a multi-pool `dataset:` list it instead contributes training rows only — the corpus test split comes from the entries that ship one, and the placeholder is the last resort for a corpus where none does |
+| `--test-size` | `None` | Test split fraction (e.g. `0.01`), cut from `train`. Refused when the input already carries a `test`/`validation` split — point `--input` at the train split alone. Without it (and without a `test` or `validation` split in the input) the output is train-only: an unsharded one trains with the first 100 train rows warned in as a placeholder test split, and `--num-shards` above `1` is refused before tokenization, since training rejects a sharded dataset with no test split |
 | `--pad-token` / `--eos-token` / `--bos-token` | `None` | Override pad / EOS / BOS token. Recorded in `metadata.json` and re-checked at training time |
 | `--chat-template` | `None` | Override chat template (Jinja2 string, or a path to a `.jinja`/`.jinja2`/`.j2` file). The resolved text is recorded and re-checked |
 | `--overwrite` | `False` | Replace an existing output. Only the local writer keeps the previous dataset intact through a failed publish (see below) |
 | `--dry-run` | `False` | Print the planned output paths and exit before the tokenizer or input dataset load — it validates nothing about the data |
 | `--private` | `False` | Make Hub dataset private |
-| `--hf-token` | `None` | Hub token for private repos |
+| `--hf-token` | `None` | Hub token for the `hf://` upload; the input and tokenizer loads use the ambient credentials (`HF_TOKEN` or the stored login) |
 | `-v`, `--verbose` | `False` | Verbose output |
 
 ## Output structure
+
+`--num-shards 1` (the default) writes a `DatasetDict.save_to_disk` directory with no shard index;
+every rank loads it whole and the DataLoader splits the rows by data-parallel rank:
+
+```text
+s3://bucket/preprocessed/dataset/
+├── metadata.json              # Preprocessing config and stats
+├── dataset_dict.json
+├── train/                     # Arrow files + dataset_info.json + state.json
+└── test/                      # only when the input has a test/validation split or --test-size is set
+```
+
+`--num-shards > 1` writes per-split shards and a shard index:
 
 ```text
 s3://bucket/preprocessed/dataset/
@@ -194,9 +213,10 @@ interrupted upload reads as *raw* (a loud failure) rather than as a silently tru
 dataset. The S3 writer never clears the prefix up front: it overwrites objects in place and sweeps
 the ones the new tree does not carry only after the upload completed.
 
-A dataset published to `hf://org/name` is detected and loaded back as preprocessed (the Hub is probed
-for `metadata.json`), so the documented Hub output round-trips into training. Sharded loading is S3
-and local only: a Hub-published dataset loads whole on every rank whatever `--num-shards` was.
+Training does not read a Hub-published dataset in place: `load_dataset` on a saved tree returns its
+sidecar files as rows, so a preprocessed dataset named by its Hub id (`org/name`) is refused at startup.
+Download it first (`hf download org/name --repo-type dataset --local-dir <dir>`) and point `dataset:`
+at the directory.
 
 ## Sharded loading
 

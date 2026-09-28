@@ -47,10 +47,10 @@ Source of truth: `MOE_LAYER_MAP` in `src/distributed/expert_parallel/patching.py
 
     Expert LoRA is rejected with `expert_tp_size > 1`. The grouped adapters honor `r` / `alpha` /
     `dropout` / `use_rslora`, with `r` a multiple of 8 — the grouped GEMM's stride contract
-    ([PEFT](../optimization/peft.md#moe-models-expert-targets-and-full-trained-modules)); knobs with
+    ([PEFT](../optimization/peft.md#moe-models--expert-targets-and-full-trained-modules)); knobs with
     no grouped implementation (`use_dora`,
     `lora_target_parameters`) are rejected rather than applied to the attention half alone. See
-    [PEFT](../optimization/peft.md#moe-models-expert-targets-and-full-trained-modules).
+    [PEFT](../optimization/peft.md#moe-models--expert-targets-and-full-trained-modules).
 
 ### Per-family EP restrictions
 
@@ -134,7 +134,7 @@ Safe single-node pure-EP shapes — one group, or 2-rank groups:
 - **`ep_size == 2`** → many 2-rank groups, clean.
 
 The only 4-way expert split left on 8 GPUs is EP+**ETP** (`ep4 + etp2`), which the gate accepts
-because `ep_group_size` then fills the domain, and which is GPU-validated
+because `ep_group_size` then fills the domain; the GPU test matrix runs `ep2 + etp4` instead
 ([ETP validation rules](expert-tensor-parallelism.md#validation-rules)). Attention **TP does not
 help** at all: it leaves `ep_group_size` untouched, so `ep4 + tp2` is rejected exactly like bare
 `ep4`.
@@ -151,8 +151,8 @@ That sweep covers every shape holding more than one EP group, the single-node on
 `ep2+tp2`) included. Mechanism:
 [Multi-Node → deferred cross-replica sync](multi-node.md#deferred-cross-replica-sync).
 
-`CUDA_DEVICE_MAX_CONNECTIONS=1` is a free global default (baked into the images): neutral on dense
-and `ep_size=2`, **+9.7%** on `ep_size=8`.
+`CUDA_DEVICE_MAX_CONNECTIONS=1` is baked into the images as a free default
+([DeepEP → Environment variables](../infrastructure/deepep.md#environment-variables)).
 
 ## Quick start
 
@@ -197,13 +197,16 @@ lossy and the error grows with rank count — worth enabling for many-rank / mul
 
 | Flag | Scope | Effect |
 |---|---|---|
-| `fp32_router` | Router/gate weights | FP32 master weights, BF16 compute via autocast |
-| `fp32_experts` | Expert weights | FP32 master, BF16 compute. No effect when FSDP2 manages replicated experts (`fsdp_shard_ep1_experts` at `ep_group_size == 1`) — use `fp32_non_ep_params` there |
+| `fp32_router` | Router/gate weights | FP32 master. The routing matmul runs in FP32 while the EP layer syncs the router (`ep_group_size > 1`, or `fsdp_shard_ep1_experts: false`); at `ep_group_size == 1` under `fsdp_shard_ep1_experts` the router takes its own FSDP2 shard group and computes in BF16 under FSDP2's `param_dtype` |
+| `fp32_experts` | Expert weights | FP32 master, BF16 compute. No effect when FSDP2 manages replicated experts (`fsdp_shard_ep1_experts` at `ep_group_size == 1`) — set `fsdp_shard_ep1_experts: false` for fp32 expert masters there |
 | `fp32_non_ep_params` | Attention, embed, norm | FP32 master, BF16 compute |
 
-`fp32_non_ep_params: true` unconditionally implies `fp32_router: true` — every family except Gemma 4
-keeps its router inside the EP wrapper, where leaving it BF16 next to FP32 dense params would trip
-FSDP2's uniform-dtype check.
+Training checkpoints keep these masters in fp32 and exports write them bf16
+([What gets saved](../reference/checkpoints.md#what-gets-saved)).
+
+`fp32_non_ep_params: true` unconditionally implies `fp32_router: true`: every family except Gemma 4
+keeps its router inside the EP wrapper, which that upcast skips, so the implication keeps every
+non-expert weight an FP32 master.
 
 **Gemma 4: `fp32_non_ep_params` under EP is refused at load**, off the family's
 `_supports_fp32_non_ep_params = False` and before the model is built. Its router (`Gemma4TextRouter`)
@@ -232,12 +235,11 @@ What an EP run has to plan around:
       disables), above which an EFA proxy-GIN dispatch **wedges instead of erroring**. Intra-node
       NVLink dispatch is validated to 65536 tokens per rank.
 
-    The Gin cap is the binding limit on `per_device_train_batch_size × max_length` for any
+    The Gin cap is the binding limit on `per_device_train_batch_size` × sequence length for any
     `ep_scope=global` run spanning more than one NVLink domain
     ([AWS EFA](../infrastructure/deepep.md#expert-parallelism-over-aws-efa)). Both ceilings are also
-    applied before the load, against the declared budget:
-    `rows-per-forward × per_device_train_batch_size × max_length`, with `max_length: null` resolved
-    to the model's own context window (the largest budget that spelling can mean).
+    applied before the load, against the run's declared per-rank budget
+    ([DeepEP → Dispatch wire-index limit](../infrastructure/deepep.md#dispatch-wire-index-limit)).
 
 - **The dispatched count is `per_device_train_batch_size × tokens-per-sequence`.** It does not scale
   with `num_generations` or `gradient_accumulation_steps`, and the buffer is per-rank, so raising
@@ -282,6 +284,15 @@ it never enters.
 `EPConfig.defer_grad_sync` routes every such shape, single-node included, to the
 [post-backward sweep](multi-node.md#deferred-cross-replica-sync). `ep_group_size == 1` under
 `fsdp_shard_ep1_experts` is the exception, since FSDP2 already owns those experts.
+
+**Expert-only training** (native expert LoRA, or experts alone unfrozen) leaves nothing upstream of
+the first MoE layer requiring grad. A rank whose experts received no token would then compute a
+constant there, and its backward would skip the DeepEP collectives its peers enter: a barrier hang,
+mispaired collectives, or no grad on its loss at all. `_rank_uniform_dispatch_input` makes such a
+dispatch input a grad-requiring leaf in a grad-enabled training forward at `ep_size > 1`, so every
+rank builds the same dispatch/combine graph. The leaf's gradient is discarded; the added work is one
+dispatch-backward all-to-all and the expert compute's input-grad path, in the first such layer of
+each forward.
 
 **Gradient clipping** is custom because experts are distributed
 (`_compute_global_grad_norm`, `src/trainers/mixins/grad_sync.py`): local expert grad-norm² per rank → TP shard
@@ -427,7 +438,7 @@ and the merge carries no optimizer state, so a resume from the merged directory 
 it with `save_only_model: true`, as every shipped sharded config does.
 
 `save_max_shard_size` does not apply to these files; a per-rank shard is one file by design. The cap
-bounds the gathered save and the merged artifact.
+bounds the gathered save; the merged artifact takes `merge_ep_shards.py --max_shard_size`.
 
 **Sharded** writes `model-{rank:05d}-of-{world_size:05d}.safetensors` plus an index carrying
 `ep_size`. `validate_ep_sharded_save()` rejects it **at trainer construction** whenever any of these
@@ -453,7 +464,10 @@ the checkpoint, and the checkpoint loader raises when the live model was constru
 else, rather than silently continuing on stale weights.
 
 The loader then restores adapters and extra trained params; optimizer, scheduler and balancing
-biases resume from trainer state. An unmerged sharded save is refused at resume resolution, and
+biases resume from trainer state. A `merge_expert_lora_on_save` checkpoint is the exception to the
+repoint: it resumes from the base plus its `resume_adapter/`
+([Merge-on-save checkpoints](../reference/checkpoints.md#merge-on-save-checkpoints)). An unmerged
+sharded save is refused at resume resolution, and
 `load_best_model_at_end` is refused under EP full fine-tune (export the best checkpoint instead). See
 [Checkpoints & Resume](../reference/checkpoints.md).
 
@@ -489,7 +503,7 @@ topology rejections sit on top: single-domain multi-group EP with `ep_size > 2`
 | `use_grouped_gemm: false` | drops the wrappers at `ep_size == 1`; peeled expert-LoRA targets then raise rather than silently vanish | `_validate_expert_lora_realized` |
 | `fsdp_reshard_after_forward` | rejected — the backward all-gather can race the DeepEP combine | `_validate_fsdp_settings` |
 | `use_hsdp` | rejected — EP already shards over the EP group | `_validate_hsdp` |
-| `bf16_optimizer: false` | rejected on any MoE — fused AdamW cannot mix plain expert tensors with FSDP2 DTensors | `mixins/base.py` |
+| `bf16_optimizer: false` with a stock AdamW `optim` | rejected at optimizer build ([why](../optimization/bf16-optimizer.md#master-weight-and-grad-reduce-options)); `fp32_non_ep_params: true`, `muon` and `flash_adamw` build | `mixins/base.py` |
 | `ref_model` (explicit) | rejected — the reference is never parallelized, so its log-probs would not match the policy | `_validate_reference_model` |
 | `init_from_scratch` | rejected — no sharded random init | `model_loading.py` |
 | `accelerate launch` | rejected — EP requires `torchrun`; the same rejection covers a grouped-GEMM MoE at `ep_size == 1` | `model_loading.py`, `ParallelismValidationMixin` |
@@ -511,54 +525,13 @@ topology rejections sit on top: single-domain multi-group EP with `ep_size > 2`
 | `DeepEP NVLink barrier timeout` then `cudaErrorLaunchFailure` abort, under GC | `use_reentrant=False` reached the EP path. The trainer forces `True` — this only appears if `enable_ep_gradient_checkpointing` was called directly. Do not pin `false` |
 | OOM | Enable GC; raise EP size (each doubling roughly halves per-GPU expert memory) |
 
-gpt-oss-20b peak per GPU on 8×B300 (grows with sequence length): `ep8` ~48 GB, `ep2` >139 GB —
-roughly halving per doubling of `ep_size`. `ep4` is not a legal shape on 8 GPUs
+gpt-oss-20b peak per GPU on 8×B300 at seq 4096, batch 1: `ep8` 25.3 GB, `ep2` 77.3 GB (it grows with
+sequence length and batch). `ep4` is not a legal shape on 8 GPUs
 ([above](#single-domain-multi-group-ep-races-and-hangs)).
 
 ## Adding a new model
 
-1. **Declare** the HF MoE class name in the wrapper's `HF_MODULE_NAMES`.
-   `patch_moe_model_for_ep()` instantiates it and auto-detects `num_experts`.
-
-    `MOE_LAYER_MAP` is derived from the `EPMoELayerBase` subclass tree by `build_moe_layer_map()`
-    (duplicate names raise), and `layers/roster.py` imports every module in the package, so dropping
-    the file into `layers/` is the whole registration.
-
-2. **Choose a wrapper** by expert layout:
-    - Pre-fused contiguous halves (`gate_up_proj` `[gate | up]`): reuse `EPGlm4MoELayer` or call
-      `_init_fused_glu_params`.
-    - Separate `gate_proj`/`up_proj` fused at init: reuse `EPQwen3MoELayer` / `EPBailingMoELayer`.
-    - Interleaved fused weights (`[g0, u0, g1, u1, …]`): reuse `EPGptOssMoELayer`.
-    - Custom routing: subclass `EPMoELayerBase`. The base owns `__init__` and expert-compute
-      dispatch; a contiguous-halves family only needs `forward`.
-    - Per-expert hub layout (GLM4, LFM2): declare `_PER_EXPERT_UNFUSED_KEYS` and the base
-      `gather_expert_state_dict` splits the fused gather automatically.
-
-    Construction is a template with one hook per step (`_detect_hidden_dim` / `_init_routing` /
-    `_init_shared_experts` / `_init_expert_compute` / `_init_expert_params`), so a family declares
-    what differs and inherits the rest, `self.top_k` included, which routing replay sizes its mask
-    from.
-
-3. **Expert detection:** declare `_NUM_EXPERTS_ATTR_PATHS` with the family's dotted attribute path —
-   `detect_num_experts` is one base implementation for every family, probing those paths first and
-   the generic container attributes second.
-
-4. **(Optional) bias-update balancing**, only for families doing routing *selection* in-layer
-   (every wrapper except Gemma 4, whose router sits outside it, and Zaya, whose own gate owns the
-   buffer). See
-   [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback).
-
-    - Set `_supports_bias_balancing = True` (+ `_ep_severs_aux_loss = True` when the family's
-      aux-loss path dies under EP).
-    - Add the per-expert bias to selection scores before top-k and gather gate weights from the
-      **unbiased** scores; call `self._record_expert_load(...)`. `_deepseek_biased_route(logits)`
-      does both in one call.
-    - Declare `_NATIVE_BALANCING_BIAS_ATTR` when the family ships a checkpoint slot for the bias.
-      Without one the family reaches only `bias_update_transient`, whose bias no export carries.
-
-Routing weights must produce FP32 `topk_weights`. Test:
-
-```bash
-torchrun --nproc_per_node=2 \
-    tests/gpu/parallelism/ep/test_ep_correctness.py
-```
+Procedure: [Adding a Model → Add EP support](../models/adding-a-model.md#add-ep-support). The per-PR
+EP correctness gate (gpt-oss-20b, EP=2 against the undistributed forward) is
+`torchrun --nproc_per_node=2 tests/gpu/parallelism/ep/test_ep_correctness.py`; a new family adds its
+own EP-vs-FSDP equivalence test.

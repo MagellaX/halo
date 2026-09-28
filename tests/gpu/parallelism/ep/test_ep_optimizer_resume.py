@@ -10,10 +10,11 @@ the whole contract on a tiny random-init model through the real trainer save/res
   2. Train 3 steps, checkpoint at step 3; snapshot this rank's optimizer state (the same
      ``get_optimizer_state_dict`` view the shard files hold) and verify the checkpoint carries
      per-rank shards + a fingerprint meta + real model weights (the source layout, trained values).
-  3. Resume to step 6: at ``on_train_begin`` (post-restore, pre-step) the optimizer state must
-     equal the snapshot EXACTLY (bf16 moments bit-identical; SR only perturbs later steps), the
-     LR scheduler must be at step 3, and the resumed loss trajectory (steps 4-6) must track the
-     continuous run closely (SR noise makes bit-exactness across the boundary unlikely).
+  3. Resume to step 6: at ``on_train_begin`` (post-restore, pre-step) the optimizer state and every
+     trainable weight must equal the save-time snapshot EXACTLY and the LR scheduler must be at
+     step 3; the resumed steps 4-6 must then reproduce the continuous run, losses and final weights
+     bit for bit. Nothing is reset between the phases: AdamWBF16 keys its stochastic rounding by the
+     parameter's step and position, so a resumed step rounds as the uninterrupted one did.
   4. Mismatch path: resume the ep_size=2 checkpoint at ep_size=1 → the fingerprint warm-restart
      warning fires naming ``ep_size``, the optimizer starts empty, training proceeds.
 
@@ -33,7 +34,6 @@ Usage:
 import argparse
 import logging
 import os
-import random
 
 import torch
 import torch.distributed as dist
@@ -42,16 +42,27 @@ from transformers.trainer_callback import TrainerCallback
 from trl import SFTConfig
 
 import src.distributed.checkpoint.optimizer as optimizer_store_mod
-import src.optimizers.adamw_bf16 as adamw_bf16_mod
 from src.checkpoint.format import load_full_state_dict
 from src.distributed.checkpoint.fingerprint import OptimizerStateFingerprint
+from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
 from src.trainers.sft import DistributedSFTTrainer
 from tests.common.datasets import create_sft_dataset
+from tests.common.distributed import world_all
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import cleanup_memory, local_optimizer_state, log, optimizer_state_matches, step_losses
+from tests.common.tolerances import TOL
+from tests.common.utils import (
+    cleanup_memory,
+    local_optimizer_state,
+    log,
+    max_or_nan,
+    optimizer_state_matches,
+    relative_l2,
+    snapshot_trainable,
+    step_losses,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["ep", "ep1", "cp"], default="ep")
@@ -66,10 +77,10 @@ SAVE_AT_STEP = 3
 BATCH_SIZE = 2
 LEARNING_RATE = 1e-4
 MAX_SEQ_LENGTH = 256
-# Resumed steps 4-6 vs the continuous run: identical batches and restored moments, differing only
-# by stochastic-rounding noise (the SR stream restarts on resume) — a warm restart instead shifts
-# the trajectory by the full Adam-moment reset, far above this tolerance.
-LOSS_TOL = 0.05
+# Resumed steps 4-6 vs the continuous run: identical batches, restored weights and moments, and the
+# same rounding noise, so every row measured bit-exact (|delta| 0.0); a warm restart shifts the
+# trajectory by the full Adam-moment reset, and a replayed rounding stream by ~1e-3.
+LOSS_TOL = TOL.replayed_resume_loss_abs
 
 _TINY_COMMON = {
     "hidden_size": 256,
@@ -127,6 +138,7 @@ def _sft_config(output_dir: str, max_steps: int, save_at: int | None) -> SFTConf
         save_strategy="steps" if save_at else "no",
         save_steps=save_at or 0,
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=MAX_SEQ_LENGTH,
         dataloader_drop_last=True,
         dataloader_num_workers=0,
@@ -135,10 +147,6 @@ def _sft_config(output_dir: str, max_steps: int, save_at: int | None) -> SFTConf
 
 
 def _make_trainer(model_path, pc, tokenizer, train_dataset, config):
-    # Reset the rank-synchronized SR RNG so every phase consumes the same stochastic-rounding
-    # stream from step 1 — the continuous and to-be-resumed runs then produce bit-comparable
-    # optimizer states at the save step.
-    adamw_bf16_mod._SR_RNG = random.Random(0xB165EED)
     # CP rejects sdpa (Ulysses needs a Flash kernel), so let CP auto-detect (FA4 on Blackwell) and
     # keep the cheaper sdpa path for the EP mode, which does not constrain the kernel.
     model, _ = load_distributed_model(
@@ -175,14 +183,24 @@ class _ResumeCapture(TrainerCallback):
             "snapshot": local_optimizer_state(trainer.model, trainer.optimizer),
             "optimizer_state_len": len(trainer.optimizer.state),
             "sched_last_epoch": int(trainer.lr_scheduler.last_epoch),
+            "weights": _trainable_weights(trainer.model),
         }
         return control
 
 
-def _all_ranks_true(local: bool, device) -> bool:
-    t = torch.tensor([1 if local else 0], device=device)
-    dist.all_reduce(t, op=dist.ReduceOp.MIN)
-    return bool(t.item())
+def _trainable_weights(model) -> dict[str, torch.Tensor]:
+    """Every trainable parameter, whole and at its live dtype. Collective under FSDP2."""
+    reshard_fsdp2_modules(model)
+    return snapshot_trainable(model)
+
+
+def _unequal(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> list[str]:
+    """Keys whose tensors differ in value or dtype, or are missing from ``actual``."""
+    return sorted(
+        key
+        for key, value in expected.items()
+        if key not in actual or actual[key].dtype != value.dtype or not torch.equal(actual[key], value)
+    )
 
 
 def _verify_checkpoint_files(ckpt_dir: str, world_size: int, pc: ParallelismConfig, optimizer) -> tuple[bool, str]:
@@ -291,6 +309,7 @@ def run(ctx):
     ctx.on_teardown(trainer.cleanup_ep)
     trainer.train()
     continuous_losses = step_losses(trainer)
+    continuous_final = _trainable_weights(trainer.model)
     log(f"continuous losses: {[f'{loss:.4f}' for loss in continuous_losses]}")
     checks["continuous_ran_all_steps"] = len(continuous_losses) == TOTAL_STEPS
     del trainer
@@ -304,6 +323,7 @@ def run(ctx):
     trainer.train()
     saved_losses = step_losses(trainer)
     snapshot_ref = local_optimizer_state(trainer.model, trainer.optimizer)
+    saved_weights = _trainable_weights(trainer.model)
     checks["saved_state_nonempty"] = any(
         torch.is_tensor(v) and v.dtype.is_floating_point and (v != 0).any() for _, v in _snapshot_values(snapshot_ref)
     )
@@ -315,8 +335,8 @@ def run(ctx):
         log(f"checkpoint weights: {weights_detail}")
     else:
         files_ok = weights_ok = True
-    checks["checkpoint_files_ok"] = _all_ranks_true(files_ok, device)
-    checks["checkpoint_weights_ok"] = _all_ranks_true(weights_ok, device)
+    checks["checkpoint_files_ok"] = world_all(files_ok, device)
+    checks["checkpoint_weights_ok"] = world_all(weights_ok, device)
     del trainer
     cleanup_memory()
     ctx.barrier()
@@ -335,19 +355,31 @@ def run(ctx):
         equal, why = optimizer_state_matches(snapshot_ref, capture["snapshot"])
         if not equal:
             log(f"OPTIMIZER STATE MISMATCH after restore: {why}")
-        checks["optimizer_state_restored_exactly"] = _all_ranks_true(equal, device)
+        checks["optimizer_state_restored_exactly"] = world_all(equal, device)
         checks["scheduler_restored"] = capture["sched_last_epoch"] == SAVE_AT_STEP
+        unrestored = _unequal(saved_weights, capture["weights"])
+        if unrestored:
+            log(f"{len(unrestored)} trainable weights differ after the restore, e.g. {unrestored[:3]}")
+        checks["weights_restored_exactly"] = world_all(bool(saved_weights) and not unrestored, device)
     resumed_tail = resumed_losses[-(TOTAL_STEPS - SAVE_AT_STEP) :]
     continuous_tail = continuous_losses[SAVE_AT_STEP:]
     checks["resumed_ran_remaining_steps"] = len(resumed_tail) == TOTAL_STEPS - SAVE_AT_STEP
     if checks["resumed_ran_remaining_steps"] and checks["continuous_ran_all_steps"]:
-        max_delta = max(abs(a - b) for a, b in zip(continuous_tail, resumed_tail, strict=True))
+        max_delta = max_or_nan(abs(a - b) for a, b in zip(continuous_tail, resumed_tail, strict=True))
         metrics["resume_loss_max_delta"] = max_delta
         log(
             f"continuous tail: {[f'{loss:.4f}' for loss in continuous_tail]}  "
             f"resumed tail: {[f'{loss:.4f}' for loss in resumed_tail]}  max |delta| = {max_delta:.5f}"
         )
-        checks["resumed_losses_track_continuous"] = max_delta < LOSS_TOL
+        checks["resumed_losses_match_continuous"] = max_delta < LOSS_TOL
+    resumed_final = _trainable_weights(trainer.model)
+    drifted = _unequal(continuous_final, resumed_final)
+    metrics["final_weights_relative_l2"] = relative_l2(resumed_final, continuous_final)
+    log(
+        f"final weights: {len(continuous_final) - len(drifted)}/{len(continuous_final)} bit-identical to the "
+        f"continuous run, relative L2 {metrics['final_weights_relative_l2']:.3e}"
+    )
+    checks["final_weights_match_continuous"] = world_all(bool(continuous_final) and not drifted, device)
     log(f"phase-2 losses: {[f'{loss:.4f}' for loss in saved_losses]}")
     del trainer
     cleanup_memory()
@@ -395,12 +427,12 @@ def run(ctx):
             )
             if (carried_moments or carried_steps) and ctx.rank == 0:
                 log(f"mismatch resume carried: moments={carried_moments[:5]} steps={carried_steps[:5]}")
-            checks["mismatch_warm_restarted"] = _all_ranks_true(not carried_moments and not carried_steps, device)
+            checks["mismatch_warm_restarted"] = world_all(not carried_moments and not carried_steps, device)
         mismatch_warned = any("fingerprint mismatch" in w and "ep_size" in w for w in warnings)
         if ctx.rank == 0 and not mismatch_warned:
             log(f"captured warnings: {warnings}")
         # The warning logs on the main process only; every rank must have taken the warm restart.
-        checks["mismatch_warning_fired"] = _all_ranks_true(mismatch_warned or ctx.rank != 0, device)
+        checks["mismatch_warning_fired"] = world_all(mismatch_warned or ctx.rank != 0, device)
         mismatch_losses = step_losses(trainer)
         checks["mismatch_run_proceeded"] = trainer.state.global_step == SAVE_AT_STEP + 1 and all(
             torch.isfinite(torch.tensor(mismatch_losses)).tolist()

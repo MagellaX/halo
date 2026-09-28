@@ -50,14 +50,17 @@ def resolve_retained(items: Iterable[tuple[str, torch.Tensor]], *, retain: bool)
     return resolved
 
 
-def gather_saveable_tensors(model: nn.Module, *, retain: bool) -> dict[str, torch.Tensor]:
+def gather_saveable_tensors(
+    model: nn.Module, *, retain: bool, items: Iterable[tuple[str, torch.Tensor]] | None = None
+) -> dict[str, torch.Tensor]:
     """Everything a gathered save writes for ``model``: parameters, persistent buffers, GptOss sinks.
 
     Non-persistent buffers (rotary caches, masks) are recomputed on load and stay out. GptOss under
     FA2 drops ``sinks`` from ``named_parameters()``; they are re-emitted neutralized so the reload
-    matches, and ``setdefault`` leaves a live sink alone. Purely local, hence retain-only.
+    matches, and ``setdefault`` leaves a live sink alone. Purely local, hence retain-only. ``items``
+    replaces the walk, as in :func:`saveable_items` (the embedding save's folded LoRA).
     """
-    state_dict = resolve_retained(saveable_items(model), retain=retain)
+    state_dict = resolve_retained(saveable_items(model, items), retain=retain)
     if retain:
         for name, tensor in neutralized_gpt_oss_sinks(model).items():
             state_dict.setdefault(name, tensor)
@@ -123,6 +126,7 @@ def stream_gathered_checkpoint(
     *,
     is_save_rank: bool,
     max_shard_size: str,
+    keep_live_dtype: bool = False,
 ) -> None:
     """Write a gathered save straight to safetensors parts, never holding the whole state dict.
 
@@ -134,7 +138,8 @@ def stream_gathered_checkpoint(
     because the reconcile compares both halves.
 
     A failing write raises through :class:`DeferredRankFailure`, reaching every rank at the collective
-    below rather than in the next chunk's gather.
+    below rather than in the next chunk's gather. ``keep_live_dtype`` (a training checkpoint) is
+    :func:`~src.checkpoint.format.save_dtype_caster`'s.
     """
     writer = StageShardWriter(output_dir, HF_STREAM_PART_PREFIX, max_shard_size, enabled=is_save_rank)
     guard = DeferredRankFailure(f"gathered checkpoint write to {output_dir}")
@@ -144,7 +149,7 @@ def stream_gathered_checkpoint(
     tied: dict[str, torch.Tensor] = {}
 
     def stage(chunk: dict[str, torch.Tensor]) -> None:
-        for key, tensor in normalize_gathered_state_dict(model, chunk).items():
+        for key, tensor in normalize_gathered_state_dict(model, chunk, keep_live_dtype=keep_live_dtype).items():
             if keep_tied and is_tie_reconcile_key(key):
                 tied[key] = tensor
             writer.add(key, tensor)

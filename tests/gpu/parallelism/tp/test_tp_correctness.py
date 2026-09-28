@@ -24,6 +24,8 @@ Requirements:
     - Model: Qwen/Qwen3-0.6B (auto-downloaded)
 """
 
+import math
+
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
@@ -38,11 +40,12 @@ from src.distributed.runtime import barrier, materialize_dtensor
 from src.distributed.tensor_parallel.state_dict import get_tp_mesh
 from src.trainers.sft import DistributedSFTTrainer
 from tests.common.datasets import create_sft_dataset
-from tests.common.distributed import ensure_model_downloaded
+from tests.common.distributed import ensure_model_downloaded, group_max_abs_diff, world_mean, world_spread
 from tests.common.ep_reference import fixed_chat_batch
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
-from tests.common.utils import cleanup_memory, gpu_mem_gb, log, log_all
+from tests.common.tolerances import TOL
+from tests.common.utils import cleanup_memory, gpu_mem_gb, log, log_all, max_or_nan
 
 MODEL_NAME = QWEN3_0_6B
 TP_SIZE = 2
@@ -173,7 +176,8 @@ def compute_tp_loss_and_grad_norm(tokenizer, local_rank, output_dir):
         production TP grad-norm, which must reproduce the unsharded baseline.
 
     Returns:
-        tuple[list[float], list[float]]: (per-rank loss, per-rank TP grad norm).
+        tuple: ((loss mean, loss spread), (grad-norm mean, grad-norm spread), reassembled grads,
+        (TP-synced grads bit-identical, params checked)). Means and spreads are over the world.
     """
     device = f"cuda:{local_rank}"
 
@@ -212,6 +216,7 @@ def compute_tp_loss_and_grad_norm(tokenizer, local_rank, output_dir):
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        logging_nan_inf_filter=False,
         max_length=SEQ_LEN,
         dataloader_drop_last=True,
         dataloader_num_workers=0,
@@ -249,15 +254,11 @@ def compute_tp_loss_and_grad_norm(tokenizer, local_rank, output_dir):
     # Mirrors tp_clip_grad_norm_ — sync replicated grads across the TP axis, then take the global norm.
     trainer._sync_tp_replicated_grads(params)
     tp_synced_identical, tp_synced_count = assert_tp_synced_grads_identical(trainer, tp_model)
-    # float(), not the tensor: all_gather_object unpickles onto each rank's OWN device, so a gathered
-    # list would mix cuda:0 and cuda:1 and every comparison below would raise.
     tp_grad_norm_local = float(trainer._compute_tp_grad_norm(params))
     log_all(f"  TP grad norm: {tp_grad_norm_local:.6f}")
 
-    all_tp_losses = [None] * dist.get_world_size()
-    all_tp_grad_norms = [None] * dist.get_world_size()
-    dist.all_gather_object(all_tp_losses, tp_loss_local)
-    dist.all_gather_object(all_tp_grad_norms, tp_grad_norm_local)
+    tp_loss = (world_mean(tp_loss_local), world_spread(tp_loss_local))
+    tp_grad_norm = (world_mean(tp_grad_norm_local), world_spread(tp_grad_norm_local))
 
     tp_grads = reassemble_tp_grads(tp_model)
 
@@ -265,7 +266,7 @@ def compute_tp_loss_and_grad_norm(tokenizer, local_rank, output_dir):
     del model, trainer, tp_model, loss
     cleanup_memory()
 
-    return all_tp_losses, all_tp_grad_norms, tp_grads, (tp_synced_identical, tp_synced_count)
+    return tp_loss, tp_grad_norm, tp_grads, (tp_synced_identical, tp_synced_count)
 
 
 def assert_tp_synced_grads_identical(trainer, tp_model) -> tuple[bool, int]:
@@ -277,18 +278,16 @@ def assert_tp_synced_grads_identical(trainer, tp_model) -> tuple[bool, int]:
     pattern rank-uniform."""
     unwrapped = tp_model.module if hasattr(tp_model, "module") else tp_model
     tp_group = trainer._get_tp_process_group()
-    tp_world = dist.get_world_size(group=tp_group)
-    checked, max_diff = 0, 0.0
+    checked, diffs = 0, []
     for _name, p in unwrapped.named_parameters():
         if p.grad is None:
             continue
         if isinstance(p.data, DTensor) and MeshDim.TP in mesh_dim_names(p.data.device_mesh):
             continue  # plan-sharded: ranks legitimately hold different slices
         grad = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-        gathered = [torch.empty_like(grad) for _ in range(tp_world)]
-        dist.all_gather(gathered, grad.contiguous(), group=tp_group)
         checked += 1
-        max_diff = max(max_diff, max((g - gathered[0]).abs().max().item() for g in gathered))
+        diffs.append(group_max_abs_diff(grad, tp_group))
+    max_diff = max_or_nan(diffs, default=0.0)
     log_all(f"  TP-synced grads: {checked} params checked, max cross-TP diff {max_diff:.3e}")
     return max_diff == 0.0 and checked > 0, checked
 
@@ -349,7 +348,7 @@ def run(ctx):
     log("PHASE 2: TP=2 Forward Pass + Grad Norm")
     log(f"{'=' * 70}")
 
-    tp_losses, tp_grad_norms, tp_grads, tp_synced = compute_tp_loss_and_grad_norm(
+    (tp_loss_avg, tp_spread), (tp_gn_avg, gn_spread), tp_grads, tp_synced = compute_tp_loss_and_grad_norm(
         tokenizer, ctx.local_rank, ctx.output_dir
     )
 
@@ -365,21 +364,20 @@ def run(ctx):
         log("VALIDATION")
         log(f"{'=' * 70}")
 
-        tp_finite = all(not (torch.isnan(torch.tensor(l)) or torch.isinf(torch.tensor(l))) for l in tp_losses)
+        # world_spread is inf when any rank's value is non-finite, so a finite spread covers every rank.
+        tp_finite = math.isfinite(tp_spread)
         checks["tp_losses_finite"] = tp_finite
-        log(f"\n  TP losses finite: {'PASS' if tp_finite else 'FAIL'}")
-        log(f"    TP losses per rank: {[f'{l:.6f}' for l in tp_losses]}")
+        log(f"\n  TP losses finite (all ranks): {'PASS' if tp_finite else 'FAIL'}")
 
-        tp_spread = max(tp_losses) - min(tp_losses)
-        tp_consistent = tp_spread < 1e-4
+        # Every TP rank computes the loss from the same all-reduced activations.
+        tp_consistent = tp_spread < TOL.all_reduced_rank_spread_abs
         checks["tp_rank_consistency"] = tp_consistent
         log(f"  TP rank consistency (spread={tp_spread:.8f}): {'PASS' if tp_consistent else 'FAIL'}")
 
-        baseline_finite = not (torch.isnan(torch.tensor(baseline_loss)) or torch.isinf(torch.tensor(baseline_loss)))
+        baseline_finite = math.isfinite(baseline_loss)
         checks["baseline_finite"] = baseline_finite
         log(f"  Baseline loss finite ({baseline_loss:.6f}): {'PASS' if baseline_finite else 'FAIL'}")
 
-        tp_loss_avg = sum(tp_losses) / len(tp_losses)
         abs_diff = abs(tp_loss_avg - baseline_loss)
         rel_diff = abs_diff / max(abs(baseline_loss), 1e-10)
 
@@ -392,18 +390,12 @@ def run(ctx):
         log(f"  Rel diff:      {rel_diff:.4%} (tol: {LOSS_REL_TOL:.4%})")
         log(f"  Match (abs AND rel): {'PASS' if loss_match else 'FAIL'}")
 
-        loss_reasonable = 0 < tp_loss_avg < 100
-        checks["loss_reasonable"] = loss_reasonable
-        log(f"  Loss in reasonable range (0 < {tp_loss_avg:.4f} < 100): {'PASS' if loss_reasonable else 'FAIL'}")
-
-        gn_finite = all(not (torch.isnan(torch.tensor(g)) or torch.isinf(torch.tensor(g))) for g in tp_grad_norms)
+        gn_finite = math.isfinite(gn_spread)
         checks["tp_grad_norm_finite"] = gn_finite
-        log(f"\n  TP grad norms finite: {'PASS' if gn_finite else 'FAIL'}")
-        log(f"    TP grad norms per rank: {[f'{g:.6f}' for g in tp_grad_norms]}")
+        log(f"\n  TP grad norms finite (all ranks): {'PASS' if gn_finite else 'FAIL'}")
 
         # The TP-aware norm is a global all-reduced scalar, so every TP rank must agree.
-        gn_spread = max(tp_grad_norms) - min(tp_grad_norms)
-        gn_consistent = gn_spread < 1e-4
+        gn_consistent = gn_spread < TOL.all_reduced_rank_spread_abs
         checks["tp_grad_norm_consistency"] = gn_consistent
         log(f"  TP grad norm consistency (spread={gn_spread:.8f}): {'PASS' if gn_consistent else 'FAIL'}")
 
@@ -411,7 +403,6 @@ def run(ctx):
         # into PLAIN slices, so a classifier keying on tensor type reads them as TP replicas and
         # averages across the group. That lands at ratio ~0.5 while keeping every rank in
         # agreement — invisible to the cross-rank check above, inside any order-of-magnitude band.
-        tp_gn_avg = sum(tp_grad_norms) / len(tp_grad_norms)
         gn_ratio = tp_gn_avg / max(abs(baseline_grad_norm), 1e-10)
         gn_matches = abs(gn_ratio - 1.0) <= GRAD_NORM_REL_TOL
         checks["grad_norm_matches_baseline"] = gn_matches
@@ -434,10 +425,13 @@ def run(ctx):
             rel = (got - ref).norm().item() / ref_norm
             ratio = got.norm().item() / ref_norm
             per_param_lines.append(f"    {name}: rel_err={rel:.2e} norm_ratio={ratio:.4f}")
+            # A NaN compares false against the trackers below, so a non-finite error counts as infinite.
+            rel = rel if math.isfinite(rel) else math.inf
+            ratio_dev = abs(ratio - 1.0) if math.isfinite(ratio) else math.inf
             if rel > worst_rel:
                 worst_rel_name, worst_rel = name, rel
-            if abs(ratio - 1.0) > worst_ratio_dev:
-                worst_ratio_name, worst_ratio_dev = name, abs(ratio - 1.0)
+            if ratio_dev > worst_ratio_dev:
+                worst_ratio_name, worst_ratio_dev = name, ratio_dev
         grads_match = worst_rel <= GRAD_TENSOR_REL_TOL and worst_ratio_dev <= GRAD_TENSOR_RATIO_TOL
         checks["per_param_grads_match_baseline"] = grads_match
         log("\n  --- Per-parameter gradient comparison (reassembled via the TP plan) ---")

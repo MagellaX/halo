@@ -10,7 +10,6 @@ import fnmatch
 import warnings
 
 import torch
-from accelerate.logging import get_logger
 from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
 from peft.tuners.tuners_utils import BaseTunerLayer, _maybe_include_all_linear_layers, check_target_module_exists
 from peft.utils.constants import INCLUDE_LINEAR_LAYERS_SHORTHAND
@@ -26,9 +25,12 @@ from src.distributed.pipeline_parallel.stage import PP_STAGE_PARTITION_ATTR
 from src.distributed.runtime import reject_across_ranks, reject_divergent_settings
 from src.models.moe_balancing import config_has_experts
 from src.models.patches.gpt_oss_sinks import SinksPolicy, stamped_sinks_policy
-from src.models.structure import DECODER_LAYER_LIST_ATTRS, EMBEDDING_HEAD_MARKERS, is_normalization_module
-
-logger = get_logger(__name__)
+from src.models.structure import (
+    DECODER_LAYER_LIST_ATTRS,
+    EMBEDDING_HEAD_MARKERS,
+    is_kbit_quantized,
+    is_normalization_module,
+)
 
 _TORCH_LAYER_PACKAGE = "torch.nn.modules."
 # The forward-probe verdict cache key: a class can be grouped at one width and plain at another.
@@ -138,6 +140,16 @@ def split_expert_lora_targets(model_config: ModelConfig) -> ExpertLoraSpec | Non
         projections=frozenset(projections),
         use_rslora=bool(getattr(model_config, "use_rslora", False)),
     )
+
+
+def has_attention_lora_targets(model_config: ModelConfig) -> bool:
+    """Whether stock PEFT has targets left after the expert peel, i.e. the run gets a ``PeftModel``.
+
+    ``None`` targets mean the architecture defaults; ``[]`` means every target was an expert
+    projection (expert-only LoRA), and conflating the two would full-finetune a ``use_peft`` run.
+    """
+    targets = model_config.lora_target_modules
+    return model_config.use_peft and (targets is None or bool(targets))
 
 
 def _reenable_expert_lora_grads(model: PreTrainedModel) -> None:
@@ -370,15 +382,12 @@ def setup_peft_model(
     """Set up adapter training (attention PEFT and/or native EP expert LoRA).
 
     Three cases: (1) no adapters → unfreeze/freeze patterns + full/partial finetune; (2) any adapter run →
-    freeze base then re-enable native EP expert adapters (PEFT re-enables attention after); (3) expert-LoRA
-    only → frozen base + trainable expert adapters, no PEFT config.
+    refuse those patterns, freeze base, then re-enable native EP expert adapters (PEFT re-enables attention
+    after); (3) expert-LoRA only → frozen base + trainable expert adapters, no PEFT config.
     """
     _reject_lora_target_parameters_under_ep(model, model_config)
     expert_lora_active = has_ep_lora(model)
-    # None targets means architecture defaults, [] means expert-only; conflating the two would
-    # full-finetune a `use_peft` run.
-    targets = model_config.lora_target_modules
-    attention_peft = model_config.use_peft and (targets is None or bool(targets))
+    attention_peft = has_attention_lora_targets(model_config)
 
     if not attention_peft and not expert_lora_active:
         if model_config.use_peft:
@@ -398,6 +407,16 @@ def setup_peft_model(
             freeze_modules_by_patterns(model, args.freeze_layers_patterns)
         return None
 
+    set_patterns = [
+        name for name in ("unfreeze_layers_patterns", "freeze_layers_patterns") if getattr(args, name, None)
+    ]
+    if set_patterns:
+        raise ValueError(
+            f"{' and '.join(set_patterns)} cannot combine with adapters: an adapter run freezes every base "
+            "parameter and trains only the adapters, so the patterns would select nothing. Drop the "
+            "patterns, or drop the adapters (use_peft: false, no expert LoRA targets) for a partial "
+            "fine-tune."
+        )
     if stamped_sinks_policy(model) is SinksPolicy.TRAINABLE:
         raise ValueError(
             "train_sinks: true needs full fine-tuning: an adapter run freezes every base parameter, and "
@@ -430,13 +449,6 @@ def setup_peft_model(
             f"This will lead to silent bugs. Make sure to pass --lora_task_type {expected_task_type}.",
             stacklevel=2,
         )
-
-    for patterns_arg in ("unfreeze_layers_patterns", "freeze_layers_patterns"):
-        if getattr(args, patterns_arg, None):
-            warnings.warn(
-                f"You can't use non-empty {patterns_arg} and peft together, only peft config will be used",
-                stacklevel=2,
-            )
 
     return build_peft_config(model, model_config)
 
@@ -514,12 +526,7 @@ def prepare_peft_model(model, peft_config, args, *, merge_existing: bool = True)
             return model, False
         model = model.merge_and_unload()
 
-    quantized = (
-        getattr(model, "is_loaded_in_8bit", False)
-        or getattr(model, "is_loaded_in_4bit", False)
-        or getattr(model, "is_quantized", False)
-    )
-    if quantized:
+    if is_kbit_quantized(model):
         prepare_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
         gc_kwargs = getattr(args, "gradient_checkpointing_kwargs", None)
         if gc_kwargs is not None:

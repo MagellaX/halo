@@ -16,13 +16,9 @@ tied embeddings, and a `logit_scale` multiplier on the lm_head output (the confi
 
 | | EP | CP | TP | ETP | PP | EP+CP | EP+TP | EP+ETP |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| Cohere2 MoE | Yes | Yes | Yes (selective) | Yes (pure, `ep_size=1`) | **No** | Yes ¹ | Yes | Experimental |
+| Cohere2 MoE | Yes | Yes | Yes (selective) | Yes (pure, `ep_size=1`) | — | Yes ¹ | Yes | Experimental |
 
-PP is refused loudly: the PP stage loader requires lazy loading, which this family declares off,
-and behind that the generic tie gate refuses too — every shipped checkpoint ties `lm_head` to
-`embed_tokens`. An untied variant would additionally have to land its stage boundaries on the
-period-4 `layer_types` pattern; its `logit_scale` is the family's declared head transform, which the
-last stage applies (`src/models/head_transform.py`).
+Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
 
 ¹ Node-local EP+CP requires `ep_group_size == nvlink_domain_size`; on an 8-GPU node that pins
 `ep_size` to 8, with `cp_size` dividing the domain (EP is orthogonal to DP — ep8+cp2 is a valid
@@ -32,6 +28,9 @@ Coverage: `tests/gpu/parallelism/test_cohere2_moe_all_parallelism.py` (ep8 / cp8
 ep8+tp2 / etp8 / ep2+etp4 on a tiny synthetic checkpoint), plus EP=2 equivalence, SFT and CPU
 contract suites (`tests/gpu/parallelism/ep/test_ep_vs_fsdp_cohere2_moe.py`,
 `tests/gpu/trainers/sft/test_sft_cohere2_moe.py`, `tests/cpu/models/test_cohere2_moe_support.py`).
+LoRA is tiny-model verified by `tests/gpu/trainers/lora/test_lora_merged_save_resume_families.py`
+(expert and mixed adapters at ep2 / ep1 / ep2+cp2, merged save and exact resume); no full-scale LoRA
+run.
 
 ## EP wrapper
 

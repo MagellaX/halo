@@ -1,4 +1,4 @@
-"""Shared LoRA / QLoRA / native-expert-LoRA helpers for the GRPO + distillation GPU tests.
+"""Shared LoRA / QLoRA / native-expert-LoRA helpers for the adapter GPU tests.
 
 These drive the same production path the training scripts use (``split_expert_lora_targets`` →
 ``load_distributed_model(quantization_config=...)`` → ``setup_peft_model``), so the tests exercise the
@@ -15,28 +15,38 @@ Modes:
 
 from __future__ import annotations
 
+import copy
+import glob
 import json
 import os
 import re
+import traceback
 from types import SimpleNamespace
 
 import torch
 from accelerate.utils import extract_model_from_parallel
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
+from peft import PeftModel, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
+from transformers import AutoModelForCausalLM
 from trl import ModelConfig, get_quantization_config
 
-from src.checkpoint.format import SAFETENSORS_INDEX_FILE, read_checkpoint_index
+from src.checkpoint.format import SAFETENSORS_INDEX_FILE, cast_to_save_dtype, read_checkpoint_index
+from src.distributed.checkpoint.peft import PeftAdapterSaver
 from src.distributed.expert_parallel.expert_weights import gather_ep_lora_adapters, has_ep_lora
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.loading.peft_setup import setup_peft_model, split_expert_lora_targets
 from src.distributed.parallelism_config import ParallelismConfig
 from src.distributed.runtime import barrier
+from src.models.patches.buffer_fixes import finalize_loaded_model
+from src.models.structure import strip_peft_adapter_segment
 from tests.common.ep_reference import ep_layers
 from tests.common.models import GPT_OSS_20B, QWEN3_0_6B
-from tests.common.utils import log
+from tests.common.tolerances import TOL
+from tests.common.utils import cleanup_memory, log
 
 DENSE_MODEL = QWEN3_0_6B
 MOE_MODEL = GPT_OSS_20B
@@ -56,7 +66,10 @@ _DEFAULT_ATTENTION_TARGETS = ["q_proj", "v_proj"]
 _MOE_MODES = frozenset({"expert_lora", "mixed"})
 
 # Attention projections live under one of these containers depending on the family.
-_ATTENTION_PROJ_RE = re.compile(r"\.(?:self_attn|self_attention|attention|attn)\.([A-Za-z0-9_]+)\.weight$")
+_ATTENTION_CONTAINERS = ("self_attn", "self_attention", "attention", "attn")
+_ATTENTION_PROJ_RE = re.compile(rf"\.(?:{'|'.join(_ATTENTION_CONTAINERS)})\.([A-Za-z0-9_]+)\.weight$")
+# Token mixers a hybrid family interleaves with attention (Qwen3.5's GatedDeltaNet).
+_MIXER_MODULE_RE = re.compile(rf"\.(?:{'|'.join((*_ATTENTION_CONTAINERS, 'linear_attn'))})\.([A-Za-z0-9_]+)$")
 
 
 def _materialize(t: torch.Tensor) -> torch.Tensor:
@@ -93,6 +106,19 @@ def attention_target_modules(model_name: str, revision: str | None = None) -> li
     return sorted(name for name in found if name.endswith("_proj")) or list(_DEFAULT_ATTENTION_TARGETS)
 
 
+def mixer_linear_leaves(model: torch.nn.Module) -> list[str]:
+    """Leaf names of every ``nn.Linear`` under a token mixer of ``model``'s own module tree (attention,
+    and a hybrid family's linear attention): the targets of a tiny single-file checkpoint, which has no
+    index to read them from."""
+    return sorted(
+        {
+            match.group(1)
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Linear) and (match := _MIXER_MODULE_RE.search(name))
+        }
+    )
+
+
 def _mode_targets(mode: str, model_name: str, revision: str | None) -> list[str]:
     """``lora_target_modules`` for a mode. ``mixed`` names both namespaces in one list, which
     split_expert_lora_targets peels apart: attention names stay with stock PEFT, expert names become
@@ -103,6 +129,12 @@ def _mode_targets(mode: str, model_name: str, revision: str | None) -> list[str]
     if mode == "mixed":
         return attention_target_modules(model_name, revision) + _EXPERT_TARGETS
     return attention_target_modules(model_name, revision)
+
+
+def mixed_targets(attention: list[str]) -> list[str]:
+    """``mixed`` mode's targets over ``attention`` named explicitly, for a family whose checkpoint index
+    does not spell its attention projections as the module tree does."""
+    return [*attention, *_EXPERT_TARGETS]
 
 
 def model_name_for(mode: str, parallelism_config) -> str:
@@ -148,6 +180,55 @@ def _build_model_config(
     )
 
 
+def peft_model_config(
+    mode: str,
+    parallelism_config,
+    *,
+    model_name: str | None = None,
+    revision: str | None = None,
+    lora_target_modules: list[str] | None = None,
+) -> ModelConfig:
+    """The ``ModelConfig`` a mode trains with, its expert targets peeled into ``parallelism_config``.
+
+    The peel runs before any load, as the training scripts' ``init_training_script`` runs it, and
+    leaves only the attention targets on the returned config. A test that hands the config to another
+    production seam (the preference loader's reference gate reads the peeled targets) builds it here
+    and loads through :func:`load_peft_model_from_config`; the other arguments are
+    :func:`load_peft_model`'s.
+    """
+    model_name = model_name or model_name_for(mode, parallelism_config)
+    model_config = _build_model_config(mode, model_name, revision, targets=lora_target_modules)
+    parallelism_config.expert_lora = split_expert_lora_targets(model_config)
+    return model_config
+
+
+def load_peft_model_from_config(
+    model_config: ModelConfig,
+    parallelism_config,
+    *,
+    attn_implementation: str | None = None,
+    use_liger_kernel: bool = True,
+    reset_sinks: bool = True,
+):
+    """:func:`load_peft_model` for a :func:`peft_model_config` the caller holds. Returns (model, tokenizer, peft_config)."""
+    model, tokenizer = load_distributed_model(
+        model_name_or_path=model_config.model_name_or_path,
+        parallelism_config=parallelism_config,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        revision=model_config.model_revision,
+        attn_implementation=attn_implementation,
+        use_liger_kernel=use_liger_kernel,
+        quantization_config=get_quantization_config(model_config),
+        reset_sinks=reset_sinks,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    peft_config = setup_peft_model(_PEFT_ARGS, model, model_config, "CAUSAL_LM")
+    return model, tokenizer, peft_config
+
+
 def load_peft_model(
     mode: str,
     parallelism_config,
@@ -176,29 +257,16 @@ def load_peft_model(
     ``lora_target_modules`` replaces the mode's targets where the checkpoint's index cannot name them
     (a family whose projections do not end in ``_proj``).
     """
-    model_name = model_name or model_name_for(mode, parallelism_config)
-    model_config = _build_model_config(mode, model_name, revision, targets=lora_target_modules)
-
-    # Peel expert targets to native grouped-LoRA before the load (no-op for attention-only modes).
-    parallelism_config.expert_lora = split_expert_lora_targets(model_config)
-    quantization_config = get_quantization_config(model_config)
-
-    model, tokenizer = load_distributed_model(
-        model_name_or_path=model_name,
-        parallelism_config=parallelism_config,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        revision=revision,
+    model_config = peft_model_config(
+        mode, parallelism_config, model_name=model_name, revision=revision, lora_target_modules=lora_target_modules
+    )
+    return load_peft_model_from_config(
+        model_config,
+        parallelism_config,
         attn_implementation=attn_implementation,
         use_liger_kernel=use_liger_kernel,
-        quantization_config=quantization_config,
         reset_sinks=reset_sinks,
     )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    peft_config = setup_peft_model(_PEFT_ARGS, model, model_config, "CAUSAL_LM")
-    return model, tokenizer, peft_config
 
 
 def adapter_param_items(model) -> list[tuple[str, torch.Tensor]]:
@@ -215,6 +283,22 @@ def is_lora_b_key(key: str) -> bool:
     and "is this fresh" checks key off this set.
     """
     return key.endswith((".lora_B", "_lora_B")) or ".lora_B." in key
+
+
+def randomize_adapters(
+    model: torch.nn.Module, *, std: float = 1.0, lora_b_only: bool = False, dtype: torch.dtype | None = None
+) -> None:
+    """Redraw ``model``'s adapter tensors (its ``lora_B`` halves alone with ``lora_b_only``) from
+    ``N(0, std²)`` in place, as training would move them.
+
+    ``lora_B`` starts at zero, so an adapter left at its init folds to its base and a fold or merge
+    test could not tell the fold from a no-op. The draw lands on ``dtype``'s grid (default: each
+    tensor's own), for a test that compares the adapters across a cast to that dtype.
+    """
+    with torch.no_grad():
+        for name, param in adapter_param_items(model):
+            if not lora_b_only or is_lora_b_key(name):
+                param.copy_(torch.empty_like(param, dtype=dtype).normal_(std=std))
 
 
 def _is_trainable_adapter(name: str) -> bool:
@@ -253,7 +337,10 @@ def snapshot_adapters(model, *, expert_lora: bool) -> dict[str, torch.Tensor]:
 
 
 def assert_adapters_moved(before: dict, after: dict) -> tuple[bool, str]:
-    """At least one adapter changed and at least one zero-init B matrix became non-zero."""
+    """Every adapter is finite, at least one changed, and at least one zero-init B matrix moved."""
+    nonfinite = [k for k, t in after.items() if not torch.isfinite(t).all()]
+    if nonfinite:
+        return False, f"{len(nonfinite)} adapters are non-finite after training (e.g. {nonfinite[:3]})"
     moved = [k for k in before if k in after and not torch.equal(before[k], after[k])]
     b_moved = [k for k in moved if is_lora_b_key(k)]
     if not moved:
@@ -340,6 +427,107 @@ def adapter_save_checks(save_dir: str, rank: int) -> dict[str, bool]:
     return checks
 
 
+def _portable_adapter_key(name: str) -> str:
+    """A live adapter param name in the spelling the saver writes: adapter segment dropped, CP-wrapper
+    artifacts stripped. Idempotent, so a plain reloaded model's names land on the same keys."""
+    return PeftAdapterSaver._normalize_cp_adapter_key(strip_peft_adapter_segment(name))
+
+
+def verify_adapter_reload(
+    save_dir: str,
+    trained_lora: dict[str, torch.Tensor],
+    *,
+    model_name: str,
+    tokenizer,
+    rank: int,
+    local_rank: int,
+    quantization_config=None,
+) -> dict[str, bool]:
+    """Reload a saved attention adapter onto a fresh, unsharded base and check it restores the trained values.
+
+    ``trained_lora`` is :func:`snapshot_adapters` (``expert_lora=False``) of the trained model, taken on every
+    rank because it gathers sharded adapters. "``PeftModel.from_pretrained`` did not raise" is vacuous: lora_B
+    is zero-init, so an all-zero adapter loads cleanly and gives finite logits. Every trained tensor must come
+    back at its trained value instead, matched through the saver's portable key spelling so a CP-trained
+    adapter compares against its plain reload. Rank 0 only; other ranks get ``{}``.
+    """
+    if rank != 0:
+        return {}
+    checks = {}
+    try:
+        log("  Reloading base model for checkpoint verification...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map={"": local_rank},
+            quantization_config=quantization_config,
+        )
+        # A bare load leaves a remote-code family's non-persistent buffers (rotary ``inv_freq``,
+        # Lightning-Attention ``slope``) on transformers-5's uninitialized memory, so the reload runs
+        # the seam every toolkit load path runs; without it the check measures the allocator, not the
+        # checkpoint.
+        finalize_loaded_model(base_model)
+        log(f"  Loading adapter from {save_dir}...")
+        reloaded = PeftModel.from_pretrained(base_model, save_dir)
+
+        restored = {
+            _portable_adapter_key(n): p.detach().float().cpu() for n, p in reloaded.named_parameters() if "lora_" in n
+        }
+        trained = {_portable_adapter_key(n): t.float() for n, t in trained_lora.items()}
+        missing = sorted(k for k in trained if k not in restored)
+        differ = sorted(
+            k for k in trained if k in restored and not torch.allclose(trained[k], restored[k], atol=TOL.weight_atol)
+        )
+        # A zero-init lora_B that training never moved reloads as zero too, so equality alone could pass
+        # an adapter that carries nothing.
+        trained_b_live = any(is_lora_b_key(k) and bool(t.abs().amax() > 0) for k, t in trained.items())
+        checks["adapter_reload"] = trained_b_live and not missing and not differ
+        log(
+            f"  Adapter reload restores trained values: {'PASS' if checks['adapter_reload'] else 'FAIL'} "
+            f"({len(trained)} trained, live lora_B: {trained_b_live}, {len(missing)} missing {missing[:3]}, "
+            f"{len(differ)} differ {differ[:3]})"
+        )
+
+        reloaded.eval()
+        test_input = tokenizer("What is 2 + 2?", return_tensors="pt").to(f"cuda:{local_rank}")
+        with torch.no_grad():
+            output = reloaded(**test_input)
+        logits_finite = torch.isfinite(output.logits).all().item()
+        checks["reload_logits_finite"] = logits_finite
+        log(f"  Reload logits finite: {'PASS' if logits_finite else 'FAIL'}")
+
+        # Finiteness catches the reused-page reading of an unrepaired buffer but not the zeroed one:
+        # zeros are finite, and the model they build has a dead RoPE. Swept off the model's own
+        # non-persistent set, so it follows the load rather than a family's buffer names.
+        unset = [
+            name
+            for name, tensor in base_model.named_non_persistent_buffers()
+            if tensor.is_floating_point()
+            and tensor.numel()
+            and not (torch.isfinite(tensor).all().item() and tensor.abs().amax().item() > 0)
+        ]
+        checks["reload_buffers_initialized"] = not unset
+        log(f"  Reload buffers initialized: {'PASS' if not unset else f'FAIL {unset[:5]}'}")
+        if not logits_finite:
+            # separates a bad gathered save (non-finite saved tensor) from a bad reloaded forward
+            for shard in sorted(glob.glob(os.path.join(save_dir, "*.safetensors"))):
+                tensors = load_file(shard)
+                bad = {k: v for k, v in tensors.items() if not torch.isfinite(v).all()}
+                log(f"  [diag] {os.path.basename(shard)}: {len(bad)} non-finite of {len(tensors)} tensors")
+                for key, val in list(bad.items())[:10]:
+                    log(f"  [diag]   {key} shape={tuple(val.shape)} nan={val.isnan().sum().item()}")
+            log(f"  [diag] logits nan={output.logits.isnan().sum().item()} inf={output.logits.isinf().sum().item()}")
+
+        del reloaded, base_model
+        cleanup_memory()
+    except Exception as e:
+        log(f"  Checkpoint reload FAILED: {e}")
+        traceback.print_exc()
+        checks["adapter_reload"] = False
+    return checks
+
+
 def unwrap(trainer_model):
     """Unwrap FSDP/DDP/compile wrappers, keeping the (possibly PEFT) model for adapter access."""
     return extract_model_from_parallel(trainer_model, recursive=True)
@@ -347,3 +535,43 @@ def unwrap(trainer_model):
 
 def is_expert_lora_active(model) -> bool:
     return has_ep_lora(model)
+
+
+def merged_lora_targets(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """What PEFT's own in-place merge writes into each LoRA target of ``model``, which it modifies:
+    every ``LoraLayer`` merged, its base layer's tensors keyed by the plain module names."""
+    merged = {}
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            module.merge()
+            for key, value in module.get_base_layer().named_parameters():
+                merged[f"{name}.{key}"] = value.detach()
+    return merged
+
+
+def injected_lora_merge(
+    model: torch.nn.Module, lora_config, adapters: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """:func:`merged_lora_targets` of ``model`` with ``lora_config`` injected in place and ``adapters``
+    (keyed by ``model``'s own names) loaded: the oracle for a save that folds those adapters."""
+    inject_adapter_in_model(copy.deepcopy(lora_config), model)
+    loaded = model.load_state_dict(adapters, strict=False)
+    if loaded.unexpected_keys:
+        raise AssertionError(f"the oracle does not take every adapter tensor: {loaded.unexpected_keys[:3]}")
+    return merged_lora_targets(model)
+
+
+def injected_lora_fold(
+    model: torch.nn.Module, lora_config, adapters: dict[str, torch.Tensor], prefix: str
+) -> dict[str, torch.Tensor]:
+    """What a save that folds ``adapters`` writes per LoRA target of the backbone ``model``: its
+    :func:`injected_lora_merge` on ``model``'s device, at the save dtype, on the host.
+
+    ``adapters`` are keyed by the SentenceTransformer's names, whose backbone sits under ``prefix``;
+    the result by the backbone's own.
+    """
+    device = next(model.parameters()).device
+    merged = injected_lora_merge(
+        model, lora_config, {key[len(prefix) :]: value.to(device) for key, value in adapters.items()}
+    )
+    return {key: cast_to_save_dtype(value.cpu()) for key, value in merged.items() if key.endswith(".weight")}

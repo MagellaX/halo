@@ -14,7 +14,6 @@ Run: ``python tests/cpu/parallelism/test_cp_grouped_gemm_wrappers.py`` (or ``pyt
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -38,6 +37,7 @@ def _capture_ep_config(*, needs_ep_wrappers: bool, model_config) -> object | Non
     pc = SimpleNamespace(
         cp_size=8,
         max_concurrent_loading=0,
+        fp32_non_ep_params=False,
         needs_ep_wrappers=needs_ep_wrappers,
         create_cp_config=lambda: SimpleNamespace(cp_size=8),
         create_ep_config=lambda: _SENTINEL_EP_CONFIG,
@@ -67,4 +67,4 @@ def test_moe_under_pure_cp_with_grouped_gemm_off_gets_no_ep_config():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -552,36 +552,39 @@ class CodeContestsEnvironment(NativeToolUseEnvironment):
         traj.append_to_last_user(contract)
 
     @staticmethod
-    def _parse_answer(context: dict[str, Any]) -> Any:
-        """Return ``context["answer"]`` as a Python object, decoding a JSON-string answer from datasets."""
+    def _parse_answer(context: dict[str, Any]) -> dict[str, Any] | list[Any]:
+        """Return ``context["answer"]`` as a dict or list, decoding a JSON-string answer from datasets.
+
+        Any other payload raises, failing the episode at reset: graded against no tests, it would
+        score 0 inside its GRPO group, indistinguishable from a wrong solution.
+        """
         answer = context.get("answer", {})
         if isinstance(answer, str):
             try:
-                return json.loads(answer)
-            except ValueError:
-                # An unparseable answer yields zero tests, which grades as an ordinary policy failure
-                # — indistinguishable from a wrong solution. Say so, or a malformed shard trains as
-                # signal with nothing in the logs.
-                logger.warning("Unparseable 'answer' payload (%d chars); grading with no tests", len(answer))
-                return {}
+                answer = json.loads(answer)
+            except ValueError as exc:
+                raise ValueError(f"unparseable 'answer' payload ({len(answer)} chars): {exc}") from exc
+        if not isinstance(answer, (dict, list)):
+            raise ValueError(f"'answer' must be a dict or list of tests, got {type(answer).__name__}")
         return answer
 
     def _store_problem_data(self, traj: Trajectory, context: dict[str, Any]) -> None:
         """Store the tests, optional checker, and time limit the submission is graded against.
 
         Accepts a bare list, ``{"test_cases": [...]}``, or the Codeforces
-        ``{"tests": [...], "checker": ..., "time_limit": ...}``. Written to ``traj.info`` so concurrent
-        Ray-rollout episodes don't clobber each other; ``_submit`` reads it via the active-trajectory ContextVar.
+        ``{"tests": [...], "checker": ..., "time_limit": ...}``; a payload holding no tests raises, as
+        in :meth:`_parse_answer`. Written to ``traj.info`` so concurrent Ray-rollout episodes don't
+        clobber each other; ``_submit`` reads it via the active-trajectory ContextVar.
         """
         answer = self._parse_answer(context)
         if isinstance(answer, dict):
             test_cases = answer.get("tests") or answer.get("test_cases") or []
             checker = answer.get("checker")
             time_limit = answer.get("time_limit")
-        elif isinstance(answer, list):
-            test_cases, checker, time_limit = answer, None, None
         else:
-            test_cases, checker, time_limit = [], None, None
+            test_cases, checker, time_limit = answer, None, None
+        if not test_cases:
+            raise ValueError("'answer' holds no tests: expected a non-empty list, or a non-empty 'tests'/'test_cases'")
 
         traj.info["_test_cases"] = test_cases
         traj.info["_checker"] = checker

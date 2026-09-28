@@ -4,11 +4,16 @@ Stochastic rounding keeps the bf16 writes unbiased, where nearest rounding would
 ``lr*step`` update to zero and inflate the non-negative second moment. Writes go through
 ``p.detach()`` (``p.data`` carries its own version counter) and bump ``_version`` explicitly, since
 the raw-pointer Triton stores are invisible to ATen and the low-precision weight cache keys on it.
+
+The rounding noise is a pure function of the parameter's optimizer step and position
+(:func:`sr_seed_pair`), so replicas round alike and a resumed run rounds as the uninterrupted one did,
+with no generator state to checkpoint. An element's noise is keyed by its offset in the rank's local
+shard: reproducible for a given sharding layout (the one a resume must keep to restore optimizer
+shards), not across layouts.
 """
 
 import logging
 import math
-import random
 from collections.abc import Sequence
 from typing import Any
 
@@ -22,9 +27,11 @@ from src.optimizers.param_groups import decay_groups
 
 logger = logging.getLogger(__name__)
 
-# SR-seed RNG kept off global ``random`` (the data path advances that per-rank) and seeded
-# identically everywhere, so replicated bf16 params (HSDP/DDP/EP) round the same way.
-_SR_RNG = random.Random(0xB165EED)
+# Key of this optimizer's rounding noise; Muon keys its own, so the two never share a stream.
+_SR_KEY = 0xB165EED
+# Seeds stay inside int32, so a kernel's seed argument keeps one Triton specialization.
+_SR_SEED_MASK = (1 << 30) - 1
+_MASK64 = (1 << 64) - 1
 
 # Launch tile shared by every SR kernel here and in Muon: all of them make the same elementwise pass
 # over a flattened parameter.
@@ -87,17 +94,25 @@ def _adam_bf16_sr_kernel(
     tl.store(p_ptr + offsets, p_sr, mask=mask)
 
 
-def _draw_sr_seeds(use_triton: bool) -> tuple[int, int]:
-    """Draw the SR seed pair one bf16 parameter consumes, in the range its update path needs.
+def _splitmix64(x: int) -> int:
+    """SplitMix64's output function: a 64-bit avalanche mix, so adjacent inputs map to unrelated outputs."""
+    x = (x + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
 
-    Both paths draw a pair (the kernel derives both noise streams from one Philox call and uses only
-    the first), so the number of draws per parameter does not depend on the path taken. ``step``
-    draws unconditionally, including for a param it skips, so rank-nonuniform grad presence cannot
-    shift the rank-synchronized ``_SR_RNG`` stream and drift replicated params apart.
+
+def sr_seed_pair(key: int, step: int, index: int) -> tuple[int, int]:
+    """The SR seed pair of the parameter at flat position ``index`` in its optimizer, at its ``step``.
+
+    ``index`` is the parameter's position across the param groups, the index space of the optimizer's
+    state dict, so it is the same on every rank and in a rebuilt optimizer; ``step`` is the count the
+    restored state carries. Nothing is drawn, so the zero-LR step that materializes state before a
+    restore consumes nothing a later step reads. The eager step seeds its two SR writes with the
+    pair; the kernel derives both noise streams from the first.
     """
-    if use_triton:
-        return _SR_RNG.randint(0, 2**30), _SR_RNG.randint(0, 2**30)
-    return _SR_RNG.randint(0, 2**31 - 1), _SR_RNG.randint(0, 2**31 - 1)
+    mixed = _splitmix64(_splitmix64(key ^ step) ^ index)
+    return mixed & _SR_SEED_MASK, (mixed >> 32) & _SR_SEED_MASK
 
 
 def _triton_adam_bf16_step(
@@ -111,7 +126,7 @@ def _triton_adam_bf16_step(
     wd_factor: float,
     beta1: float,
     beta2: float,
-    sr_seeds: tuple[int, int] | None = None,
+    sr_seeds: tuple[int, int],
 ):
     """Launch the fused Adam+SR Triton kernel for a single parameter."""
     p_data = to_local(p.detach())
@@ -127,9 +142,8 @@ def _triton_adam_bf16_step(
 
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
-    # Pre-drawn by ``step`` (structural) or drawn here for direct calls; the kernel uses only the
-    # first of the pair (see :func:`_draw_sr_seeds`).
-    seed = (sr_seeds if sr_seeds is not None else _draw_sr_seeds(use_triton=True))[0]
+    # The kernel uses only the first of the pair (see :func:`sr_seed_pair`).
+    seed = sr_seeds[0]
 
     _adam_bf16_sr_kernel[grid](
         p_flat,
@@ -149,16 +163,16 @@ def _triton_adam_bf16_step(
     torch.autograd.graph.increment_version(p)  # the raw-pointer store above is invisible to ATen
 
 
-def stochastic_round_to_bf16(x_fp32: Tensor, seed: int | None = None) -> Tensor:
+def stochastic_round_to_bf16(x_fp32: Tensor, seed: int) -> Tensor:
     """Convert an fp32 tensor to bf16 by stochastic rounding, modifying it in-place.
 
-    Noise comes from the rank-synchronized ``_SR_RNG``, not torch's default generator whose CUDA
-    state drifts per rank, so replicated bf16 params round identically across replicas.
+    Noise comes from ``seed`` (:func:`sr_seed_pair`), not torch's default generator whose CUDA state
+    drifts per rank, so replicated bf16 params round identically across replicas.
     """
     x_fp32 = x_fp32.contiguous()
     bits = x_fp32.view(torch.int32)
     gen = torch.Generator(device=bits.device)
-    gen.manual_seed(seed if seed is not None else _SR_RNG.randint(0, 2**31 - 1))
+    gen.manual_seed(seed)
     bits += torch.randint(0, 0x10000, bits.shape, dtype=bits.dtype, device=bits.device, generator=gen)
     bits &= 0xFFFF0000
     return x_fp32.to(torch.bfloat16)
@@ -175,11 +189,9 @@ def _eager_adam_bf16_step(
     wd_factor: float,
     beta1: float,
     beta2: float,
-    sr_seeds: tuple[int, int] | None = None,
+    sr_seeds: tuple[int, int],
 ):
     """Eager (non-Triton) Adam+SR step for a single bf16 parameter."""
-    if sr_seeds is None:
-        sr_seeds = _draw_sr_seeds(use_triton=False)
     easq_seed, weight_seed = sr_seeds
     p_data = to_local(p.detach())
     grad = to_local(grad)
@@ -252,6 +264,7 @@ class AdamWBF16(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        index = 0  # flat position across the groups, the state dict's index space
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             lr = group["lr"]
@@ -262,10 +275,8 @@ class AdamWBF16(torch.optim.Optimizer):
             fp32_params = []
 
             for p in group["params"]:
-                # Seed draw and step count advance for every param, including one with no grad;
-                # otherwise rank-nonuniform grad presence would drift replicas apart.
-                sr_seeds = _draw_sr_seeds(self._triton_for(p)) if p.dtype == torch.bfloat16 else None
-
+                # The step count advances for every param, including one with no grad, so replicas
+                # whose grad presence differs still agree on the step a param's seed is keyed by.
                 state = self.state[p]
                 if len(state) == 0:
                     state["step"] = 0
@@ -273,16 +284,15 @@ class AdamWBF16(torch.optim.Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(p)
                 state["step"] += 1
 
-                if p.grad is None:
-                    continue
-
-                if p.dtype == torch.bfloat16:
-                    bf16_params.append((p, p.grad, state, sr_seeds))
-                else:
-                    fp32_params.append((p, p.grad, state))
+                if p.grad is not None:
+                    if p.dtype == torch.bfloat16:
+                        bf16_params.append((p, p.grad, state, index))
+                    else:
+                        fp32_params.append((p, p.grad, state))
+                index += 1
 
             if bf16_params:
-                for p, grad, state, sr_seeds in bf16_params:
+                for p, grad, state, param_index in bf16_params:
                     update_fn = _triton_adam_bf16_step if self._triton_for(p) else _eager_adam_bf16_step
                     step = state["step"]
                     bc1 = 1.0 - beta1**step
@@ -301,7 +311,7 @@ class AdamWBF16(torch.optim.Optimizer):
                         wd_factor,
                         beta1,
                         beta2,
-                        sr_seeds,
+                        sr_seed_pair(_SR_KEY, step, param_index),
                     )
 
             # Per-param updates (no _foreach_* — FSDP2 DTensor params can't mix with plain Tensors).

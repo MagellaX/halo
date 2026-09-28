@@ -17,7 +17,6 @@ Run: python tests/cpu/data/test_vlm_run_dispatch.py  (or pytest)
 
 import json
 import re
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,7 +37,7 @@ from src.data.pipeline.conversation import (
     IMAGE_PART_TYPE,
     conversation_carries_images,
 )
-from src.data.pipeline.preferences import apply_chat_template_to_preference_data, build_reward_preprocess_fn
+from src.data.pipeline.preferences import apply_chat_template_to_preference_data
 from src.data.pipeline.rendered import render_generation_prompt
 from src.data.pipeline.row_processors import (
     apply_chat_template_to_conversations,
@@ -52,7 +51,7 @@ from src.data.vlm import (
     is_vlm_run,
     process_vlm_conversation,
 )
-from src.training.script_runner import enforce_text_path_padding_side
+from src.training.script_runner import enforce_text_path_padding_side, resolve_vlm_run
 from tests.common.utils import load_script_module
 
 # Real configs, not stand-ins: the verdict must follow what transformers says about the architecture.
@@ -158,6 +157,28 @@ def test_args_without_the_modality_knobs_still_resolve():
     bare = SimpleNamespace()
     assert not is_vlm_run(bare, "Qwen/Qwen3.5-9B", _dataset([TEXT_TURNS]), config=VLM_CONFIG)
     assert is_vlm_run(bare, "Qwen/Qwen3.5-9B", _dataset([TEXT_TURNS], {"image": [None]}), config=VLM_CONFIG)
+
+
+def test_the_script_seam_probes_the_checkpoint_the_run_loads(monkeypatch):
+    """A training script's probe must read the pinned commit under the run's own trust: hub ``main``
+    can name a different modality, and a forced trust would execute code the run never trusted."""
+    seen = []
+    monkeypatch.setattr(vlm_module, "is_vlm_model", lambda name, **kwargs: seen.append((name, kwargs)) or True)
+    model_config = SimpleNamespace(model_name_or_path="org/ckpt", model_revision="abc123", trust_remote_code=True)
+
+    assert resolve_vlm_run(_args(images_field="images"), model_config, None, text_only_model=False)
+    assert seen == [("org/ckpt", {"config": None, "revision": "abc123", "trust_remote_code": True})]
+
+
+@pytest.mark.parametrize("vlm_checkpoint", [True, False])
+def test_a_checkpoint_verdict_already_taken_is_not_probed_again(monkeypatch, vlm_checkpoint):
+    monkeypatch.setattr(vlm_module, "is_vlm_model", lambda *a, **k: pytest.fail("the checkpoint was probed again"))
+    model_config = SimpleNamespace(model_name_or_path="org/ckpt", model_revision=None, trust_remote_code=False)
+
+    verdict = resolve_vlm_run(
+        _args(images_field="images"), model_config, None, text_only_model=False, vlm_checkpoint=vlm_checkpoint
+    )
+    assert verdict is vlm_checkpoint
 
 
 # --- the dataset-side declaration ----------------------------------------------------------------
@@ -321,19 +342,6 @@ def test_preference_renderer_refuses_an_image_content_part(field):
         apply_chat_template_to_preference_data(row, _UnreachableTokenizer())
 
 
-def test_reward_renderer_refuses_an_image_content_part():
-    """Bradley-Terry reward prep renders prompt+chosen and prompt+rejected itself."""
-    fn = build_reward_preprocess_fn(_UnreachableTokenizer(), max_length=64)
-    with pytest.raises(ValueError, match="image content part"):
-        fn(
-            {
-                "prompt": [IMAGE_TURNS[:1]],
-                "chosen": [[{"role": "assistant", "content": "a"}]],
-                "rejected": [[{"role": "assistant", "content": "b"}]],
-            }
-        )
-
-
 def test_generation_prompt_renderer_refuses_an_image_content_part():
     """The GRPO family's shared prompt renderer (RLVR, environmental): a rollout has no pixels."""
     with pytest.raises(ValueError, match="image content part"):
@@ -461,4 +469,4 @@ def test_vlm_run_keeps_the_processor_padding_side():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

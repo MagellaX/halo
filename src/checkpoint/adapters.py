@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 from accelerate.logging import get_logger
@@ -21,8 +21,8 @@ from transformers import PreTrainedModel
 from src.checkpoint.format import (
     ADAPTER_CONFIG_FILE,
     ADAPTER_SAFETENSORS_FILE,
-    ADAPTER_WEIGHT_NAMES,
     DEFAULT_MAX_SHARD_SIZE,
+    adapter_weight_paths,
     cast_to_save_dtype,
 )
 from src.checkpoint.tool_io import (
@@ -53,6 +53,15 @@ MERGED_ADAPTER_CONFIG_DIR = "original_adapter_config"
 EXPERT_LORA_PEFT_TYPE = "EXPERT_LORA"
 MIXED_EXPERT_LORA_PEFT_TYPE = "LORA_WITH_EP_EXPERT_LORA"
 EXPERT_LORA_PEFT_TYPES = frozenset({EXPERT_LORA_PEFT_TYPE, MIXED_EXPERT_LORA_PEFT_TYPE})
+# Where a mixed attention+expert ``adapter_config.json`` describes its expert half; the expert-only one
+# carries the same fields at the top level.
+EXPERT_LORA_CONFIG_KEY = "ep_expert_lora"
+
+# The ``LoraConfig`` fields a LoRA delta is scaled by (and, under DoRA, reparametrized with). A resume
+# under other values restores every adapter tensor by name and shape and rescales the delta, so the
+# values recorded beside the adapter are what refuse it. The native expert adapters record the first two.
+LORA_SCALING_FIELDS = ("lora_alpha", "use_rslora", "use_dora", "alpha_pattern")
+EXPERT_LORA_SCALING_FIELDS = ("lora_alpha", "use_rslora")
 
 # What PEFT appends below the adapted module's own path in a saved key.
 _ADAPTER_KEY_SUFFIX_MARKERS = (".lora_", ".modules_to_save", ".base_layer", ".original_module")
@@ -71,15 +80,6 @@ def is_expert_lora_key(key: str) -> bool:
     matching those here would route real PEFT adapters into the EP loader.
     """
     return ".experts." in key and key.endswith((".lora_A", ".lora_B"))
-
-
-def adapter_weight_paths(adapter_dir: str) -> tuple[str, ...]:
-    """The adapter weight files a directory may carry, in PEFT's own load-preference order.
-
-    Taken from the :data:`~src.checkpoint.format.ADAPTER_WEIGHT_NAMES` tuple that declares it: a
-    reader that misses the ``.bin`` fallback reads a saved adapter as absent.
-    """
-    return tuple(os.path.join(adapter_dir, name) for name in ADAPTER_WEIGHT_NAMES)
 
 
 def _adapter_tensor_keys(adapter_dir: str) -> list[str]:
@@ -169,6 +169,42 @@ def read_adapter_file(path: str) -> dict:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
+def lora_scaling_mismatch(adapter_dir: str, attention: Mapping | None, expert: Mapping | None = None) -> str | None:
+    """Why the adapter in ``adapter_dir`` was trained at another LoRA scaling than the live run, or None.
+
+    ``attention`` is the live ``LoraConfig`` as a dict, ``expert`` the live native expert adapters'
+    config fields (None for a half the run does not train); each is held to the ``adapter_config.json``
+    beside the adapter on :data:`LORA_SCALING_FIELDS` / :data:`EXPERT_LORA_SCALING_FIELDS`. A missing
+    config is a reason too, since nothing else records the scaling. Rank-local read.
+    """
+    if attention is None and expert is None:
+        return None
+    config_path = os.path.join(adapter_dir, ADAPTER_CONFIG_FILE)
+    if not os.path.isfile(config_path):
+        return (
+            f"{config_path} is missing, so the LoRA scaling the adapter beside it was trained at cannot be "
+            f"held to this run's. Resume from a complete checkpoint."
+        )
+    with open(config_path) as fh:
+        saved = json.load(fh)
+    halves = [("", saved, attention, LORA_SCALING_FIELDS)]
+    halves.append(("expert ", saved.get(EXPERT_LORA_CONFIG_KEY, saved), expert, EXPERT_LORA_SCALING_FIELDS))
+    changed = {
+        f"{half}{field}: saved {recorded.get(field)!r}, live {live.get(field)!r}": field
+        for half, recorded, live, fields in halves
+        if live is not None
+        for field in fields
+        if recorded.get(field) != live.get(field)
+    }
+    if not changed:
+        return None
+    return (
+        f"the adapter at {adapter_dir} was trained at another LoRA scaling than this run ({'; '.join(changed)}): "
+        f"its tensors would restore by name and shape and every delta would be rescaled. Resume with the "
+        f"{' / '.join(dict.fromkeys(changed.values()))} it was saved with."
+    )
+
+
 def cast_adapter_state_to_save_dtype(state: dict) -> dict:
     """Adapter-file cast honouring the balancing export contract: balancing tensors (a
     ``modules_to_save`` router's bias riding along with the clone) stay at trained dtype, as in every
@@ -193,7 +229,7 @@ def _expert_lora_merge_remedy(adapter_dir: str, *, mixed: bool) -> str:
     ``merge_expert_lora_on_save``, which folds them inside
     :func:`~src.distributed.checkpoint.save.save_ep_checkpoint`'s gathered save. On the mixed shape
     that flag also routes the write past :class:`PeftAdapterSaver` and folds the attention half
-    (``merged_adapters`` held open over it), so ``mixed`` only selects the wording.
+    into each tensor it writes, so ``mixed`` only selects the wording.
     """
     if mixed:
         shape = (
@@ -240,6 +276,30 @@ def assert_no_expert_lora_adapter(adapter_dir: str) -> None:
         raise ValueError(_expert_lora_merge_remedy(adapter_dir, mixed=len(expert_keys) != len(keys)))
 
 
+def adapter_input_gates(adapter_dir: str, output_dir: str) -> PeftConfig:
+    """Refuse a saved adapter a tool cannot convert into ``output_dir``, then return its config.
+
+    The gate order every tool writing from a saved adapter shares; each gate covers a failure that
+    raises nothing:
+
+    * a per-rank EP/TP directory reads as whole while every expert tensor is one rank's slice.
+      Checked on the adapter and again on the base, from which a merge takes its weights;
+    * an ``--output_dir`` pointing at the adapter or the base destroys that input, since the save
+      deletes the weight files it does not overwrite;
+    * ``merge_and_unload`` cannot fold a native EP expert-LoRA adapter, and drops every expert delta.
+    """
+    reject_sharded_checkpoint(adapter_dir)
+    reject_in_place_conversion(adapter_dir, output_dir)
+    assert_no_expert_lora_adapter(adapter_dir)
+
+    peft_config = PeftConfig.from_pretrained(adapter_dir)
+    base_model_path = peft_config.base_model_name_or_path
+    if base_model_path and os.path.isdir(base_model_path):
+        reject_in_place_conversion(base_model_path, output_dir)
+        reject_sharded_checkpoint(base_model_path)
+    return peft_config
+
+
 def merge_adapter_into_base(
     adapter_dir: str,
     output_dir: str,
@@ -254,14 +314,7 @@ def merge_adapter_into_base(
 ) -> PreTrainedModel:
     """Fold a saved PEFT adapter into its base model and write the merged checkpoint.
 
-    The gate order every merge tool shares; each gate covers a failure that raises nothing:
-
-    * a per-rank EP/TP directory reads as whole while every expert tensor is one rank's slice.
-      Checked on the adapter and again on the base, from which a merge takes its weights;
-    * an ``--output_dir`` pointing at the adapter or the base destroys that input, since the save
-      deletes the weight files it does not overwrite;
-    * ``merge_and_unload`` cannot fold a native EP expert-LoRA adapter, and drops every expert delta.
-
+    :func:`adapter_input_gates` runs first, so nothing is loaded or written for a refused input.
     ``excuse_task_head`` is read off the adapter's ``modules_to_save``: a classification head on a
     plain causal-LM base is the only absence the tool's own ``load_base_model`` may excuse.
     ``prepare_for_save`` mutates the merged model before the save, which carries the base's aux files
@@ -269,15 +322,8 @@ def merge_adapter_into_base(
     """
     log = logger.info if verbose else lambda message: None
 
-    reject_sharded_checkpoint(adapter_dir)
-    reject_in_place_conversion(adapter_dir, output_dir)
-    assert_no_expert_lora_adapter(adapter_dir)
-
-    peft_config = PeftConfig.from_pretrained(adapter_dir)
+    peft_config = adapter_input_gates(adapter_dir, output_dir)
     base_model_path = peft_config.base_model_name_or_path
-    if base_model_path and os.path.isdir(base_model_path):
-        reject_in_place_conversion(base_model_path, output_dir)
-        reject_sharded_checkpoint(base_model_path)
 
     # Size preflight before the heavy load: without a device map the whole base lands in host RAM,
     # and the merged output is about the base checkpoint's size on disk.
@@ -307,11 +353,13 @@ def merge_adapter_into_base(
 
     log(f"Saving merged model to {output_dir}...")
     os.makedirs(output_dir, exist_ok=True)
+    # The base's resume state describes the base's own run, not this merge of an adapter into it.
     save_full_checkpoint(
         merged_model,
         output_dir,
         processing_class=processing_class,
         source_dir=base_model_path,
+        include_resume_sidecars=False,
         max_shard_size=max_shard_size,
     )
     copy_training_sidecars(adapter_dir, output_dir)

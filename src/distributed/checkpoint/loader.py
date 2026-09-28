@@ -2,7 +2,9 @@
 
 :class:`CheckpointLoader` implements the weight restore paths; optimizer state and the LR scheduler
 are handled by :class:`~src.distributed.checkpoint.optimizer.OptimizerShardStore`, adapters by
-:func:`~src.distributed.checkpoint.peft.restore_adapters`. Resume policy only — the file reads it
+:func:`~src.distributed.checkpoint.peft.restore_adapters`. :func:`weights_read_from` and
+:func:`built_from_checkpoint` are its construction-identity probe, public for the trainers whose own
+restores refuse a model built from the checkpoint. Resume policy only — the file reads it
 drives (:class:`StreamingCheckpointReader`, :func:`read_checkpoint_key_set`) live in the format leaf,
 shared with the standalone tools.
 """
@@ -19,22 +21,28 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from src.checkpoint.config_export import LOADED_WEIGHTS_FROM_ATTR
 from src.checkpoint.format import (
-    ADAPTER_WEIGHT_NAMES,
+    has_adapter_weight_file,
     has_whole_model_weight_file,
     is_sharded_checkpoint,
     load_full_state_dict,
+    missing_resume_adapter_reason,
     read_checkpoint_key_set,
     read_specific_keys_from_checkpoint,
+    resume_adapter_dir,
+    resume_adapter_on_own_weights_reason,
+    unmarked_merged_checkpoint_reason,
 )
 from src.distributed.checkpoint.context import CheckpointLoadContext
 from src.distributed.checkpoint.coordination import KEY_PREVIEW_COUNT, all_ranks_ok, joined_streaming_reader
-from src.distributed.checkpoint.peft import restore_adapters
+from src.distributed.checkpoint.peft import find_peft_model, restore_adapters
 from src.distributed.checkpoint.save import reject_unhandled_pp_axes
+from src.distributed.expert_parallel.expert_weights import has_ep_lora
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.runtime import (
     DeferredRankFailure,
     barrier,
     broadcast_from_rank0,
+    copy_full_tensor,
     is_global_main_process,
     is_multi_rank_run,
     reject_across_ranks,
@@ -53,7 +61,7 @@ logger = logging.getLogger(__name__)
 _MIN_RESUME_COVERAGE_FRACTION = 0.5
 
 
-def _weights_read_from(model) -> str | None:
+def weights_read_from(model) -> str | None:
     """Where the live model's weights were read, or None for a from-config random init.
 
     ``load_distributed_model`` stamps ``_loaded_weights_from`` (None under ``init_from_scratch``,
@@ -67,7 +75,7 @@ def _weights_read_from(model) -> str | None:
     return str(getattr(getattr(live, "config", None), "_name_or_path", "")) or None
 
 
-def _built_from_checkpoint(live_source: str | None, checkpoint: str) -> bool:
+def built_from_checkpoint(live_source: str | None, checkpoint: str) -> bool:
     """Whether a model whose weights were read from ``live_source`` was built from ``checkpoint``.
 
     ``realpath`` identity, so a symlinked or relative spelling of the same directory still counts;
@@ -76,6 +84,13 @@ def _built_from_checkpoint(live_source: str | None, checkpoint: str) -> bool:
     per-rank answer splits the world.
     """
     return live_source is not None and os.path.realpath(live_source) == os.path.realpath(checkpoint)
+
+
+def _trains_adapters(model) -> bool:
+    """Whether ``model`` carries adapters, attention PEFT or native EP expert LoRA (structural, so
+    rank-uniform)."""
+    unwrapped = unwrap_framework_wrappers(model)
+    return find_peft_model(unwrapped) is not None or has_ep_lora(unwrapped)
 
 
 def _construction_whence(live_source: str | None, subject: str = "model") -> str:
@@ -173,7 +188,8 @@ class CheckpointLoader:
         """Load model weights, routing by mode.
 
         - EP/CP/EP+CP/EP+TP: skip (already loaded via load_distributed_model; HF-format keys
-          incompatible with EP-fused/CP-wrapped structure).
+          incompatible with EP-fused/CP-wrapped structure), then restore the adapters (see
+          :meth:`_restore_adapters_onto_constructed_model`).
         - FSDP2 only: set_model_state_dict() distributes full-tensor weights into DTensor params.
         - TP (pure, or TP+DP): each rank distributes the full tensors into its DTensor shards (see
           :meth:`_load_tp`).
@@ -194,15 +210,18 @@ class CheckpointLoader:
             return
 
         if self._needs_skip_weight_load():
-            live_source = _weights_read_from(model if model is not None else ctx.model)
+            live_model = model if model is not None else ctx.model
+            live_source = weights_read_from(live_model)
             # Base weights only load at construction, so both refusals below turn on whether this
             # checkpoint ships base weights (an adapter-only one has none to reload). Decided on rank 0:
             # ``realpath`` resolves locally, so per-rank branching splits the world on a non-shared FS.
             has_base = False
             built_from_ckpt = False
             read_failed = False
+            merged_resume_adapter = None
             if is_global_main_process():
-                built_from_ckpt = _built_from_checkpoint(live_source, resume_from_checkpoint)
+                built_from_ckpt = built_from_checkpoint(live_source, resume_from_checkpoint)
+                merged_resume_adapter = resume_adapter_dir(resume_from_checkpoint)
                 try:
                     has_base = bool(read_checkpoint_key_set(resume_from_checkpoint)) or is_sharded_checkpoint(
                         resume_from_checkpoint
@@ -212,6 +231,7 @@ class CheckpointLoader:
                     logger.warning(f"Unreadable checkpoint key set at {resume_from_checkpoint}: {e}")
             built_from_ckpt = broadcast_from_rank0(built_from_ckpt)
             ships_base_weights = broadcast_from_rank0(has_base)
+            merged_resume_adapter = broadcast_from_rank0(merged_resume_adapter)
             if broadcast_from_rank0(read_failed):
                 # Degrading to "no base weights" would take the adapter-only path and continue on the
                 # base weights, which is the failure this guard exists to stop.
@@ -228,21 +248,17 @@ class CheckpointLoader:
                     f"would silently carry the LAST weights. Export the best checkpoint directly "
                     f"instead."
                 )
-            if ships_base_weights and not built_from_ckpt:
-                whence = _construction_whence(live_source)
-                raise ValueError(
-                    f"EP/CP resume requires the model to be constructed FROM the checkpoint: "
-                    f"{whence}, not '{resume_from_checkpoint}' — the run would silently continue on "
-                    f"those weights. Launch via the training scripts (they repoint "
-                    f"model_name_or_path at the checkpoint), or pass a model loaded from the "
-                    f"checkpoint directory."
-                )
             # Base weights came from load_distributed_model, but LoRA adapters are fresh zero-init.
-            restore_adapters(
-                resume_from_checkpoint, model if model is not None else ctx.model, is_cp_mode=ctx.is_cp_mode
+            self._restore_adapters_onto_constructed_model(
+                resume_from_checkpoint,
+                live_model,
+                live_source=live_source,
+                merged_resume_adapter=merged_resume_adapter,
+                ships_base_weights=ships_base_weights,
+                built_from_ckpt=built_from_ckpt,
             )
             # Wrapper-level trained params are dropped by the base-only reload too.
-            self._restore_extra_trained_params(resume_from_checkpoint, model if model is not None else ctx.model)
+            self._restore_extra_trained_params(resume_from_checkpoint, live_model)
             if is_global_main_process():
                 mode = "+".join(
                     m
@@ -266,6 +282,46 @@ class CheckpointLoader:
             return ctx.super_load_from_checkpoint(resume_from_checkpoint, model)
 
         return self._load_tp(resume_from_checkpoint, model, for_best_model=for_best_model)
+
+    def _restore_adapters_onto_constructed_model(
+        self,
+        checkpoint: str,
+        model,
+        *,
+        live_source: str | None,
+        merged_resume_adapter: str | None,
+        ships_base_weights: bool,
+        built_from_ckpt: bool,
+    ) -> None:
+        """The adapter half of an EP/CP resume, whose base weights were read at construction.
+
+        A ``merge_expert_lora_on_save`` checkpoint (``merged_resume_adapter`` set, off its marker)
+        resumes its unmerged adapters onto a model built from the BASE: its own weights already hold
+        the delta, so a model built from them would take it twice. Any other checkpoint that ships
+        base weights must be what the model was built from, and its adapters, if any, sit at its
+        root. Every input is rank-0-decided and broadcast, and the adapter read is a consensus, so
+        each refusal fires on every rank or none.
+        """
+        is_cp_mode = self.ctx.is_cp_mode
+        if merged_resume_adapter is not None:
+            if built_from_ckpt:
+                raise ValueError(resume_adapter_on_own_weights_reason(checkpoint))
+            if restore_adapters(merged_resume_adapter, model, is_cp_mode=is_cp_mode) is None:
+                raise RuntimeError(missing_resume_adapter_reason(checkpoint))
+            return
+        if ships_base_weights and not built_from_ckpt:
+            whence = _construction_whence(live_source)
+            raise ValueError(
+                f"EP/CP resume requires the model to be constructed FROM the checkpoint: "
+                f"{whence}, not '{checkpoint}' — the run would silently continue on "
+                f"those weights. Launch via the training scripts (they repoint "
+                f"model_name_or_path at the checkpoint), or pass a model loaded from the "
+                f"checkpoint directory."
+            )
+        restored = restore_adapters(checkpoint, model, is_cp_mode=is_cp_mode)
+        if ships_base_weights and restored is None and _trains_adapters(model):
+            # Only a merged save ships base weights from an adapter run.
+            raise ValueError(unmarked_merged_checkpoint_reason(checkpoint))
 
     def _load_tp(self, checkpoint: str, model=None, *, for_best_model: bool = False) -> None:
         """Load a gathered checkpoint into a TP model's DTensor params.
@@ -308,8 +364,8 @@ class CheckpointLoader:
         # repoint model_name_or_path at the checkpoint on resume), so the re-read is waste. Decided on
         # rank 0, since ``realpath`` resolves locally. Best-model loads must still read: the live
         # weights trained past it.
-        live_source = _weights_read_from(model)
-        constructed_from_ckpt = broadcast_from_rank0(_built_from_checkpoint(live_source, checkpoint))
+        live_source = weights_read_from(model)
+        constructed_from_ckpt = broadcast_from_rank0(built_from_checkpoint(live_source, checkpoint))
         if not for_best_model and constructed_from_ckpt:
             if is_global_main_process():
                 logger.info(f"TP resume: model was constructed from {checkpoint}; skipping the weight reload.")
@@ -396,13 +452,13 @@ class CheckpointLoader:
         self._reject_sharded_resume(checkpoint)
 
         # EP experts only load at construction, so a model not built from the checkpoint resumes base
-        # experts. The signal is ``_weights_read_from`` (None for a from-config init), not
+        # experts. The signal is ``weights_read_from`` (None for a from-config init), not
         # ``config._name_or_path``, which survives a build that read no weights. Both inputs are
         # rank-local (``ep_moe_layers()`` is stage-dependent, ``realpath`` resolves per node), so
         # every rank joins the verdict before acting rather than raising inside the gate.
-        live_source = _weights_read_from(stage)
+        live_source = weights_read_from(stage)
         reason = None
-        if stage.ep_moe_layers() and not _built_from_checkpoint(live_source, checkpoint):
+        if stage.ep_moe_layers() and not built_from_checkpoint(live_source, checkpoint):
             whence = _construction_whence(live_source, "stage")
             reason = (
                 f"a stage's EP expert weights only load at construction, so resume requires the model "
@@ -443,15 +499,8 @@ class CheckpointLoader:
                             f"parameter/buffer to load into — a state-dict hook the PP loader does "
                             f"not understand."
                         )
-                    value = reader.get(global_name).to(target.dtype)
-                    data = target.data if isinstance(target, torch.nn.Parameter) else target
-                    if isinstance(data, DTensor):
-                        # Default ``src_data_rank``: the stage's mesh rank 0 broadcasts its read, so
-                        # the stage's DP replicas hold one node's bytes and the collective stays inside
-                        # the stage's mesh (``_load_tp`` slices per rank with ``src_data_rank=None``).
-                        value = distribute_tensor(value, data.device_mesh, data.placements)
-                    data.copy_(value)
-                    del value
+                    # A DTensor target is a collective inside this stage's own mesh.
+                    copy_full_tensor(target, reader.get(global_name))
 
         if is_global_main_process():
             logger.info(f"✓ PP stage checkpoint loaded from {checkpoint} ({len(local_by_global)} tensors)")
@@ -555,9 +604,7 @@ class CheckpointLoader:
 
         if not source_has_file:
             # PEFT runs save adapter-only checkpoints; route through the DTensor-aware restorer.
-            adapter_present = broadcast_from_rank0(
-                any(os.path.isfile(os.path.join(resume_from_checkpoint, name)) for name in ADAPTER_WEIGHT_NAMES)
-            )
+            adapter_present = broadcast_from_rank0(has_adapter_weight_file(resume_from_checkpoint))
             if adapter_present:
                 restore_adapters(resume_from_checkpoint, model, is_cp_mode=self.ctx.is_cp_mode)
                 barrier()
@@ -572,8 +619,8 @@ class CheckpointLoader:
         # 100B+ state dict is waste. Keyed on where the weights were read (an ``init_from_scratch``
         # build matches on ``_name_or_path`` yet holds random weights) and decided on rank 0, since
         # ``realpath`` resolves locally. Best-model loads must still read: the live weights trained on.
-        weights_source = _weights_read_from(model)
-        constructed_from_ckpt = broadcast_from_rank0(_built_from_checkpoint(weights_source, resume_from_checkpoint))
+        weights_source = weights_read_from(model)
+        constructed_from_ckpt = broadcast_from_rank0(built_from_checkpoint(weights_source, resume_from_checkpoint))
         if not for_best_model and constructed_from_ckpt:
             if is_global_main_process():
                 logger.info(f"FSDP2 resume: model was constructed from {resume_from_checkpoint}; skipping re-load.")

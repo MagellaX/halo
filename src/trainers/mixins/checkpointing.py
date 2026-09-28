@@ -1,10 +1,10 @@
 """Checkpoint save/resume plus the sidecars the base Trainer does not handle.
 
 Routes every write and every restore through :mod:`src.distributed.checkpoint` (the saver ladder,
-the loader, the per-rank optimizer shard store) and adds the LR-scheduler and
-router-balancing-bias sidecars, rotation deferred until they are on disk, and a parallelism-aware
-best-model load. Its zero-arg ``super()`` calls must resolve past every sibling mixin to the base
-Trainer, which ``tests/cpu/trainers/test_mixin_composition.py`` checks.
+the loader, the per-rank optimizer shard store) and adds the LR-scheduler and router-balancing-bias
+sidecars, a hook for a trainer's own, rotation deferred until they are on disk, and a
+parallelism-aware best-model load. Its zero-arg ``super()`` calls must resolve past every sibling
+mixin to the base Trainer, which ``tests/cpu/trainers/test_mixin_composition.py`` checks.
 """
 
 import inspect
@@ -34,7 +34,7 @@ from src.distributed.checkpoint.coordination import consensus_read
 from src.distributed.checkpoint.loader import CheckpointLoader
 from src.distributed.checkpoint.optimizer import OptimizerShardStore
 from src.distributed.checkpoint.peft import PeftAdapterSaver, find_peft_model
-from src.distributed.checkpoint.save import save_checkpoint
+from src.distributed.checkpoint.save import remove_stale_resume_marker, save_checkpoint, save_resume_adapter
 from src.distributed.expert_parallel.expert_weights import has_ep_lora
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.runtime import (
@@ -76,6 +76,9 @@ class CheckpointingMixin:
     # :meth:`_save_checkpoint` to decide whether a recorded failure may be deferred to the collective
     # rejection or must raise on this rank now.
     _model_save_collectives_done: bool = False
+    # True while :meth:`_save_checkpoint`'s base save runs ``save_model``, whose context then marks a
+    # training checkpoint (tensors at their live dtype) rather than an export.
+    _writing_training_checkpoint: bool = False
 
     def _checkpoint_load_context(self) -> CheckpointLoadContext:
         """Capture the current model/optimizer/scheduler for a resume path (rebuilt per call so the
@@ -158,16 +161,25 @@ class CheckpointingMixin:
         ``save_total_limit: 1`` a preemption between the base's rotation and the optimizer-shard
         writes would leave one checkpoint with no optimizer state. For the same reason the base's
         rank-0 optimizer.pt stays in place until its replacement shards are written.
+
+        The weights keep their live dtype (``CheckpointContext.training_checkpoint``), so fp32 masters
+        are written unrounded; the final ``save_model`` export casts to the save dtype.
         """
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        output_dir = os.path.join(self._get_output_dir(trial=trial), checkpoint_folder)
+        # Any run type: a marker left in a directory this save rewrites is stale by definition.
+        remove_stale_resume_marker(output_dir)
         # Do not force save_only_model for EP/CP here: it drops scheduler.pt and RNG.
         guard = DeferredRankFailure(f"checkpoint write to step {self.state.global_step}")
         save_total_limit = self.args.save_total_limit
         self.args.save_total_limit = None  # rotation is deferred below, not dropped
         self._model_save_collectives_done = False
+        self._writing_training_checkpoint = True
         try:
             guard.run(partial(super()._save_checkpoint, model, trial))
         finally:
             self.args.save_total_limit = save_total_limit
+            self._writing_training_checkpoint = False
         # The fence covers the base's writer-local tail (rank-0 optimizer.pt, RNG,
         # trainer_state.json), so an ENOSPC there reaches every rank as a diagnostic rather than
         # leaving them blocked in the next collective. It cannot cover the region before that: the
@@ -180,17 +192,16 @@ class CheckpointingMixin:
                 f"save's collectives completed: {guard.reason}"
             )
         guard.reject()
+        self._save_merged_checkpoint_resume_adapter(output_dir)
         # save_only_model drops scheduler.pt on every mode, re-warming the LR from step 0 on resume.
         self._persist_lr_scheduler_for_resume(trial)
+        self._persist_trainer_sidecars(output_dir)
 
         # Pure TP skips FSDP2 but keeps per-rank TP optimizer shards; one optimizer.pt clobbers them.
         pure_tp = self.parallelism_config.is_tp_mode and not self._fsdp_wrapped
         if (not self._fsdp_wrapped and not pure_tp) or self.args.save_only_model:
             self._rotate_checkpoints_after_sidecars(trial)
             return
-
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-        output_dir = os.path.join(self._get_output_dir(trial=trial), checkpoint_folder)
 
         # Sync before modifying checkpoint files (base Trainer's post-save I/O is async across ranks).
         barrier()
@@ -224,6 +235,30 @@ class CheckpointingMixin:
                 best_model_checkpoint=self.state.best_model_checkpoint,
                 use_mtime=True,
             )
+
+    def _save_merged_checkpoint_resume_adapter(self, checkpoint_dir: str) -> None:
+        """Write a ``merge_expert_lora_on_save`` checkpoint's unmerged adapters, which it resumes from
+        (:func:`~src.distributed.checkpoint.save.save_resume_adapter`); no-op for any other run. A
+        trainer whose own ``save_model`` folds adapters overrides it (the embedding trainer's
+        injected LoRA).
+
+        A checkpoint sidecar rather than part of ``save_model``: the final export is a serving
+        artifact with no training state to resume, so it carries none. Written under
+        ``save_only_model`` too, where the adapters are still the only exact trained weights.
+        Collective, on every rank.
+        """
+        if not self.parallelism_config.merge_expert_lora_on_save:
+            return
+        save_resume_adapter(self._checkpoint_context(), checkpoint_dir)
+
+    def _persist_trainer_sidecars(self, checkpoint_dir: str) -> None:
+        """Write a trainer's own resume state into ``checkpoint_dir``; none by default.
+
+        Called on every rank of every checkpoint save, after the base save's collectives and before
+        rotation, so a checkpoint is never rotated in ahead of its sidecars. An override fences its
+        save-rank write with :func:`barrier_on_exit`, and its trainer lists it ahead of
+        :class:`DistributedTrainerMixin` in its bases so this default does not shadow it.
+        """
 
     def _persist_lr_scheduler_for_resume(self, trial) -> None:
         """Write ``scheduler.pt`` even under ``save_only_model`` (which makes the base Trainer drop it).
@@ -463,4 +498,5 @@ class CheckpointingMixin:
             cp_wrapper=self._find_cp_wrapper(),
             tokenizer=getattr(self, "processing_class", None),
             pp_wrapper_state=self._pp_wrapper_state,
+            training_checkpoint=self._writing_training_checkpoint,
         )

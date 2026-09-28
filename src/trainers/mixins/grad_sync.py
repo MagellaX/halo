@@ -111,52 +111,59 @@ class GradientSyncMixin:
             grads.append(param.grad)
         reduce_grads_bucketed(grads, op=dist.ReduceOp.AVG, fp32=self.parallelism_config.fp32_grad_reduce)
 
-    def _setup_backward_reshard_window(self) -> None:
-        """Cache the FSDP2 modules whose post-backward reshard toggles per grad-accum window.
+    def _setup_grad_accum_window(self) -> None:
+        """Cache the FSDP2 modules whose post-backward work toggles per grad-accum window.
 
-        Empty for every run but ``fsdp_reshard_after_backward=False`` on a wrap applied by this
-        mixin, which leaves :meth:`_set_backward_reshard` inert on torch's always-reshard default.
-        Call once, after every wrap: ``fully_shard`` is what makes a module an ``FSDPModule``.
+        Empty unless ``fsdp_reshard_after_backward=False`` or ``fsdp_defer_grad_sync`` is set on a
+        wrap applied by this mixin, which leaves :meth:`_set_window_end` inert on torch's
+        every-microstep defaults. Call once, after every wrap: ``fully_shard`` is what makes a
+        module an ``FSDPModule``.
         """
         config = self.parallelism_config
-        pin = self._fsdp_wrapped and not config.fsdp_reshard_after_backward
+        toggled = self._fsdp_wrapped and (not config.fsdp_reshard_after_backward or config.fsdp_defer_grad_sync)
         # The outermost model, not ``_top_level_model()``: every mode wraps at or below it.
-        self._backward_reshard_modules = fsdp2_modules(self.model) if pin else []
+        self._window_modules = fsdp2_modules(self.model) if toggled else []
         # fully_shard's own default, and what the modules carry until the first microstep toggles them.
-        self._backward_reshard_armed = True
-        if self._backward_reshard_modules:
+        self._window_end_armed = True
+        if self._window_modules:
             logger.info(
-                f"  ✓ fsdp_reshard_after_backward=False: {len(self._backward_reshard_modules)} FSDP2 "
-                f"modules stay unsharded across the grad-accum window (its LAST backward still reshards)"
+                f"  ✓ {len(self._window_modules)} FSDP2 modules toggle per grad-accum window "
+                f"(fsdp_reshard_after_backward={config.fsdp_reshard_after_backward}, fsdp_defer_grad_sync="
+                f"{config.fsdp_defer_grad_sync}): only the window's LAST backward runs the skipped work"
             )
 
-    def _set_backward_reshard(self, reshard: bool) -> None:
-        """Arm FSDP2's post-backward reshard for the microstep about to run.
+    def _set_window_end(self, is_last: bool) -> None:
+        """Arm FSDP2's post-backward reshard and/or gradient reduce for the microstep about to run.
 
-        torch's ``set_reshard_after_backward`` contract is per grad-accum window: off for microbatches
-        1..n-1, on for the last. Left off, ``post_backward`` clears the unsharded params' ``.grad``
-        before reduce-scattering onto the sharded DTensors and never re-registers those, so
-        ``model.parameters()`` yields grad-less objects the optimizer never captured while
-        ``unshard()`` no-ops, hiding the optimizer's update from the next forward.
+        torch's ``set_reshard_after_backward`` / ``set_requires_gradient_sync`` contracts are per
+        grad-accum window: off for microbatches 1..n-1, on for the last. A reshard left off makes
+        ``post_backward`` clear the unsharded params' ``.grad`` before reduce-scattering onto the
+        sharded DTensors and never re-register those, so ``model.parameters()`` yields grad-less
+        objects the optimizer never captured while ``unshard()`` no-ops, hiding the optimizer's
+        update from the next forward; a reduce left off never reaches the sharded grads at all.
         """
-        if not self._backward_reshard_modules or reshard == self._backward_reshard_armed:
+        if not self._window_modules or is_last == self._window_end_armed:
             return
-        for module in self._backward_reshard_modules:
-            module.set_reshard_after_backward(reshard, recurse=False)
-        self._backward_reshard_armed = reshard
+        config = self.parallelism_config
+        for module in self._window_modules:
+            if not config.fsdp_reshard_after_backward:
+                module.set_reshard_after_backward(is_last, recurse=False)
+            if config.fsdp_defer_grad_sync:
+                module.set_requires_gradient_sync(is_last, recurse=False)
+        self._window_end_armed = is_last
 
     def _setup_ep_gradient_sync(self) -> None:
         """FSDP2 for the EP (and EP+CP) gradient sync: experts FSDP-ignored, everything else sharded.
 
-        One module-tree walk feeds both the presence check and the wrap: ``_ep_fsdp_ignored_modules``
-        inspects every parameter's dtype, so deriving it twice doubles that pass over the model.
+        One ``_fsdp_exclusions`` derivation (a walk over every parameter's dtype) feeds both the
+        EP-module presence check and the wrap.
         """
         config = self.parallelism_config
         # Rank-block width, not the global world (identical without PP).
         if config.stage_world_size <= 1:
             return
-        ignored = self._ep_fsdp_ignored_modules()
-        if not ignored[0] and config.is_ep_mode:
+        exclusions = self._fsdp_exclusions()
+        if not exclusions.ep_modules and config.is_ep_mode:
             raise RuntimeError(
                 "EP mode is active but no EP-patched modules found in the model. "
                 "This means expert gradient synchronization will not work — experts "
@@ -165,7 +172,7 @@ class GradientSyncMixin:
             )
         self._apply_ep_aware_dp_fsdp2(
             self.model,
-            ignored=ignored,
+            exclusions=exclusions,
             fallback_dp_size=config.stage_world_size,
             dp_replicate_size=config.dp_replicate_size,
             topo=f", HSDP {config.dp_replicate_size}×{config.dp_shard_size}" if config.is_hsdp else "",
@@ -192,9 +199,12 @@ class GradientSyncMixin:
                 "over; load the model through load_distributed_model."
             )
         mp_policy = create_mixed_precision_policy_v2(self.args, fp32_master_weights=config.fp32_non_ep_params)
-        ignored_set = IdentityParamSet(self._ignored_params(self._ep_fsdp_ignored_modules()[2]) or ())
         apply_fsdp2_per_layer(
-            self.model, device_mesh[MeshDim.DP], mp_policy, config.fsdp_reshard_after_forward, ignored_set
+            self.model,
+            device_mesh[MeshDim.DP],
+            mp_policy,
+            config.fsdp_reshard_after_forward,
+            IdentityParamSet(self._fsdp_exclusions().params),
         )
         self._fsdp_wrapped = True
         logger.info(
@@ -217,7 +227,7 @@ class GradientSyncMixin:
         self._apply_dp_fsdp2(
             self._top_level_model(),
             config.stage_world_size,
-            ignored_modules=self._find_fsdp_incompatible_modules(),
+            excluded_params=self._fsdp_exclusions().params,
             dp_replicate_size=config.dp_replicate_size,
             topo=f", HSDP {config.dp_replicate_size}×{config.dp_shard_size}" if config.is_hsdp else "",
             detail="applied for CP gradient sync",
@@ -600,10 +610,11 @@ class GradientSyncMixin:
         ids = {id(param) for name, param in model.named_parameters() if name in names}
         if names and not ids:
             raise RuntimeError(
-                f"TP registered {len(names)} per-head attention norms for the step-time gradient SUM, "
-                f"but none of those names resolve against the trainer's model (e.g. {sorted(names)[:3]}). "
+                f"TP registered {len(names)} per-head attention norms for the step-time gradient SUM, but "
+                f"none of those names resolve against the trainer's model (e.g. {sorted(names)[:3]}). "
                 "Their gradients would stay divided across the TP group and the norms would train on a "
-                "1/tp_size gradient. The registry is keyed on the model apply_tp_to_attention_only saw."
+                "1/tensor_parallel_size gradient. The registry is keyed on the model "
+                "apply_tp_to_attention_only saw."
             )
         self._tp_per_head_norm_ids_cache = ids
         return ids

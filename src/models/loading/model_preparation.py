@@ -24,11 +24,11 @@ from src.checkpoint.model_card import HUB_TAGS
 from src.kernels.liger.orchestrator import LIGER_APPLIED_CONFIG_ATTR, trl_reapplication_config
 from src.models.loading.checkpoint_coverage import from_pretrained_verified
 from src.models.patches.attention import (
-    model_is_gemma4,
+    head_dim_exceeds_flash,
     model_is_mistral4,
     model_is_zaya,
     patch_mistral4_flash_packed_position_ids,
-    patch_sdpa_for_gemma4_long_seq,
+    patch_sdpa_for_wide_heads,
     patch_transformers_flash_varlen_int_seqlen,
 )
 from src.models.patches.gpt_oss_sinks import SinksPolicy, apply_sinks_policy
@@ -141,8 +141,8 @@ def apply_family_attention_patches(model_config, attn_implementation: str) -> No
     would otherwise miss its family's patch (the policy's load keys on the policy's config) and, for
     example, score packed rows with cross-document flash attention while the student is isolated.
     """
-    if attn_implementation == "sdpa" and model_is_gemma4(model_config):
-        patch_sdpa_for_gemma4_long_seq()
+    if attn_implementation == "sdpa" and head_dim_exceeds_flash(model_config):
+        patch_sdpa_for_wide_heads()
     # Else Mistral4's attention swallows position_ids before the flash interface, so the varlen
     # packed path never engages and packed documents attend across each other.
     if attn_implementation.startswith("flash_attention") and model_is_mistral4(model_config):

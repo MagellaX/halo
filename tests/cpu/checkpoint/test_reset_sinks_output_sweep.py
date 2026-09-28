@@ -27,6 +27,7 @@ import time
 import pytest
 import torch
 from accelerate import PartialState
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from transformers import GptOssConfig, GptOssForCausalLM
 
@@ -34,7 +35,10 @@ PartialState()  # the script's model loading logs through accelerate's logger
 
 import scripts.after_training.reset_sinks as reset_sinks_mod
 from scripts.after_training.reset_sinks import reset_sinks
+from src.checkpoint import tool_io
+from src.checkpoint.format import SAFETENSORS_METADATA
 from src.checkpoint.tool_io import STAGING_SUFFIX, checkpoint_shard_files
+from src.models.patches import gpt_oss_sinks
 from tests.common.checkpoint_io import weight_files
 
 INDEX = "model.safetensors.index.json"
@@ -156,6 +160,18 @@ def test_the_single_file_branch_sweeps_the_previous_runs_leftovers(tmp_path):
 
     assert _weight_files(out) == {SINGLE}, "the previous sharded run outlived the reset"
     _assert_sinks_reset(out, sinks)
+
+
+def test_the_single_file_branch_stamps_the_safetensors_format(tmp_path):
+    """The rewrite stamps the ``format`` metadata ``save_pretrained`` and the toolkit's full-checkpoint
+    writers stamp, so the reset file reads as the same kind of checkpoint it replaced."""
+    source, out = tmp_path / "src", tmp_path / "out"
+    _build_source(source, sharded=False)
+
+    reset_sinks(str(source), str(out))
+
+    with safe_open(os.path.join(out, SINGLE), framework="pt") as handle:
+        assert handle.metadata() == SAFETENSORS_METADATA
 
 
 def test_the_sharded_branch_sweeps_the_previous_runs_index(tmp_path):
@@ -382,8 +398,6 @@ def test_both_branches_preflight_the_full_checkpoint_load(tmp_path, monkeypatch,
     """Both branches hold the whole checkpoint in host RAM (``load_file``, or from_pretrained onto the
     CPU), so the shared preflight must warn before either loads — silence means the tool stopped
     calling the helper — and must not abort the reset."""
-    from src.checkpoint import tool_io
-
     monkeypatch.setattr(tool_io, "available_host_ram_bytes", lambda: 1)
     source, out = tmp_path / "src", tmp_path / "out"
     sinks = _build_source(source, sharded=sharded)
@@ -400,8 +414,6 @@ def test_an_unrecognized_sink_layout_raises_instead_of_saving_live_sinks(tmp_pat
     nothing, and the tool would still write, sweep and report a "reset" checkpoint whose sinks are
     untouched. Routed through the trainers' ``apply_sinks_policy``, a sinks-carrying model the walk
     finds no attention layers on is a raise."""
-    from src.models.patches import gpt_oss_sinks
-
     source, out = tmp_path / "src", tmp_path / "out"
     _build_source(source, sharded=True)
     # The one thing an unrecognized layout changes: the decoder-layer list cannot be resolved.

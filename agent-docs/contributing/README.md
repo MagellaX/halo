@@ -11,8 +11,8 @@ same targets. The Docker incantation lives once in the `Makefile`; `make help` l
   `torchrun`, `pytest` directly.
 - **`make lint`, `make format`, `make precommit`, and `make docs` are the only host-runnable gates**
   (ruff via `uvx ruff@$(RUFF_VERSION)`, `RUFF_VERSION ?= 0.9.10`, falling back to a `ruff` already on
-  `PATH`; the docs target is a pure link check). Everything else — tests, benchmarks — runs inside
-  the image.
+  `PATH`; the docs target is a stdlib-`python3` link and anchor check). Everything else — tests,
+  benchmarks — runs inside the image.
 - **Credentials live in the repo-root `.env`.** `cp .env.example .env` and fill it in: the GPU
   `make` targets pass `--env-file .env` and fail outright without the file.
 - **Markdown lives in `agent-docs/` (the detailed reference), `human-docs/` (the concise human
@@ -110,11 +110,11 @@ make train METHOD=preference/smpo CONFIG=<config>    # METHOD defaults to sft
 - **ruff, line length 119.** Selected: `E, F, I, W, UP, B, C4, SIM, T20, PLC0415`. `make lint`
   enforces the full set, and the blocking CI job runs `ruff format --check` plus the same full set.
   See [Continuous Integration](../infrastructure/ci.md).
-- **No inline imports in `src/`** (`PLC0415`). A function-level import is reserved for a genuinely
-  optional or arch-specific dependency (`flash_attn`, `deep_ep`, `kernels`). A circular import is
-  never that exception — fix it structurally.
-- **No stray `print()` in `src/`** (`T20`). `tests/**` relaxes `PLC0415`, `E402`, `T20`, `E741`,
-  `B007`, `B023`, and `SIM117`; `scripts/**` relaxes `T20`.
+- **No inline imports** (`PLC0415`), in `tests/` as in `src/`. A function-level import is reserved
+  for a genuinely optional or arch-specific dependency (`flash_attn`, `deep_ep`, `kernels`). A
+  circular import is never that exception — fix it structurally.
+- **No stray `print()` in `src/`** (`T20`). `tests/**` relaxes `E402`, `T20`, `E741`, `B007`,
+  `B023`, and `SIM117`; `scripts/**` relaxes `T20`.
 - **Reuse over re-implementation.** New trainers extend `DistributedTrainerMixin`; new parallelism
   wrappers reuse the EP-layer base hooks. See
   [Trainer Architecture](../reference/trainer-architecture.md).
@@ -141,8 +141,8 @@ manifest.
   and rejection of unsupported configs — never on private internals.
 - **A CPU test file is a plain pytest module.** It ends in
   `if __name__ == "__main__": raise SystemExit(pytest.main([__file__, "-v"]))`, so a standalone
-  `python tests/cpu/<file>.py` runs exactly what `pytest` collects. The conventions test requires a
-  `pytest.main([__file__, …])` entry in every CPU test file.
+  `python tests/cpu/<file>.py` runs exactly what `pytest` collects. The conventions test requires
+  every CPU test file to end in exactly that block.
 
     A hand-listed runner silently drops any test missing from its list, and a printed pass/fail summary
     hides a FAIL from pytest; both are rejected by `tests/cpu/conventions/test_test_conventions.py`.
@@ -179,9 +179,10 @@ manifest.
     `gpu_test_main(exact_world_size=N)`.
 
 - **Run GPU tests through pytest**, not by hand: `make test-gpu-core`, or a narrower marker
-  expression over the two entrypoints (`pytest -m "gpu and ep" tests/gpu/test_suite.py
-  tests/gpu/test_launcher_contract.py`). Name the entrypoints: pointed at `tests/gpu/` instead, pytest
-  collects the manifest scripts as modules and executes their top-level torchrun code.
+  expression over the directory (`pytest -m "gpu and ep" tests/gpu`). The launcher entry points
+  (`LAUNCHER_ENTRYPOINTS` in `tests/gpu/manifest.py`) are the only modules pytest collects under
+  `tests/gpu/`: `tests/gpu/conftest.py` ignores every manifest script, so no collection (a
+  `pytest -m cpu` from the repo root included) imports a torchrun program.
 
     The launcher allocates a free `--master_port` per node from `tests/common/ports.py` — a pool from
     20000 up to the kernel's ephemeral range, one slice per pytest-xdist worker — and points `TMPDIR`
@@ -199,6 +200,10 @@ manifest.
   (`init_distributed` → setup → body → teardown → `sys.exit`); the body is *load → train → assert*
   and returns `{"checks": {name: bool}, "metrics": {...}}`, exiting `0` pass / `1` fail / `2` bad
   launch.
+
+    It sets `CAUSAL_CONV1D_DETERMINISTIC=1` unless the caller exported a value: causal_conv1d's
+    default backward sums the conv weight gradient with atomics, so the gated-DeltaNet families miss
+    an exact resume replay now and then.
 - **Emit perf and memory.** Return `ctx.metrics(trainer)` so the result line carries tokens/s/GPU
   and peak memory; a `benchmark_*` script's `emit_benchmark(key, callback)` writes the line the
   committed throughput baselines are compared against.
@@ -270,28 +275,26 @@ entry and the script name them, and the non-obvious ones are:
 | `HALO_TEST_ENV_GRPO_SGLANG_MODEL` | Checkpoint of the SGLang Environmental-GRPO e2e wrappers (`trainers/grpo/test_env_grpo_sglang_e2e.py` and its four-rank sibling `test_env_grpo_sglang_4gpu_e2e.py`, default `unsloth/gpt-oss-20b-BF16`); a per-family pass points it at the family and serves the same checkpoint. Its own knob because its server and default family differ from the vLLM leg's. |
 | `HALO_TEST_ENV_GRPO_ATTN_IMPL` / `HALO_TEST_ENV_GRPO_LORA_TARGETS` | Per-family overrides for the Environmental-GRPO e2e body: the policy's `attn_implementation` (unset = the loader's auto-selection; `sdpa` for a remote-code family without FA4) and a comma-separated `lora_target_modules` for the `--peft lora` rows (unset = the attention projections read off the checkpoint's index, which MLA families resolve to their own names; needed where the projections do not end in `_proj`, such as Ling's `query_key_value,dense`). |
 | `HALO_TEST_ENV_GRPO_4GPU_MODEL` | Checkpoint of the 4-rank Environmental-GRPO e2e (`trainers/grpo/test_env_grpo_vllm_4gpu_e2e.py`, default `unsloth/gpt-oss-20b-BF16`), whose rows hold two parallelism axes at once (EP+ETP, EP+TP, ep4). Its own knob because it shares the 2-GPU file's server but not its default family. |
-| `HALO_TEST_VLLM_REINIT_MODEL` / `HALO_TEST_VLLM_REINIT_CYCLES` | Checkpoint (default `Qwen/Qwen3-0.6B`, the dense endpoint's) and connect/sync/disconnect cycle count (default `12`) of `trainers/grpo/test_vllm_weight_transfer_reinit.py`. Each cycle leaked ~633 MiB of NCCL communicator on both ends before the re-init patch, so twelve overshoot the suite's 1 GiB growth budget several times over. |
+| `HALO_TEST_VLLM_REINIT_MODEL` / `HALO_TEST_VLLM_REINIT_CYCLES` | Checkpoint (default `Qwen/Qwen3-0.6B`, the dense endpoint's) and connect/sync/disconnect cycle count (default `12`) of `trainers/grpo/test_vllm_weight_transfer_reinit.py`. An unreleased communicator costs ~633 MiB per cycle on each end, so twelve cycles of a leak overshoot the suite's 1 GiB growth budget several times over. |
 | `HALO_TEST_VLLM_SERVER_GPU` | The vLLM server's GPU as `nvidia-smi` indexes it, for the same suite's device-memory read. Unset means "every GPU the trainer does not own", which is exactly the server's on the tier's own topology (`TRAINER_CUDA_DEVICES` covers the rest); set it when another job holds a third GPU. |
 
 **Env knob or `args_matrix` row?** `nproc`, `markers`, `timeout` and the tier are per-`TestSpec`, not
 per-row, so every row of a matrix runs at the same size, under the same marker set, in the same tier.
 
-A leg that only changes *which phase runs* (same model, same axis, same cost) becomes a CLI flag
-with one row per leg, so each gets its own pytest node and verdict (`--mode` on
-`trainers/grpo/test_online_grpo_vllm_e2e.py`, `--mode` on `trainers/sft/test_sft_qwen3_dense.py`).
+A leg that keeps the model, the GPU count and the cost becomes a CLI flag with one row per leg, so
+each gets its own pytest node and verdict (`--mode` on `trainers/grpo/test_online_grpo_vllm_e2e.py`;
+one `--mode` per parallel shape on `trainers/sft/test_sft_qwen3_dense.py` and
+`trainers/sft/test_sft_gptoss_modes.py`). Such an entry's markers are the union over its rows, so
+`-m "gpu and cp"` also selects its non-CP rows.
 
-A leg that changes the model family, the parallelism axis, or the runtime stays an env override:
-registering it as a row would file an EP-on-20B run under the entry's `tp`/dense markers and its
+A leg that changes the model family, the GPU count or the runtime stays an env override:
+registering it as a row would file an EP-on-20B run under a dense entry's markers and its
 neighbor's timeout.
-
-That is also why the twelve `gpt-oss` SFT scripts under `trainers/sft/` (`test_sft_ep*`,
-`test_sft_oss20b_*`) stay separate entries rather than collapsing into one matrix: `-m "gpu and cp"`
-must select their two CP legs and nothing else.
 
 `core` is the pre-merge gate, and small-and-fast is its *intent*: ≤2 GPUs, tiny model. Size the host
 from the manifest, not from that intent. Over half of `tests/gpu/manifest.py` carries `core`.
 
-Within that tier four entries need 4 GPUs, 18 declare a timeout ≥1500 s (three at 2400 s), and a large
+Within that tier several entries need 4 GPUs, many declare timeouts of 1500–2400 s, and a large
 minority load a real multi-billion-parameter checkpoint (gpt-oss-20b, GLM-4.7-Flash, ZAYA1-8B,
 Qwen3-30B-A3B, Qwen3.5-2B, Qwen3-VL-2B and three Ling/Ring checkpoints), so summed worst-case timeouts
 run to tens of hours. This page owns tier composition; the manifest is the only place exact counts live.
@@ -299,9 +302,9 @@ run to tens of hours. This page owns tier composition; the manifest is the only 
 Where a big-checkpoint entry stays `core`, it is because it is a *correctness gate* — a comparison
 against an independent reference that catches a silently wrong result, like
 `parallelism/ep/test_ep_correctness.py` (gpt-oss ep2 vs the dense reference). Smoke runs on the same
-checkpoint are `full`: `trainers/sft/test_sft_ep.py`, `trainers/sft/test_sft_oss20b_*.py` and
-`trainers/lora/test_lora_mixed_merged_save.py` all assert only that training completed and stayed
-finite, which the gate already covers.
+checkpoint are `full`: `trainers/sft/test_sft_gptoss_modes.py`, `trainers/sft/test_sft_oss20b_default.py`
+and `trainers/lora/test_lora_mixed_merged_save.py` all assert only that training completed on the
+requested shape and stayed finite, which the gate already covers.
 
 Run `make test-gpu-core` deliberately, not as a quick check, and mark a new heavy or many-GPU test
 `full`. The tier measures about 4 h 15 m on 8×B300, and `gpu-tests.yml` budgets 6 h for the whole
@@ -344,8 +347,9 @@ keep `provenance` accurate.
 The committed set is gpt-oss-20b SFT under Expert Parallelism at **ep1 / ep2 / ep8** — 8× B300, seq
 4096, batch 1, gradient checkpointing on, `CUDA_DEVICE_MAX_CONNECTIONS=1`, bf16 + FA4 + grouped GEMM
 on `halo:blackwell`: 9,401 / 10,551 / 8,225 tok/s/GPU. **ep4 is intentionally excluded** —
-pure `2 < ep_size < gpus_per_node` deadlocks the DeepEP combine barrier and the trainer fails fast
-([DeepEP](../infrastructure/deepep.md)).
+pure `ep_size > 2` with `ep_group_size < nvlink_domain_size` is rejected at config time: its DeepEP
+combine races FSDP2's DP-wide collectives
+([Expert Parallelism](../parallelism/expert-parallelism.md#single-domain-multi-group-ep-races-and-hangs)).
 
 ## Docs
 
@@ -353,7 +357,7 @@ Update the owning doc page in the same PR when you change `src/` (`skills/docs/d
 follow the anti-slop charter carried by the `/docs` skill: American English, active voice, short
 sentences, tables only for real matrices, no marketing register.
 
-`docs.yml` runs three jobs, and `make docs` runs only the first: the relative-link check over
+`docs.yml` runs three jobs, and `make docs` runs only the first: the link and anchor check over
 `agent-docs/`, `human-docs/`, `skills/` and the root markdown, which blocks a merge; a `diagrams` job
 that re-runs every `scripts/diagrams/gen_*.py` and byte-compares the result against the committed PNGs
 under `agent-docs/assets/` — touch a generator and you owe `make diagrams` plus the regenerated figure in

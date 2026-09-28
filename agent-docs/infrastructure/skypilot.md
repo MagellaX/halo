@@ -100,7 +100,7 @@ GIN-plugin prerequisites and the measured B300 EFA numbers: [DeepEP → Expert p
 
 ### NVL72 racks (GB200/GB300)
 
-On NVL72 the NVLink domain spans the rack (72 GPUs across ~18 OS nodes), so node-local grouping should target the rack: set `NVLINK_DOMAIN_SIZE: "72"` and `EXPERT_PARALLEL_SCOPE: "node"` in `envs`. Standard 8-GPU hosts need no change — the default reads `gpus_per_node`. See [Multi-Node → NVL72](../parallelism/multi-node.md#gb200gb300-nvl72-multi-node-nvlink).
+On NVL72 the NVLink domain spans the rack (72 GPUs across ~18 OS nodes), so node-local grouping should target the rack: set `NVLINK_DOMAIN_SIZE: "72"` and `EXPERT_PARALLEL_SCOPE: "node"` in `envs`. Standard 8-GPU hosts need no change — the default reads `gpus_per_node`. See [Multi-Node → NVL72](../parallelism/multi-node.md#gb200gb300-nvl72-multi-node-nvlink). The published images are x86_64-only, so the rack's Grace (aarch64) hosts need an arm64 build first ([Docker](docker.md)).
 
 ### NCCL collective timeout
 
@@ -113,11 +113,11 @@ Every shipped task declares two mounts:
 ```yaml
 file_mounts:
   /workspace: {source: ., mode: COPY}                  # the repo
-  /data:      {source: s3://${HALO_BUCKET}/halo, mode: MOUNT}   # bucket from envs; --env HALO_BUCKET=... retargets
+  /data:      {source: "s3://${HALO_BUCKET}/halo", mode: MOUNT}   # bucket from envs; --env HALO_BUCKET=... retargets
 ```
 
-`/data` is a **placeholder you must edit** before launching; `HF_HOME`, `HALO_DATA_ROOT` (the toolkit
-scratch root) and `OUTPUT_DIR` all resolve under it.
+`HALO_BUCKET` is the placeholder you must set (`--env HALO_BUCKET=<your-bucket>`); `HF_HOME`,
+`HALO_DATA_ROOT` (the toolkit scratch root) and `OUTPUT_DIR` all resolve under `/data`.
 
 | Mode | Use case | Write |
 |------|----------|-------|
@@ -125,15 +125,16 @@ scratch root) and `OUTPUT_DIR` all resolve under it.
 | `MOUNT` | Checkpoints, write-heavy persistence | Yes |
 | `MOUNT_CACHED` | Large models/datasets, read-heavy | Yes (async) |
 
-Pre-upload large models (>10GB) to S3 once and mount them `MOUNT_CACHED`, keeping checkpoints on `MOUNT`:
+Pre-upload large models (>10GB) to S3 once. `/data` is the bucket's `halo/` prefix, so sync below it:
 
 ```bash
-aws s3 sync models/qwen3.5-122b-a10b s3://my-bucket/models/qwen3.5-122b-a10b/
+aws s3 sync models/qwen3.5-122b-a10b s3://<your-bucket>/halo/models/qwen3.5-122b-a10b/
 ```
 
-Then point the run at that mount with `--env MODEL=/data/models/...`; the shipped tasks default
+Then point the run at it with `--env MODEL=/data/models/qwen3.5-122b-a10b`; the shipped tasks default
 `MODEL` to a Hub id and keep only their writes under `/data` (`OUTPUT_DIR: /data/checkpoints/...`).
-Alternatively download from HF at runtime with `HF_HOME` on a
+For `MOUNT_CACHED` reads, add a second `file_mounts` entry for the model prefix and point `MODEL` at
+it, keeping checkpoints on the `MOUNT`. Alternatively download from HF at runtime with `HF_HOME` on a
 `MOUNT_CACHED` bucket so the cache survives restarts.
 
 In multi-node training a `MOUNT` checkpoint bucket is shared across all nodes; any node can save and
@@ -148,7 +149,7 @@ AWS account, no registry login).
 
 Each task's `setup:` block fails fast when `flash_attn` / `deep_ep` are not importable, so a from-source
 build on a bare node is not a fallback; the prebuilt image is required. The `hopper` image serves
-H100/H200 (Nebius and AWS p5/p5e) and `blackwell` the B200 single-node tasks. To run your own build
+the H100/H200 tasks (Nebius and AWS) and `blackwell` the B200 single-node tasks. To run your own build
 instead, push it to a registry the nodes can reach and point `image_id` there ([Docker](docker.md)).
 
 ```yaml

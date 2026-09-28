@@ -283,19 +283,34 @@ def dataset_declares_images(dataset, conversation_field: str | None = None) -> b
     return agree_probe_across_ranks(local, "the loaded dataset", "dataset_declares_images")
 
 
-def is_vlm_run(args, model_name_or_path: str, dataset=None, *, config=None, revision: str | None = None) -> bool:
+def is_vlm_run(
+    args,
+    model_name_or_path: str,
+    dataset=None,
+    *,
+    config=None,
+    revision: str | None = None,
+    trust_remote_code: bool = False,
+    vlm_checkpoint: bool | None = None,
+) -> bool:
     """Whether this run takes the VLM data path: a multimodal checkpoint plus image data to feed it.
 
     The checkpoint alone cannot decide it: every natively-multimodal family (Gemma 4, Qwen3.5/3.6) is
     a VLM by config while its text-only recipes are ordinary text runs. The run declares image data by
     naming the column (``images_field``) or carrying one; the model loads through its own multimodal
-    class either way, so only the data prep, collator and eval split follow this verdict.
+    class either way, so only the processor requirement, data prep, collator and eval split follow
+    this verdict.
 
-    Agreed across ranks once for the whole verdict rather than per term. ``config`` / ``revision`` pin
-    the modality probe as in :func:`~src.models.modality.is_vlm_model`; pass the already-loaded
-    ``model.config`` where there is one.
+    Agreed across ranks once for the whole verdict rather than per term. ``config`` / ``revision`` /
+    ``trust_remote_code`` reach the modality probe as in :func:`~src.models.modality.is_vlm_model`;
+    pass the already-loaded ``model.config`` where there is one, or the probe's own verdict as
+    ``vlm_checkpoint`` where the caller already took it, so the checkpoint config is not read twice.
     """
-    local = is_vlm_model(model_name_or_path, config=config, revision=revision) and bool(
+    if vlm_checkpoint is None:
+        vlm_checkpoint = is_vlm_model(
+            model_name_or_path, config=config, revision=revision, trust_remote_code=trust_remote_code
+        )
+    local = vlm_checkpoint and bool(
         getattr(args, "images_field", None)
         or _declares_images_locally(dataset, getattr(args, "conversation_field", None))
     )

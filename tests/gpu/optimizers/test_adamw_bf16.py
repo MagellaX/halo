@@ -7,19 +7,23 @@ Verifies that AdamWBF16:
 2. Achieves loss comparable to fp32 master weights (not stale like pure bf16)
 3. Handles mixed dtype models (bf16 + fp32 params)
 
-Usage (single GPU, no torchrun needed):
-    python tests/gpu/optimizers/test_adamw_bf16.py
+Usage (single GPU):
+    torchrun --nproc_per_node=1 tests/gpu/optimizers/test_adamw_bf16.py
 """
 
+import copy
 import math
 
 import torch
 import torch.nn as nn
+from torch.distributed.checkpoint.state_dict import _init_optim_state
 
 from src.kernels.lowp.quantization import cached_fake_quant
 from src.optimizers.adamw_bf16 import AdamWBF16
 from src.optimizers.flash_adamw import create_flash_adamw_optimizer
 from src.optimizers.muon import create_muon_optimizer
+from tests.common.harness import gpu_test_main, record_check
+from tests.common.utils import assert_optimizer_state_bit_exact
 
 # ─── Model ───────────────────────────────────────────────────────────────────
 
@@ -199,7 +203,7 @@ def test_mixed_dtypes():
             assert p.dtype == torch.bfloat16, f"Param {name} should stay bf16"
 
     # Verify training didn't diverge
-    assert not math.isnan(losses[-1]), "Loss is NaN"
+    assert math.isfinite(losses[-1]), f"Loss is not finite: {losses[-1]}"
     assert losses[-1] < losses[0], "Loss should decrease"
 
     print(f"  Final loss: {losses[-1]:.6f} (started at {losses[0]:.6f})")
@@ -207,7 +211,7 @@ def test_mixed_dtypes():
 
 
 def test_weight_decay_groups():
-    """Verify weight decay is applied correctly (decay vs no-decay groups)."""
+    """Decay and no-decay param groups step with a finite loss (the decay itself is not checked)."""
     print("\nTEST 4: Weight decay param groups")
     model = create_model(torch.bfloat16)
 
@@ -236,9 +240,9 @@ def test_weight_decay_groups():
         opt.step()
         opt.zero_grad()
 
-    assert not math.isnan(loss.item()), "Loss is NaN with param groups"
+    assert math.isfinite(loss.item()), f"Loss is not finite with param groups: {loss.item()}"
     print(f"  Final loss: {loss.item():.6f}")
-    print("  PASSED: Param groups with different weight decay work correctly")
+    print("  PASSED: Param groups with different weight decay step with a finite loss")
 
 
 def test_sr_removes_second_moment_bias():
@@ -301,17 +305,14 @@ def test_exp_avg_stays_nearest():
     ever (wrongly) applied to exp_avg on either the Triton or eager path:
 
       1. DETERMINISM: run the identical step twice from identical inputs/state but with the
-         global / SR RNG perturbed between runs. NEAREST rounding is a pure function of the
-         fp32 value, so exp_avg must be BIT-IDENTICAL across the two runs. exp_avg_sq and the
-         weight, which DO use SR, must DIFFER (the negative control — it proves the RNG
-         perturbation actually changed the SR streams, so the exp_avg equality is meaningful
-         rather than an RNG that simply never advanced).
+         param at another position in the optimizer, which keys other SR noise. NEAREST rounding
+         is a pure function of the fp32 value, so exp_avg must be BIT-IDENTICAL across the two
+         runs. exp_avg_sq and the weight, which DO use SR, must DIFFER (the negative control — it
+         proves the noise actually changed, so the exp_avg equality is meaningful).
       2. VALUE: exp_avg must equal the deterministic nearest-bf16 of the exact fp32 EMA
          (torch.equal), i.e. it carries no stochastic component.
     """
     print("\nTEST 7: exp_avg stays nearest-rounded (no SR on the first moment)")
-    import src.optimizers.adamw_bf16 as adamw_mod
-
     beta1, beta2 = 0.9, 0.999
     grad_val = 3.0e-4  # signed, small enough that the bf16 store of the EMA is non-trivial
     n_steps = 16
@@ -328,41 +329,40 @@ def test_exp_avg_stays_nearest():
             ea_fp32.mul_(beta1).add_(g32, alpha=1.0 - beta1)
         ea_nearest_ref = ea_fp32.to(torch.bfloat16)  # deterministic nearest-bf16 of the exact EMA
 
-        def run_once(rng_seed: int):
-            # Reseed BOTH the dedicated SR RNG and torch's global RNG so the two SR noise
-            # streams (weight + exp_avg_sq) differ between the two runs, while the inputs do not.
-            adamw_mod._SR_RNG.seed(rng_seed)
-            torch.manual_seed(rng_seed)
+        def run_once(leading: int):
+            # A grad-less param ahead of p shifts p's position, and with it both SR noise streams
+            # (weight + exp_avg_sq), while the inputs stay identical.
+            pads = [nn.Parameter(torch.zeros(1, dtype=torch.bfloat16, device=device)) for _ in range(leading)]
             p = nn.Parameter(torch.zeros(size, dtype=torch.bfloat16, device=device))
-            opt = AdamWBF16([p], lr=1e-3, betas=(beta1, beta2), weight_decay=0.0, use_triton=use_triton)
+            opt = AdamWBF16([*pads, p], lr=1e-3, betas=(beta1, beta2), weight_decay=0.0, use_triton=use_triton)
             for _ in range(n_steps):
                 p.grad = torch.full((size,), grad_val, dtype=torch.bfloat16, device=device)
                 opt.step()
             st = opt.state[p]
             return p.data.clone(), st["exp_avg"].clone(), st["exp_avg_sq"].clone()
 
-        w_a, ea_a, easq_a = run_once(0x1111)
-        w_b, ea_b, easq_b = run_once(0x2222)
+        w_a, ea_a, easq_a = run_once(0)
+        w_b, ea_b, easq_b = run_once(1)
 
-        # 1a. exp_avg is RNG-independent => bit-identical across the two RNG seeds (NEAREST).
+        # 1a. exp_avg is noise-independent => bit-identical across the two runs (NEAREST).
         assert torch.equal(ea_a, ea_b), (
-            f"[{path}] exp_avg differs across RNG seeds — it carries stochastic noise (SR applied?)"
+            f"[{path}] exp_avg differs across SR noise — it carries stochastic noise (SR applied?)"
         )
-        # 1b. Negative control: weight and exp_avg_sq DO use SR, so they must differ across seeds.
-        #     (This guards against a vacuous pass where the RNG simply never advanced.)
+        # 1b. Negative control: weight and exp_avg_sq DO use SR, so they must differ across runs.
+        #     (This guards against a vacuous pass where the noise never changed.)
         assert not torch.equal(w_a, w_b), (
-            f"[{path}] weight identical across RNG seeds — SR noise stream did not change; "
+            f"[{path}] weight identical across SR noise — the noise did not change; "
             "the exp_avg determinism check would be vacuous"
         )
         assert not torch.equal(easq_a, easq_b), (
-            f"[{path}] exp_avg_sq identical across RNG seeds — SR not applied to the second moment"
+            f"[{path}] exp_avg_sq identical across SR noise — SR not applied to the second moment"
         )
 
         # 2. exp_avg equals the deterministic nearest-bf16 reference (no stochastic component).
         assert torch.equal(ea_a, ea_nearest_ref), (
             f"[{path}] exp_avg != nearest-rounded fp32 EMA; first moment is not nearest-rounded"
         )
-        print(f"  [{path}] exp_avg bit-identical across RNG seeds and == nearest ref; weight/easq vary (SR)")
+        print(f"  [{path}] exp_avg bit-identical across SR noise and == nearest ref; weight/easq vary (SR)")
 
     print("  PASSED: exp_avg is nearest-rounded on both paths; SR confined to weight + exp_avg_sq")
 
@@ -488,14 +488,12 @@ def test_every_optimizer_advances_the_version_counter():
         "Muon (fused step)": _named(lambda m: create_muon_optimizer(m, lr=1e-1, weight_decay=0.01)),
         "FlashAdamW": _named(lambda m: create_flash_adamw_optimizer(m, lr=1e-1, weight_decay=0.0)),
     }
-    covered = set()
     for label, build in builders.items():
         param = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
         # No ImportError swallow: gram-newton-schulz is a core dependency and flashoptim is baked
         # into both images, so a failed build here is a regression, not an absent extra — catching
         # it would silently reduce this sweep to the two AdamWBF16 legs TEST 9 already covers.
         opt = build(param)
-        covered.add(label)
         before_quant = cached_fake_quant(param, "mxfp8", -1).clone()
         before_weight = param.detach().clone()
         before_version = param._version
@@ -512,12 +510,15 @@ def test_every_optimizer_advances_the_version_counter():
         )
         print(f"  {label}: _version {before_version} -> {param._version}, cache tracked the master")
 
-    assert covered == set(builders), f"legs never ran: {sorted(set(builders) - covered)}"
     print("  PASSED: no optimizer leaves the low-precision cache stale")
 
 
 def test_state_dict_roundtrip():
-    """Verify optimizer state can be saved and loaded (checkpoint compatibility)."""
+    """Save -> deepcopy -> load into a fresh optimizer: every state tensor and ``step`` bit-exact.
+
+    The deepcopy matters: ``load_state_dict`` keeps a tensor that already has the param's dtype and
+    device, so loading the live dict would hand the new optimizer the saved tensors themselves.
+    """
     print("\nTEST 5: State dict save/load roundtrip")
     model = create_model(torch.bfloat16)
     opt = AdamWBF16(model.parameters(), lr=1e-4)
@@ -530,47 +531,91 @@ def test_state_dict_roundtrip():
         opt.step()
         opt.zero_grad()
 
-    # Save state
-    state_dict = opt.state_dict()
-
-    # Create fresh optimizer and load state
+    saved = copy.deepcopy(opt.state_dict())
     opt2 = AdamWBF16(model.parameters(), lr=1e-4)
-    opt2.load_state_dict(state_dict)
-
-    # Verify states match
-    for p in model.parameters():
-        s1 = opt.state[p]
-        s2 = opt2.state[p]
-        assert torch.equal(s1["exp_avg"], s2["exp_avg"]), "exp_avg mismatch after load"
-        assert torch.equal(s1["exp_avg_sq"], s2["exp_avg_sq"]), "exp_avg_sq mismatch after load"
-        assert s1["step"] == s2["step"], "step count mismatch after load"
+    opt2.load_state_dict(copy.deepcopy(saved))
+    assert_optimizer_state_bit_exact(saved, opt2.state_dict())
 
     print("  PASSED: State dict roundtrip preserves all optimizer state")
 
 
+def _train_on(optimizer, params: list[nn.Parameter], grads: list[list[torch.Tensor]]) -> None:
+    for step_grads in grads:
+        for p, g in zip(params, step_grads, strict=True):
+            p.grad = g
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+
+def test_restore_replays_the_rounding():
+    """A restored optimizer rounds exactly as the uninterrupted one, on the Triton paths.
+
+    One run takes six steps; another takes three, is rebuilt on its weights, materializes state with
+    torch's zero-LR ``_init_optim_state`` step (what every sharded resume runs), loads the saved state
+    and takes the other three. Fixed gradients keep the forward out of it, so any miss is the
+    optimizer's. Muon covers its matrix step and the internal AdamWBF16 of its scalar params.
+    """
+    print("\nTEST 11: A restored optimizer replays the uninterrupted run's rounding")
+    builders = {
+        "AdamWBF16 (Triton)": lambda m: AdamWBF16(m.parameters(), lr=1e-3),
+        "Muon (fused step)": lambda m: create_muon_optimizer(m, lr=1e-2, weight_decay=0.01),
+    }
+    for name, build in builders.items():
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        shapes = [(p.shape, p.dtype) for p in create_model(torch.bfloat16).parameters()]
+        grads = [[torch.randn(shape, generator=gen, device="cuda", dtype=dtype) * 1e-3 for shape, dtype in shapes]]
+        grads += [[g * (step + 2) for g in grads[0]] for step in range(5)]
+
+        uninterrupted = create_model(torch.bfloat16)
+        _train_on(build(uninterrupted), list(uninterrupted.parameters()), grads)
+
+        first = create_model(torch.bfloat16)
+        first_opt = build(first)
+        _train_on(first_opt, list(first.parameters()), grads[:3])
+        saved = copy.deepcopy(first_opt.state_dict())
+
+        resumed = create_model(torch.bfloat16)
+        with torch.no_grad():
+            for p, w in zip(resumed.parameters(), first.parameters(), strict=True):
+                p.copy_(w)
+        resumed_opt = build(resumed)
+        _init_optim_state(resumed_opt)
+        resumed_opt.load_state_dict(copy.deepcopy(saved))
+        _train_on(resumed_opt, list(resumed.parameters()), grads[3:])
+
+        unequal = [
+            n
+            for (n, a), b in zip(uninterrupted.named_parameters(), resumed.parameters(), strict=True)
+            if not torch.equal(a, b)
+        ]
+        assert not unequal, f"[{name}] {len(unequal)} params rounded differently after the restore: {unequal[:3]}"
+        print(f"  [{name}] every param bit-identical to the uninterrupted run")
+    print("  PASSED: restored optimizers round as the uninterrupted run did")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("CUDA not available, cannot run test")
-        exit(1)
 
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA device:     {torch.cuda.get_device_name(0)}")
+@gpu_test_main(exact_world_size=1, prefix="adamw_bf16", partial_state=False)
+def run(ctx) -> dict:
+    print(f"CUDA device:     {torch.cuda.get_device_name(ctx.device)}")
     print(f"Model size:      {create_model(torch.float32, 'cpu').param_count() / 1e6:.1f}M params")
-    print()
+    checks: dict[str, bool] = {}
+    record_check(checks, "dtypes", test_dtypes)
+    record_check(checks, "vs_baselines", test_vs_baselines)
+    record_check(checks, "mixed_dtypes", test_mixed_dtypes)
+    record_check(checks, "weight_decay_groups", test_weight_decay_groups)
+    record_check(checks, "sr_removes_second_moment_bias", test_sr_removes_second_moment_bias)
+    record_check(checks, "sr_removes_second_moment_bias_eager", test_sr_removes_second_moment_bias_eager)
+    record_check(checks, "exp_avg_stays_nearest", test_exp_avg_stays_nearest)
+    record_check(checks, "step_advances_the_version_counter", test_step_advances_the_version_counter)
+    record_check(
+        checks, "every_optimizer_advances_the_version_counter", test_every_optimizer_advances_the_version_counter
+    )
+    record_check(checks, "state_dict_roundtrip", test_state_dict_roundtrip)
+    record_check(checks, "restore_replays_the_rounding", test_restore_replays_the_rounding)
+    return {"checks": checks}
 
-    test_dtypes()
-    test_vs_baselines()
-    test_mixed_dtypes()
-    test_weight_decay_groups()
-    test_sr_removes_second_moment_bias()
-    test_sr_removes_second_moment_bias_eager()
-    test_exp_avg_stays_nearest()
-    test_step_advances_the_version_counter()
-    test_every_optimizer_advances_the_version_counter()
-    test_state_dict_roundtrip()
 
-    print("\n" + "=" * 50)
-    print("ALL TESTS PASSED")
-    print("=" * 50)
+if __name__ == "__main__":
+    run()

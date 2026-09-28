@@ -80,6 +80,10 @@ _SHARED_OVERLAP_STREAMS: dict[int, torch.cuda.Stream] = {}
 # both keeps either compile out of the dispatch→combine span.
 _ACTIVATION_WARMUP_TOKENS = (16, 1)
 
+# Floor added to a top-k weight sum before renormalizing by it (DeepSeek-V3's own 1e-20), shared by
+# every family whose upstream router renormalizes with one.
+TOPK_WEIGHT_NORM_EPS = 1e-20
+
 
 def _shared_overlap_stream(device: torch.device) -> torch.cuda.Stream:
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -379,8 +383,8 @@ class EPMoELayerBase(EPExpertGatherMixin, EPRouterBalancingMixin, nn.Module, ABC
         self.expert_tp_group = ep_config.expert_tp_group
         if self.expert_tp_size > 1 and self.expert_tp_group is None:
             raise RuntimeError(
-                f"expert_tp_size={self.expert_tp_size} requires expert_tp_group to be created "
-                f"in EPConfig process group setup. Got expert_tp_group=None."
+                f"expert_tensor_parallel_size={self.expert_tp_size} requires expert_tp_group to be created in "
+                f"EPConfig process group setup. Got expert_tp_group=None."
             )
 
         self.fp32_router = ep_config.fp32_router
@@ -543,19 +547,19 @@ class EPMoELayerBase(EPExpertGatherMixin, EPRouterBalancingMixin, nn.Module, ABC
         scores = F.softmax(torch.gather(logits.float(), -1, indices), dim=-1)
         return scores, indices
 
-    def _softmax_gate_weights_at(self, router_logits: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """Renormalized-softmax router weights at ``indices``: the Qwen3-style gating shared by families
-        whose router is softmax over all experts → gather → optional top-k renorm.
+    def _softmax_gate_weights_at(
+        self, router_logits: torch.Tensor, indices: torch.Tensor, *, normalize: bool
+    ) -> torch.Tensor:
+        """Softmax router weights at ``indices``, top-k renormalized when ``normalize``: the Qwen3-style
+        gating shared by families whose router is softmax over all experts → gather → optional renorm.
 
-        ``norm_topk_prob`` is read off the live router module and defaults to True (Qwen3 makes it a
-        required config field; Qwen3.5's ``Qwen3_5MoeTopKRouter`` carries no such attribute and
-        renormalizes unconditionally). Reading the module rather than a cached copy keeps routing replay
-        bit-identical to the router the forward just called. Not the default for ``_gate_weights_at``, so
-        a family with different gating (Bailing's sigmoid, Cohere2's) raises instead of inheriting it.
+        Each family passes its router's own rule, so an upstream rename raises instead of silently
+        flipping the renorm. Not the default for ``_gate_weights_at``, so a family with different
+        gating (Bailing's sigmoid, Cohere2's) raises instead of inheriting it.
         """
         probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
         weights = probs.gather(-1, indices)
-        if getattr(self.gate, "norm_topk_prob", True):
+        if normalize:
             weights = weights / weights.sum(dim=-1, keepdim=True)
         return weights.to(router_logits.dtype)
 
@@ -1154,8 +1158,8 @@ class EPMoELayerBase(EPExpertGatherMixin, EPRouterBalancingMixin, nn.Module, ABC
         if intermediate % self.expert_tp_size != 0:
             raise ValueError(
                 f"Expert TP requires the expert intermediate size ({intermediate}) to be divisible by "
-                f"expert_tp_size ({self.expert_tp_size}); got remainder {intermediate % self.expert_tp_size}. "
-                f"Reduce expert_tp_size."
+                f"expert_tensor_parallel_size ({self.expert_tp_size}); got remainder "
+                f"{intermediate % self.expert_tp_size}. Reduce expert_tensor_parallel_size."
             )
         return intermediate // self.expert_tp_size
 
@@ -1451,6 +1455,30 @@ class EPMoELayerBase(EPExpertGatherMixin, EPRouterBalancingMixin, nn.Module, ABC
             return self._compute_experts_gmm(tokens, experts, weights, output_dtype)
         return self._compute_experts_weighted(tokens, experts, weights, output_dtype, self._expert_forward)
 
+    def _rank_uniform_dispatch_input(self, flat: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """``flat`` as a grad-requiring leaf when this layer's experts train but no dispatch operand
+        requires grad (expert-only LoRA or fine-tuning); ``flat`` itself otherwise.
+
+        With no grad-requiring operand the dispatch builds no autograd node, and the combine joins the
+        graph only through the expert output: a constant on a rank whose experts received no token. That
+        rank's backward then skips DeepEP collectives its peers enter, here and in every later layer
+        whose input loses grad through it, which hangs the barrier, mispairs collectives, or leaves its
+        loss with no grad at all. The leaf gives every rank the same dispatch and combine nodes. Its
+        gradient is discarded, so no parameter gradient changes. The cost, in the first such layer of a
+        forward only (its combined output requires grad downstream), is the dispatch backward's
+        all-to-all and the expert compute's input-grad path.
+
+        Not applied outside a grad-enabled training forward, or at ``ep_size == 1``, which has no
+        transport.
+        """
+        if flat.requires_grad or weights.requires_grad:
+            return flat
+        if not (self.training and torch.is_grad_enabled()) or self.ep_size <= 1:
+            return flat
+        if not any(param.requires_grad for _, param in self.expert_named_params()):
+            return flat
+        return flat.detach().requires_grad_()
+
     def _dispatch_compute_combine(
         self, flat: torch.Tensor, experts: torch.Tensor, weights: torch.Tensor, input_dtype: torch.dtype
     ) -> torch.Tensor:
@@ -1479,6 +1507,8 @@ class EPMoELayerBase(EPExpertGatherMixin, EPRouterBalancingMixin, nn.Module, ABC
             # upstream of it trains on a 1/expert_tp_size gradient.
             flat = SumGradAcrossGroup.apply(flat, self.expert_tp_group)
             weights = SumGradAcrossGroup.apply(weights, self.expert_tp_group)
+
+        flat = self._rank_uniform_dispatch_input(flat, weights)
 
         with self._perf("ep.dispatch"):
             recv_x, recv_topk_idx, recv_topk_weights, handle = self._gc_dispatch(flat, experts, weights)
@@ -1590,9 +1620,8 @@ class EPGroupLimitedMoELayerBase(EPSharedExpertsMoELayerBase):
     # MoE Lite leaves the gate weights un-normalized, the others normalize.
     _NORM_TOPK_PROB_DEFAULT: bool = True
 
-    # Floor added to the top-k weight sum before dividing (DeepSeek-V3's own 1e-20). Step-3.7
-    # renormalizes with none; adding one there would change every routed weight it emits.
-    _TOPK_WEIGHT_NORM_EPS: float = 1e-20
+    # Step-3.7 renormalizes with no floor; adding one there would change every routed weight it emits.
+    _TOPK_WEIGHT_NORM_EPS: float = TOPK_WEIGHT_NORM_EPS
 
     # Routing knobs (any spelling) this family's block, router and config genuinely do not declare —
     # Laguna and Step-3.7 carry no group limiting and no ``norm_topk_prob``. Every other knob is

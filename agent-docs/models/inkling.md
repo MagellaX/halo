@@ -8,9 +8,11 @@ Transformers ships `transformers.models.inkling` natively (the image pins 5.16.1
 
 | | EP | CP | TP | ETP | EP+CP | EP+TP | LoRA |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| Inkling-Small | Yes | **No** ¹ | **No** ¹ | Yes | **No** ¹ | **No** ¹ | untested |
+| Inkling-Small | Yes | **No** ¹ | **No** ¹ | Yes | **No** ¹ | **No** ¹ | Yes ² |
 
-¹ Architectural, not a missing registration — see [Why CP and TP are out](#why-cp-and-tp-are-out). PP is not yet available in this release — see [Pipeline parallelism](#pipeline-parallelism).
+¹ Architectural, not a missing registration — see [Why CP and TP are out](#why-cp-and-tp-are-out). Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
+
+² Tiny-model LoRA verified (`test_lora_merged_save_resume_families.py`: expert and mixed adapters at ep2 and ep1 through a merged save and an exact resume); no full-scale LoRA run.
 
 ## EP wrapper
 
@@ -38,7 +40,7 @@ The lazy loaders read the same declarative entries through the family's `_HUB_CO
 
 The `from_pretrained` fallback still works but materializes the full checkpoint per concurrently-loading rank: 532 GB for Inkling-Small, so `max_concurrent_loading: 4` ≈ 2.1 TB peak host RAM.
 
-`from_pretrained` honors the family's fp32 pin, which covers the **short convolutions** (`_keep_in_fp32_modules_strict`: `k_sconv`/`v_sconv`/`attn_sconv`/`mlp_sconv`); `load_ep_model` then re-casts parameters to the run dtype, since FSDP2 rejects mixed-dtype parameters in one shard group — the sconvs train in bf16 here, a deliberate trade validated by the multi-node runs below.
+The family's fp32 pin covers the **short convolutions** (`_keep_in_fp32_modules_strict`: `k_sconv`/`v_sconv`/`attn_sconv`/`mlp_sconv`). Every training loader casts them to the run dtype ([Load precision](README.md#load-precision)), so the sconvs train in bf16 unless the run keeps fp32 masters — a deliberate trade validated by the multi-node runs below.
 
 ## Why CP and TP are out
 
@@ -49,21 +51,6 @@ The `from_pretrained` fallback still works but materializes the full checkpoint 
 
 - **TP** — the selective-TP planner shards q/k/v/o structurally; Inkling's attention carries per-layer head geometry (`swa_*` on sliding layers), sequence convolutions on the projected K/V, and a per-head `rel_logits_proj`, none of which the planner can shard. The zero-shard raise names the class.
 
-## Pipeline parallelism
-
-Pipeline parallelism is [not yet available in this release](../parallelism/pipeline-parallelism.md).
-The shipped seams target the **text decoder** (`InklingForCausalLM`): put a text-only `config.json`
-(`InklingTextConfig` fields, `architectures: ["InklingForCausalLM"]`) beside the hub weights and
-point `model_name_or_path` at that directory.
-
-The stage loader reads the TM-namespace safetensors through the conversion entry, drops the
-tower/MTP keys, and composes with EP inside each stage. The generic VLM gate refuses only a run that
-feeds images, so the composite class is admitted text-only as well, but the text-only config is the
-route the seams target.
-
-Layer types repeat with period 6 on Inkling-Small (42 layers), so the split contract binds stage
-boundaries to multiples of 6; EP must fit inside one stage, which puts `pp2` + EP16 at ≥ 4 nodes.
-
 ## Multimodal training
 
 The composite class trains under EP: patching finds `InklingMoE` under `model.language_model`, the
@@ -73,8 +60,8 @@ alongside the expert shards (`tests/gpu/parallelism/ep/test_ep_vlm_inkling.py`, 
 undistributed composite reference).
 
 Image-text SFT rides the VLM data path (`VLMDataCollator` + `processing_inkling`); text-only data
-through the same class is what the multi-node runs below validated. CP rejects the class outright and
-PP refuses any image-carrying run, so multimodal is EP/ETP-only.
+through the same class is what the multi-node runs below validated. CP rejects the class outright, so
+multimodal is EP/ETP-only.
 
 ## Multi-node EP
 
@@ -99,4 +86,4 @@ Inkling loads as a `ConditionalGeneration` class, but the data path follows the 
 
 The shipped config sets `packing: false`: full rows attend 8192 tokens/rank/step against the ~2.3k the measurement above ran at, on a peak of 246 of 288 GB, and the depthwise convs cross packed documents either way.
 
-CPU coverage: `tests/cpu/models/test_inkling_support.py` (registration and router parity, joint normalization included). GPU gates: `tests/gpu/parallelism/ep/test_ep_vs_reference_inkling.py`, `tests/gpu/parallelism/combined/test_ep_etp_inkling.py`, `tests/gpu/parallelism/ep/test_ep_vlm_inkling.py`.
+CPU coverage: `tests/cpu/models/test_inkling_support.py` (registration and router parity, joint normalization included). GPU gates: `tests/gpu/parallelism/ep/test_ep_vs_reference_inkling.py`, `tests/gpu/parallelism/combined/test_ep_etp_inkling.py`, `tests/gpu/parallelism/ep/test_ep_vlm_inkling.py`, `tests/gpu/trainers/lora/test_lora_merged_save_resume_families.py` (`--family inkling_text`).

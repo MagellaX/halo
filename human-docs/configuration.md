@@ -1,11 +1,11 @@
 # Writing a Config
 
 A run is one flat YAML file: the HuggingFace `TrainingArguments` fields you
-already know, plus Halo's own. What you read is what the trainer gets.
+already know, plus Halo's own.
 
 ## Start from the nearest example
 
-Don't write one from scratch. `examples/` is organised by method, then by model
+Don't write one from scratch. `examples/` is organized by method, then by model
 family (`examples/sft/qwen3/`, `examples/preference/qwen3_5/`), and the closest
 file is usually within two edits of what you want:
 
@@ -32,13 +32,15 @@ constraints, not decoration.
 | PEFT | `use_peft`, `lora_r`, `lora_alpha`, `lora_target_modules` |
 | Checkpoint / eval | `output_dir`, `save_strategy`, `save_steps`, `save_only_model`, `eval_strategy`, `eval_steps` |
 | Logging | `report_to`, `project_name`, `run_name`, `logging_steps` |
-| RL / rollout | both: `num_generations`, `vllm_server_host`, `vllm_server_port` · async GRPO with environments only: `rollout_server_url`, `environment_type`, `rewards`, `num_rollout_workers` |
+| RL / rollout | both: `num_generations`, `rewards` · online GRPO: `vllm_server_host`, `vllm_server_port` · async GRPO with environments: `rollout_server_url`, `environment_type`, `num_rollout_workers` |
 
 A few notes on the ones that bite:
 
-- `attn_implementation` — leave it unset and Halo picks the backend for your GPU
-  and model (FA4 on Blackwell, FA3 on Hopper, per-family fallbacks where a kernel
-  is known-broken). Most examples pin one anyway; copy the pin with the config.
+- `attn_implementation` — leave it unset and SFT, self-distillation and embedding
+  pick the backend for your GPU and model (FA4 on Blackwell, FA3 on Hopper, per-family
+  fallbacks where a kernel is known-broken). The padded-batch methods (preference,
+  reward, classification, teacher distillation, every GRPO) default to SDPA
+  instead. Most examples pin one anyway; copy the pin with the config.
 - `model_revision` pins a Hub commit, and `max_concurrent_loading` caps how many
   ranks per node load weights at once — unset it resolves to half the node's GPUs
   capped at 4, and `1` rescues a CPU-RAM-tight host.
@@ -75,7 +77,7 @@ And four things a launch refuses up front rather than deep inside training — t
 first three in the parser:
 
 - An unknown or retired key, named in the message. No spelling is migrated — TRL's
-  old `max_seq_length` (now `max_length`) raises like any other.
+  retired `max_seq_length` (the field is `max_length`) raises like any other.
 - YAML 1.1 booleans on a boolean field (`packing: no`, `bf16: off`) — YAML 1.2
   reads those as truthy strings, inverting what you wrote. Use `true` / `false`.
 - A value outside a field's declared choices (`advantage_method: banana`).
@@ -95,7 +97,8 @@ things per trainer:
 | SFT, DPO, KTO, distillation | `max_length` only; DPO's `generation_max_prompt_length` (default 512) bounds eval-time samples, not training |
 | SMPO | shares carved out of `max_length` — an unset prompt takes half, the completion the rest |
 | Offline GRPO | independent truncation caps; set both and their sum becomes the tokenizer's `model_max_length` |
-| Online GRPO, async GRPO with environments | `max_prompt_length` is a dataset *filter* (over-long rows are dropped, not truncated); `max_completion_length` is the generation budget |
+| Online GRPO | `max_prompt_length` is a dataset *filter* (over-long rows are dropped, not truncated); `max_completion_length` is the generation budget |
+| Async GRPO with environments | `max_prompt_length` is the same filter; the per-turn generation budget is `rollout_max_tokens`, and a `max_completion_length` other than TRL's default (256) must equal it |
 
 The two online trainers declare no `max_length` at all, so the key fails to parse
 there; offline GRPO's parses and is then refused at trainer construction.

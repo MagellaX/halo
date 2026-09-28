@@ -14,7 +14,6 @@ Each test pins one run-degrading failure mode:
 """
 
 import logging
-import sys
 
 import numpy as np
 import pytest
@@ -32,7 +31,6 @@ PartialState()
 # --- top_entropy_quantile must never exclude structural tokens ---
 
 SPECIAL_IDS = [100, 101]  # <|channel|>, <|call|>: near-deterministic, so the lowest-entropy tokens
-NORMAL_IDS = [7, 8, 9]
 
 
 class _FakeTokenizer:
@@ -232,4 +230,4 @@ def test_unprotected_warning_is_emitted_once_not_per_microbatch(caplog):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -77,7 +77,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('you
 | Setup | EP | CP | TP | Scope | DP | Flags |
 |-------|----|----|-----|-------|----|-------|
 | Node-local EP (default) | 8 | 1 | 1 | `node` | 16 | `--expert_parallel_size=8 --ep_scope=node` |
-| Long sequence (8K+) | 8 | 8 | 1 | `node` | 2 | `+ --context_parallel_size=8` |
+| Long sequence (8K+) | 8 | 8 | 1 | `node` | 2 | `+ --context_parallel_size=8 --packing=false` (CP refuses packing) |
 | Cross-node EP | 16 | 1 | 1 | `global` | 16 | `--expert_parallel_size=16 --ep_scope=global` |
 | EP+TP (max memory efficiency) | 16 | 1 | 8 | `global` | 2 | `+ --tensor_parallel_size=8` |
 
@@ -143,9 +143,9 @@ Formats, save modes, and resume mechanics are owned by
   each pod's local rank 0 writes a complete checkpoint to its own disk; re-run `torchrun` on every pod with
   `--resume_from_checkpoint=true`.
 
-    To resume *trained* EP/CP weights (not just trainer state), point
-    `model_name_or_path` at the gathered checkpoint directory
-    ([why](../reference/checkpoints.md#resume-by-parallelism-mode)).
+    Trained EP/CP weights reload with no manual step: the training scripts load the policy from the
+    resumed checkpoint, so leave `model_name_or_path` at the base, which reference and teacher models
+    still resolve ([why](../reference/checkpoints.md#resume-by-parallelism-mode)).
 
 - `WANDB_RUN_ID` is hashed from `output_dir` + launch timestamp and broadcast from rank 0, so it is
   consistent across a run's ranks but not across re-runs. Export the same `WANDB_RUN_ID` on every pod
@@ -176,7 +176,7 @@ gradient sync crosses the network.
 
 **Host OOM during gathered save.** Every gathered save streams: the EP path one MoE layer at a
 time, the dense/CP/TP paths one decoder layer at a time
-([Checkpoints](../reference/checkpoints.md#expert-parallelism-ep)). Each pod's save rank peaks
+([Checkpoints](../reference/checkpoints.md#expert-parallelism-ep-eptp-epcp)). Each pod's save rank peaks
 at the replicated non-expert params plus one pending shard (`save_max_shard_size`, default `5GB`),
 not a model's worth.
 

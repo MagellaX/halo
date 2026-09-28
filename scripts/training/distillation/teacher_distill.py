@@ -27,9 +27,8 @@ from src.data.collators.factory import select_data_collator
 from src.data.collators.vlm import VLMDataCollator
 from src.data.pipeline.processing import coordinated_map, filter_by_length, resolve_map_num_proc
 from src.data.pipeline.rendered import tokenize_rendered
-from src.data.pipeline.row_processors import apply_chat_template_to_conversations
+from src.data.pipeline.row_processors import apply_chat_template_to_conversations, text_render_kwargs
 from src.data.pipeline.vlm_dataset import prepare_vlm_dataset
-from src.data.vlm import is_vlm_run
 from src.distributed.loading.frozen_models import load_frozen_auxiliary_model
 from src.distributed.loading.peft_setup import prepare_peft_model, setup_peft_model
 from src.distributed.loading.vlm_setup import load_model_for_training
@@ -50,7 +49,7 @@ from src.training.script_runner import (
     load_script_datasets,
     log_script_dataset_examples,
     padded_workload_attn_implementation,
-    reject_images_under_text_only_model,
+    resolve_vlm_run,
     run_trainer,
 )
 
@@ -91,27 +90,12 @@ def _load_distill_teacher(
 def _prepare_text_distill_data(ds, args, training_config, tokenizer, model_config):
     """Chat-template → length-filter → tokenize; the collator derives the labels the losses mask on."""
     num_proc_kwargs = {"num_proc": resolve_map_num_proc(training_config.dataset_num_proc)}
+    render_kwargs = text_render_kwargs(args)
     ds = coordinated_map(
         ds,
-        lambda row: {
-            "text": apply_chat_template_to_conversations(
-                row,
-                tokenizer,
-                conversation_field=args.conversation_field,
-                system_prompt=args.system_prompt,
-                model_supports_system_role=args.model_supports_system_role,
-                tools_field=args.tools_field,
-                interleaved_thinking=args.interleaved_thinking,
-            )
-        },
+        lambda row: {"text": apply_chat_template_to_conversations(row, tokenizer, **render_kwargs)},
         desc="Applying chat template",
-        cache_key_extras={
-            "conversation_field": args.conversation_field,
-            "system_prompt": args.system_prompt,
-            "model_supports_system_role": args.model_supports_system_role,
-            "tools_field": args.tools_field,
-            "interleaved_thinking": args.interleaved_thinking,
-        },
+        cache_key_extras=render_kwargs,
         **num_proc_kwargs,
     )
     train_dataset = filter_by_length(ds["train"], training_config.max_length, tokenizer, **num_proc_kwargs)
@@ -188,11 +172,20 @@ def main():
         model_config,
         dist_args,
         script_prefix="distill",
-        supports_cp=False,
-        supports_pp=False,
+        trainer_cls=DistributedDistillationTrainer,
     )
     parallelism_config = runtime.parallelism_config
     local_rank = runtime.local_rank
+
+    ds, dataset_presharded = load_script_datasets(
+        args,
+        parallelism_config,
+        conversation_field=args.conversation_field,
+    )
+    # The data path follows the run, not the checkpoint class: a natively-multimodal student
+    # distilled on text-only rows is a text run (see is_vlm_run). Decided before the model load,
+    # which requires the checkpoint's processor for an image run.
+    is_vlm = resolve_vlm_run(args, model_config, ds, text_only_model=dist_args.text_only_model)
 
     # Same padded-workload request the teacher load makes: the two forwards are compared token by
     # token, so a backend split between them biases the distillation targets.
@@ -200,6 +193,7 @@ def main():
         model_config,
         training_config,
         parallelism_config,
+        vlm_run=is_vlm,
         attn_default=padded_workload_attn_implementation(model_config, sinks_reset=dist_args.reset_sinks),
         reset_sinks=dist_args.reset_sinks,
         train_sinks=dist_args.train_sinks,
@@ -207,7 +201,8 @@ def main():
         text_only_model=dist_args.text_only_model,
     )
     tokenizer = apply_max_length(training_config, args, student_model, tokenizer)
-    processing_class = install_resolved_tokenizer(processing_class, tokenizer, is_vlm_checkpoint)
+    processing_class = install_resolved_tokenizer(processing_class, tokenizer)
+    enforce_text_path_padding_side(tokenizer, is_vlm)
 
     # The distillation trainer is a plain Trainer (no peft_config kwarg), so PEFT is applied here via
     # prepare_peft_model (k-bit prep before the wrap, then the bf16 adapter cast).
@@ -229,16 +224,6 @@ def main():
         teacher_params = sum(p.numel() for p in teacher_model.parameters()) / 1e9
         logger.info(f"Teacher model: {args.teacher_model} ({teacher_params:.2f}B params)")
 
-    ds, dataset_presharded = load_script_datasets(
-        args,
-        parallelism_config,
-        conversation_field=args.conversation_field,
-    )
-    # The data path follows the run, not the checkpoint class: a natively-multimodal student
-    # distilled on text-only rows is a text run (see is_vlm_run).
-    reject_images_under_text_only_model(args, ds, text_only_model=dist_args.text_only_model)
-    is_vlm = is_vlm_run(args, model_config.model_name_or_path, ds, config=student_model.config)
-    enforce_text_path_padding_side(tokenizer, is_vlm)
     if is_vlm:
         train_dataset, eval_dataset, data_collator = _prepare_vlm_distill_data(
             ds, args, training_config, processing_class, tokenizer, student_model.config

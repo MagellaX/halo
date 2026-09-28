@@ -17,11 +17,8 @@ Usage:
     python tests/cpu/data/test_tokenize_rendered.py
 """
 
-import sys
-
 import pytest
 
-from src.data.pipeline.preferences import build_reward_preprocess_fn
 from src.data.pipeline.rendered import probe_tokenizer_specials, render_generation_prompt, tokenize_rendered
 from tests.common.utils import load_script_module
 
@@ -356,38 +353,6 @@ def test_for_generation_noop_without_trailing_specials():
         ), type(tok).__name__
 
 
-def test_reward_preprocess_single_bos_for_bos_template():
-    """build_reward_preprocess_fn routes through tokenize_rendered: single BOS on both branches."""
-    fn = build_reward_preprocess_fn(BosTokenizer(), max_length=64)
-    out = fn(
-        {
-            "prompt": [[{"role": "user", "content": "q"}]],
-            "chosen": [[{"role": "assistant", "content": "good answer"}]],
-            "rejected": [[{"role": "assistant", "content": "bad"}]],
-        }
-    )
-    for key in ("input_ids_chosen", "input_ids_rejected"):
-        ids = out[key][0]
-        assert ids[0] == BOS_ID and BOS_ID not in ids[1:], f"{key} must carry exactly one BOS, got {ids}"
-
-
-def test_reward_preprocess_keeps_gemma4_bos():
-    """Reward path regression: gemma-4-style templates keep their BOS (a leading-BOS strip plus
-    add_special_tokens=True drops it)."""
-    tok = Gemma4StyleTokenizer()
-    fn = build_reward_preprocess_fn(tok, max_length=64)
-    out = fn(
-        {
-            "prompt": [[{"role": "user", "content": "q"}]],
-            "chosen": [[{"role": "assistant", "content": "good answer"}]],
-            "rejected": [[{"role": "assistant", "content": "bad"}]],
-        }
-    )
-    for key in ("input_ids_chosen", "input_ids_rejected"):
-        ids = out[key][0]
-        assert ids[0] == BOS_ID and ids.count(BOS_ID) == 1, f"{key} must keep the template BOS, got {ids}"
-
-
 def test_render_generation_prompt_keeps_bos_when_nothing_re_adds_it():
     """gemma-4-style: the template's BOS must stay in the returned prompt TEXT.
 
@@ -488,9 +453,9 @@ def test_classification_row_maps_multi_labels_of_either_type(labels, expected):
 
 @pytest.mark.parametrize("sentinel", [-1, "-1"])
 def test_classification_row_skips_the_unlabeled_sentinel_in_a_multi_label_row(sentinel):
-    """``get_label_list`` warns about and REMOVES ``-1`` from the label list, so it has no id to look
-    up — the single-label branch passes it through, and a multi-hot row says the same thing by leaving
-    every slot at 0. Without the skip the row ``KeyError``s on a key the pipeline deliberately dropped.
+    """``build_label_list`` REMOVES ``-1`` from the class list, so it has no id to look up: a multi-hot
+    row reads it as absence, leaving its slot at 0. Without the skip the row ``KeyError``s on a key the
+    pipeline deliberately dropped.
     """
     module = _classification_script()
 
@@ -505,4 +470,4 @@ def test_classification_row_skips_the_unlabeled_sentinel_in_a_multi_label_row(se
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))
