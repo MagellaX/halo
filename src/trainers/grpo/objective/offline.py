@@ -1,4 +1,9 @@
-"""Offline-GRPO's per-token objective and shared local, CP and pipeline normalization."""
+"""Offline-GRPO's per-token objective and shared local, CP and pipeline normalization.
+
+The negative-advantage ``min_log_prob`` floor applies to both policy and reference log-probs.
+The policy term, capped k3 KL and per-token diagnostics are shared across the scoring paths;
+the reduction preserves group weighting over complete rows or CP-owned token shards.
+"""
 
 from __future__ import annotations
 

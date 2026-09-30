@@ -18,7 +18,23 @@ def full_row_loss(logps, shifted_labels, advantages, group_sizes):
     return ((token_loss * valid).sum(1) / valid.sum(1).clamp(min=1) * weights).sum() / weights.sum()
 
 
-def gradient_agreement(actual, expected):
+def ep_gradient_parameter_names(model, ep_layers):
+    """Routed expert/router parameters by identity; shared experts retain the dense CP bounds."""
+    routed_ids = {id(parameter) for layer in ep_layers for _, parameter in layer.expert_named_params()}
+    for layer in ep_layers:
+        router = layer._live_router_module()
+        if router is not None:
+            routed_ids.update(id(parameter) for parameter in router.parameters())
+    return {name for name, parameter in model.named_parameters() if id(parameter) in routed_ids}
+
+
+def gradient_agreement(
+    actual,
+    expected,
+    *,
+    cosine_min=TOL.cp_grad_cosine_min,
+    norm_ratio_band=(1.0 - TOL.cp_grad_norm_rtol, 1.0 + TOL.cp_grad_norm_rtol),
+):
     """Exact parameter coverage, each parameter's direction and scale, and total gradient scale."""
     same_keys = actual.keys() == expected.keys()
     if not same_keys or not expected:
@@ -39,7 +55,7 @@ def gradient_agreement(actual, expected):
             cosines.append(1.0 if current_norm == 0.0 else 0.0)
             parameter_norms_match &= current_norm == 0.0
         else:
-            parameter_norms_match &= abs(current_norm / reference_norm - 1.0) < TOL.cp_grad_norm_rtol
+            parameter_norms_match &= norm_ratio_band[0] < current_norm / reference_norm < norm_ratio_band[1]
             cosine = (
                 (current.flatten() @ reference.flatten()).item() / (current_norm * reference_norm)
                 if current_norm
@@ -50,21 +66,21 @@ def gradient_agreement(actual, expected):
     norm_ratio = (actual_squared_norm / expected_squared_norm) ** 0.5 if expected_squared_norm else float("inf")
     return (
         same_keys,
-        minimum_cosine >= TOL.cp_grad_cosine_min,
-        parameter_norms_match and abs(norm_ratio - 1.0) < TOL.cp_grad_norm_rtol,
+        minimum_cosine >= cosine_min,
+        parameter_norms_match and norm_ratio_band[0] < norm_ratio < norm_ratio_band[1],
         minimum_cosine,
         norm_ratio,
     )
 
 
-def optimizer_step_agreement(actual, expected, initial):
+def optimizer_step_agreement(actual, expected, initial, **gradient_bounds):
     """Compare the applied update, not large unchanged weights that hide an omitted optimizer step."""
     if actual.keys() != expected.keys() or expected.keys() != initial.keys():
         return False
     actual_update = torch.cat([(actual[name] - initial[name]).flatten() for name in sorted(initial)])
     expected_update = torch.cat([(expected[name] - initial[name]).flatten() for name in sorted(initial)])
     _, direction_matches, norm_matches, _, _ = gradient_agreement(
-        {"update": actual_update}, {"update": expected_update}
+        {"update": actual_update}, {"update": expected_update}, **gradient_bounds
     )
     return direction_matches and norm_matches
 

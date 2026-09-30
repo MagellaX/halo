@@ -14,8 +14,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from src.data.spans import LABEL_IGNORE_INDEX
 from src.distributed.context_parallel.config import CPConfig
-from src.distributed.context_parallel.wrapper import UlyssesCPModelWrapper
 from src.trainers.preference.smpo import SmoothMarginPOTrainer
+from tests.common.cp_wrapper import unpatched_cp_wrapper
 from tests.common.gloo import run_gloo_ranks
 
 VOCAB, SEQ = 17, 12
@@ -28,16 +28,6 @@ class _LogitsModel(nn.Module):
 
     def forward(self, input_ids, **kwargs):
         return CausalLMOutputWithPast(logits=self.embedding(input_ids))
-
-
-def _wrapper(model, config):
-    wrapper = UlyssesCPModelWrapper.__new__(UlyssesCPModelWrapper)
-    nn.Module.__init__(wrapper)
-    wrapper.model, wrapper.cp_config = model, config
-    wrapper.cp_rank, wrapper.cp_size = config.cp_rank, config.cp_size
-    wrapper.cp_group = config.process_group
-    wrapper._attention_layers = []
-    return wrapper
 
 
 def _sync_gradient(parameter, cp_size):
@@ -70,7 +60,7 @@ def _sft_worker(rank, cp_size):
     for mutated in (False, True):
         model = copy.deepcopy(baseline)
         model.zero_grad()
-        wrapper = _wrapper(model, config)
+        wrapper = unpatched_cp_wrapper(model, cp_config=config)
         if mutated:
             with patch("src.distributed.context_parallel.wrapper.cp_shift_against_full_labels", _drop_boundary):
                 loss = wrapper(ids, attention_mask=mask, labels=labels).loss
@@ -123,7 +113,7 @@ def _smpo_worker(rank, cp_size):
     for mutated in (False, True):
         model = copy.deepcopy(baseline)
         model.zero_grad()
-        wrapper = _wrapper(model, config)
+        wrapper = unpatched_cp_wrapper(model, cp_config=config)
         host = _smpo_host(config)
         if mutated:
             with patch("src.trainers.preference.smpo.cp_shift_against_full_labels", _drop_boundary):

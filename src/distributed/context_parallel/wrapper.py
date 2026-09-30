@@ -32,16 +32,6 @@ from src.models.structure import base_transformers_model, unwrap_framework_wrapp
 logger = logging.getLogger(__name__)
 
 
-def find_cp_wrapper(model: nn.Module) -> UlyssesCPModelWrapper | None:
-    """Find the CP wrapper directly or below PEFT and framework wrappers."""
-    model = unwrap_framework_wrappers(model)
-    if isinstance(model, UlyssesCPModelWrapper):
-        return model
-    inner = getattr(model, "base_model", None)
-    inner_model = getattr(inner, "model", inner)
-    return inner_model if isinstance(inner_model, UlyssesCPModelWrapper) else None
-
-
 def _reject_left_padding(attention_mask) -> None:
     """Raise if any row is left-padded.
 
@@ -275,11 +265,12 @@ class UlyssesCPModelWrapper(nn.Module):
         return coef
 
     def _compute_cp_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Boundary-aware causal LM loss with global (sum/global_tokens) normalization.
+        """Causal LM loss of this rank's chunk against the full ``labels``, with boundary handling and
+        global (sum/global_tokens) normalization.
 
-        For non-final ranks the last logit predicts the next chunk's first label
-        from the full labels. Sum-normalized so every token weighs equally regardless of CP rank;
-        the ``× cp_size`` factor cancels FSDP's grad average over CP ranks.
+        For non-final ranks the last logit predicts the next chunk's first label. Sum-normalized (not
+        local mean) so every token weighs equally regardless of CP rank; the ``× cp_size`` factor
+        cancels FSDP's grad average over CP ranks.
         """
         vocab_size = logits.size(-1)
 
@@ -413,6 +404,16 @@ class UlyssesCPModelWrapper(nn.Module):
 
     def load_state_dict(self, *args, **kwargs):
         return self.model.load_state_dict(*args, **kwargs)
+
+
+def find_cp_wrapper(model: nn.Module) -> UlyssesCPModelWrapper | None:
+    """Find the CP wrapper directly or below PEFT and framework wrappers."""
+    model = unwrap_framework_wrappers(model)
+    if isinstance(model, UlyssesCPModelWrapper):
+        return model
+    inner = getattr(model, "base_model", None)
+    inner_model = getattr(inner, "model", inner)
+    return inner_model if isinstance(inner_model, UlyssesCPModelWrapper) else None
 
 
 def patch_model_for_cp(model: nn.Module, cp_config: CPConfig) -> nn.Module:

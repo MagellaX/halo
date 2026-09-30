@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 import src.distributed.context_parallel.wrapper as cp_wrapper
-from src.distributed.context_parallel.wrapper import UlyssesCPModelWrapper
+from tests.common.cp_wrapper import unpatched_cp_wrapper
 
 SEQ = 12
 HIDDEN = 5
@@ -45,14 +45,9 @@ class _Model(nn.Module):
 
 
 def _wrapper(model, cp_size, cp_rank):
-    wrapper = UlyssesCPModelWrapper.__new__(UlyssesCPModelWrapper)
-    nn.Module.__init__(wrapper)
-    wrapper.model = model
-    wrapper.cp_config = SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
-    wrapper.cp_size = cp_size
-    wrapper.cp_rank = cp_rank
-    wrapper._attention_layers = [SimpleNamespace(global_position_ids=None)]
-    return wrapper
+    return unpatched_cp_wrapper(
+        model, cp_size=cp_size, cp_rank=cp_rank, attention_layers=[SimpleNamespace(global_position_ids=None)]
+    )
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])

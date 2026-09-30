@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Qwen3-MoE EP8 offline-GRPO scoring: CP1 vs CP2/CP4 on identical logical rows.
 
-The PR 1 trainer gate stays closed. This tests its scoring seam on real DeepEP and Ulysses,
-including EP-owned expert gradients and one optimizer step.
+Tests the production scoring seam on real DeepEP and Ulysses, including EP-owned expert
+gradients and one optimizer step.
 
 Run on one NVLink-connected eight-GPU domain:
     torchrun --nproc_per_node=8 tests/gpu/parallelism/combined/test_qwen3_moe_cp_grpo_scoring.py
@@ -25,6 +25,7 @@ from src.trainers.grpo.mixins.chunked_logprobs import ChunkedLogprobsCore
 from src.trainers.grpo.objective.offline import offline_loss
 from tests.common.cp_grpo import (
     boundary_loss_negative_control,
+    ep_gradient_parameter_names,
     full_row_loss,
     gradient_agreement,
     optimizer_step_agreement,
@@ -128,6 +129,10 @@ def run(ctx) -> dict:
 
     baseline, _, base_ep_layers = _build_model(ctx.device, cp_size=1)
     initial_weights = {name: param.detach().float().clone() for name, param in baseline.named_parameters()}
+    ep_names = ep_gradient_parameter_names(baseline, base_ep_layers)
+    parameter_groups = {"dense": initial_weights.keys() - ep_names, "expert_router": ep_names}
+    assert all(parameter_groups.values())
+    ep_bounds = {"cosine_min": TOL.ep_grad_cosine_min, "norm_ratio_band": TOL.ep_grad_norm_ratio_band}
     logits = baseline(input_ids=ids, attention_mask=mask, use_cache=False).logits[:, :-1]
     full_logps = F.log_softmax(logits.float(), dim=-1).gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
     base_loss = full_row_loss(full_logps, labels[:, 1:], advantages, group_sizes)
@@ -144,6 +149,7 @@ def run(ctx) -> dict:
     checks = {}
     for cp_size in (2, 4):
         model, cp_config, ep_layers = _build_model(ctx.device, cp_size)
+        assert ep_gradient_parameter_names(model, ep_layers) == ep_names
         scorer = ChunkedLogprobsCore()
         scorer.temperature = 1.0
         scorer.accelerator = SimpleNamespace(unwrap_model=lambda m: m)
@@ -176,9 +182,23 @@ def run(ctx) -> dict:
         cp_loss.backward()
         _sync_non_ep_grads(model, ep_layers)
         cp_gradients = _snapshot(model)
-        same_grad_keys, directions_match, norm_match, minimum_cosine, norm_ratio = gradient_agreement(
-            cp_gradients, base_gradients
-        )
+        same_grad_keys = cp_gradients.keys() == base_gradients.keys()
+        directions_match = norm_match = True
+        for kind, names in parameter_groups.items():
+            got = {name: gradient for name, gradient in cp_gradients.items() if name in names}
+            want = {name: gradient for name, gradient in base_gradients.items() if name in names}
+            keys_match, direction_matches, norm_matches, minimum_cosine, norm_ratio = gradient_agreement(
+                got, want, **(ep_bounds if kind == "expert_router" else {})
+            )
+            same_grad_keys &= keys_match
+            directions_match &= direction_matches
+            norm_match &= norm_matches
+            checks[f"cp{cp_size}_{kind}_gradient_direction"] = direction_matches
+            checks[f"cp{cp_size}_{kind}_gradient_norm"] = norm_matches
+            log(
+                f"EP8/CP{cp_size} {kind}: minimum gradient cosine={minimum_cosine:.5g}, "
+                f"gradient norm ratio={norm_ratio:.5g}"
+            )
         if cp_size == 4:
             correct, broken, correct_error, broken_error = boundary_loss_negative_control(
                 scorer, model, ids, mask, advantages, group_sizes, full_logps, cp_config
@@ -202,15 +222,20 @@ def run(ctx) -> dict:
         checks[f"cp{cp_size}_gradient_names"] = same_grad_keys
         checks[f"cp{cp_size}_gradient_norm"] = norm_match
         checks[f"cp{cp_size}_every_parameter_gradient_direction"] = directions_match
-        checks[f"cp{cp_size}_optimizer_step"] = (
-            same_weight_keys
-            and step_error < TOL.kernel_atol
-            and optimizer_step_agreement(cp_weights, base_weights, initial_weights)
-        )
+        step_matches = same_weight_keys and step_error < TOL.kernel_atol
+        for kind, names in parameter_groups.items():
+            group_step_matches = optimizer_step_agreement(
+                {name: weight for name, weight in cp_weights.items() if name in names},
+                {name: weight for name, weight in base_weights.items() if name in names},
+                {name: weight for name, weight in initial_weights.items() if name in names},
+                **(ep_bounds if kind == "expert_router" else {}),
+            )
+            checks[f"cp{cp_size}_{kind}_optimizer_step"] = group_step_matches
+            step_matches &= group_step_matches
+        checks[f"cp{cp_size}_optimizer_step"] = step_matches
         log(
             f"EP8/CP{cp_size}: max supervised logp error={group_error.item():.4g}, "
             f"loss error={(cp_loss.detach() - base_loss_value).abs().item():.4g}, "
-            f"minimum gradient cosine={minimum_cosine:.5g}, gradient norm ratio={norm_ratio:.5g}, "
             f"step max error={step_error:.4g}"
         )
         _destroy_ep(ep_layers)

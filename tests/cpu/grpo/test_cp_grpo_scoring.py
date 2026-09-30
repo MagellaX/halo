@@ -3,16 +3,21 @@
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
-from torch import nn
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from src.distributed.context_parallel.wrapper import UlyssesCPModelWrapper, find_cp_wrapper
+from src.data.spans import LABEL_IGNORE_INDEX
+from src.distributed.context_parallel.config import cp_boundary_shift
+from src.distributed.context_parallel.wrapper import find_cp_wrapper
 from src.trainers.grpo.mixins.chunked_logprobs import ChunkedLogprobsCore
+from src.trainers.grpo.objective.offline import offline_loss
+from tests.common.cp_grpo import full_row_loss
+from tests.common.cp_wrapper import unpatched_cp_wrapper
 from tests.common.models import TINY_QWEN3_CONFIG
 
 SEQ = 12
@@ -57,13 +62,7 @@ def _scored_shards(model, hidden, ids, mask, labels, cp_size):
     scorer = _scorer()
     logps, shifted = [], []
     for rank in range(cp_size):
-        cp_config = SimpleNamespace(cp_size=cp_size, cp_rank=rank)
-        wrapper = UlyssesCPModelWrapper.__new__(UlyssesCPModelWrapper)
-        nn.Module.__init__(wrapper)
-        wrapper.model = model
-        wrapper.cp_size = cp_size
-        wrapper.cp_rank = rank
-        wrapper.cp_config = cp_config
+        wrapper = unpatched_cp_wrapper(model, cp_size=cp_size, cp_rank=rank)
         start = rank * SEQ // cp_size
         end = (rank + 1) * SEQ // cp_size
         # CPU has no Ulysses attention kernel. The actual wrapper split is pinned separately in
@@ -106,19 +105,41 @@ def test_scored_targets_and_gradients_match_full_qwen3(cp_size):
         torch.testing.assert_close(current_params[name].grad, baseline_params[name].grad, atol=1e-4, rtol=1e-4)
 
 
-def test_removing_a_boundary_target_changes_the_supervised_sequence():
-    ids, mask, labels = _inputs()
+def test_dropping_boundary_targets_breaks_the_production_scorer_objective():
+    ids, mask, _ = _inputs()
+    labels = torch.full_like(ids, LABEL_IGNORE_INDEX)
+    labels[:, (3, 6, 9)] = ids[:, (3, 6, 9)]
     model = _model()
     hidden = model.base_model(input_ids=ids, attention_mask=mask, use_cache=False).last_hidden_state
-    _, correct_labels = _scored_shards(model, hidden, ids, mask, labels, cp_size=4)
-    chunk = SEQ // 4
-    assert labels[0, chunk] != -100
-    assert correct_labels[0, chunk - 1] == labels[0, chunk]
-    # Dropping boundary supervision must differ from the full-row target sequence.
-    bad_labels = torch.cat([labels[:, rank * chunk + 1 : (rank + 1) * chunk] for rank in range(4)], dim=1)
-    assert bad_labels.shape[1] == SEQ - 4
-    assert correct_labels.shape[1] == SEQ - 1
-    assert (correct_labels != -100).sum() > (bad_labels != -100).sum()
+    logits = model(input_ids=ids, attention_mask=mask, use_cache=False).logits[:, :-1]
+    full_logps = F.log_softmax(logits.float(), dim=-1).gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    advantages, group_sizes = torch.tensor([1.2, 0.8]), torch.tensor([2, 3])
+    expected = full_row_loss(full_logps, labels[:, 1:], advantages, group_sizes)
+
+    def score_loss():
+        logps, shifted = _scored_shards(model, hidden, ids, mask, labels, cp_size=4)
+        return offline_loss(
+            -logps * advantages.unsqueeze(1),
+            shifted != LABEL_IGNORE_INDEX,
+            group_sizes,
+            loss_type="grpo",
+            max_completion_length=SEQ,
+        )
+
+    def drop_boundary(local_hidden, local_labels, _boundary, _is_last_rank):
+        return cp_boundary_shift(local_hidden, local_labels, None, True)
+
+    correct = score_loss()
+    with patch("src.distributed.context_parallel.config.cp_boundary_shift", side_effect=drop_boundary):
+        broken = score_loss()
+    torch.testing.assert_close(correct, expected, atol=1e-4, rtol=1e-4)
+    assert not torch.isclose(broken, expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(broken, torch.zeros_like(broken))
+    expected_grad = torch.autograd.grad(expected, model.lm_head.weight)[0]
+    correct_grad = torch.autograd.grad(correct, model.lm_head.weight, retain_graph=True)[0]
+    broken_grad = torch.autograd.grad(broken, model.lm_head.weight)[0]
+    torch.testing.assert_close(correct_grad, expected_grad, atol=1e-4, rtol=1e-4)
+    assert not torch.allclose(broken_grad, expected_grad, atol=1e-4, rtol=1e-4)
 
 
 def test_scorer_rejects_misaligned_labels():
@@ -132,13 +153,7 @@ def test_scorer_rejects_misaligned_labels():
 @pytest.mark.parametrize("peft_outside", [False, True], ids=["cp-over-peft", "peft-over-cp"])
 def test_cp_scorer_finds_real_peft_layout_and_preserves_adapter_gradients(peft_outside):
     ids, mask, labels = _inputs()
-    wrapper = UlyssesCPModelWrapper.__new__(UlyssesCPModelWrapper)
-    nn.Module.__init__(wrapper)
-    wrapper.model = _model()
-    wrapper.cp_size = 1
-    wrapper.cp_rank = 0
-    wrapper.cp_config = SimpleNamespace(cp_size=1, cp_rank=0, process_group=None)
-    wrapper._attention_layers = []
+    wrapper = unpatched_cp_wrapper(_model())
     config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj"], init_lora_weights=False, task_type="CAUSAL_LM")
     if peft_outside:
         model = get_peft_model(wrapper, config)
@@ -166,10 +181,7 @@ def test_zero_width_final_shard_backprops_zero_through_head_and_hidden():
     labels = ids.clone()
     model = _model()
     hidden = torch.randn(1, 1, CONFIG["hidden_size"], requires_grad=True)
-    wrapper = UlyssesCPModelWrapper.__new__(UlyssesCPModelWrapper)
-    nn.Module.__init__(wrapper)
-    wrapper.model = model
-    wrapper.cp_size, wrapper.cp_rank = 2, 1
+    wrapper = unpatched_cp_wrapper(model, cp_size=2, cp_rank=1)
     wrapper.forward_hidden_states = lambda **kwargs: hidden
     logps, shifted = _scorer()._cp_chunked_logps_impl(wrapper, ids, torch.ones_like(ids), labels)
     assert logps.shape == shifted.shape == (1, 0)
