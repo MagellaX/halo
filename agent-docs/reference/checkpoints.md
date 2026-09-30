@@ -150,6 +150,12 @@ full fine-tune built from the checkpoint at construction (Path B, [Resuming trai
 still loads at the run dtype before the trainer's fp32 upcast, so its fp32 masters resume rounded to
 bf16.
 
+`ReferenceLogpsCheckpointMixin` persists DPO/KTO precompute scores on the filesystem-aware
+save rank. The save completes only after its file and parent directory are synced. Unchanged
+checkpoints hardlink the immutable file, falling back to a copy where links are unavailable;
+adding a scored split writes a new payload. Write failures rendezvous across ranks before
+checkpoint rotation can remove the previous complete checkpoint.
+
 The exported `config.json` is serialized with run-scoped router mutations restored
 (`config_export_ready`): the balancing strategy's zeroed `router_aux_loss_coef`, forced
 `output_router_logits` and toolkit stamp configure the run, not the artifact — exported, they would

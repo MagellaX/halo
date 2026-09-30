@@ -1,0 +1,272 @@
+"""Rank-consistent identity, resume and checkpoint lifecycle for frozen reference scores."""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import os
+import shutil
+import tempfile
+from collections.abc import Mapping, Sequence
+from functools import partial
+
+import numpy as np
+import pyarrow as pa
+import torch
+from accelerate.logging import get_logger
+from datasets import Dataset
+
+from src.checkpoint.format import REFERENCE_LOGPS_FILE
+from src.distributed.checkpoint.coordination import consensus_read
+from src.distributed.runtime import (
+    DeferredRankFailure,
+    barrier_on_exit,
+    fs_aware_save_rank,
+    rank_consensus,
+    reject_across_ranks,
+    reject_divergent_settings,
+)
+
+logger = get_logger(__name__, log_level="info")
+
+_DIGEST_BATCH_ROWS = 256
+_DIGEST_CHUNK_VALUES = 1 << 22
+_IDENTITY_SCHEMA = {"num_rows": int, "token_digests": Mapping, "settings": Mapping}
+_LINK_COPY_ERRNOS = {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EOPNOTSUPP}
+
+
+def is_token_type(arrow_type: pa.DataType) -> bool:
+    """Integer or boolean tokens, bare or in one list level."""
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        arrow_type = arrow_type.value_type
+    return pa.types.is_integer(arrow_type) or pa.types.is_boolean(arrow_type)
+
+
+def token_digest(dataset: Dataset, column: str) -> str:
+    """Hash ordered row lengths and int64 values, independent of Arrow batches and integer width."""
+    lengths, values = hashlib.sha256(), hashlib.sha256()
+    for batch in dataset.select_columns([column]).with_format("arrow").iter(batch_size=_DIGEST_BATCH_ROWS):
+        array = batch.column(column).combine_chunks()
+        if array.null_count:
+            raise ValueError(f"'{column}' contains null token IDs")
+        if pa.types.is_list(array.type) or pa.types.is_large_list(array.type):
+            lengths.update(array.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64).tobytes())
+            array = array.flatten()
+        if array.null_count:
+            raise ValueError(f"'{column}' contains null token IDs")
+        for start in range(0, len(array), _DIGEST_CHUNK_VALUES):
+            chunk = array.slice(start, _DIGEST_CHUNK_VALUES)
+            values.update(chunk.to_numpy(zero_copy_only=False).astype(np.int64).tobytes())
+    return hashlib.sha256(lengths.digest() + values.digest()).hexdigest()
+
+
+def _identity_mismatch(entry: object, identity: Mapping) -> str | None:
+    if not isinstance(entry, Mapping) or not all(isinstance(entry.get(k), t) for k, t in _IDENTITY_SCHEMA.items()):
+        return f"its entry is not a saved reference split (expected {sorted(_IDENTITY_SCHEMA)})"
+    if entry["num_rows"] != identity["num_rows"]:
+        return f"it was saved for {entry['num_rows']} rows and this dataset has {identity['num_rows']}"
+    if entry["settings"] != identity["settings"]:
+        return f"it was computed under {entry['settings']} and this run sets {identity['settings']}"
+    changed = sorted(
+        column for column, digest in identity["token_digests"].items() if entry["token_digests"].get(column) != digest
+    )
+    if changed:
+        return (
+            f"this dataset's {changed} differ from the saved run's (a changed dataset, split, chat template "
+            "or tokenizer — or, for KTO's KL completions, per_device_train_batch_size or dataset_num_proc)"
+        )
+    return None
+
+
+def _atomic_reference_save(path: str, payload, previous: str | None = None) -> None:
+    """Commit one complete sidecar; immutable references can share storage across checkpoints."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{REFERENCE_LOGPS_FILE}.", dir=directory)
+    os.close(descriptor)
+    try:
+        if previous is not None and os.path.isfile(previous):
+            os.unlink(temporary)
+            try:
+                os.link(previous, temporary)
+            except OSError as exc:
+                if exc.errno not in _LINK_COPY_ERRNOS:
+                    raise
+                shutil.copyfile(previous, temporary)
+        else:
+            torch.save(payload(), temporary)
+        with open(temporary, "rb") as completed:
+            os.fsync(completed.fileno())
+        os.replace(temporary, path)
+        fsync_reference_directory(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def fsync_reference_directory(directory: str) -> None:
+    """Persist the rename/link directory entry before earlier checkpoints can rotate."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class ReferenceLogpsCheckpointMixin:
+    """Shared frozen-reference lifecycle; subclasses own the score payload and the sweep."""
+
+    def _init_reference_state(self, *, checkpoint, given: bool, policy_from_checkpoint: bool) -> None:
+        self._reference_resume_given = given
+        self._reference_resume_checkpoint = checkpoint
+        self._policy_from_checkpoint = policy_from_checkpoint
+        self._reference_logps_by_split: dict[str, dict] = {}
+        self._resumed_reference_logps: dict[str, object] = {}
+        self._reference_saved_loaded = False
+        self._reference_state_generation = 0
+        self._reference_saved_generation = -1
+        self._reference_immutable_path: str | None = None
+
+    def _reference_resume_required(self) -> bool:
+        return self._policy_from_checkpoint and getattr(self, "ref_model", None) is None
+
+    def _reference_split_identity(self, dataset: Dataset, name: str, settings: Mapping | None = None) -> dict:
+        guard = DeferredRankFailure(f"Identifying the '{name}' reference dataset", exc_type=ValueError)
+        identity = guard.run(
+            lambda: {
+                "num_rows": len(dataset),
+                "token_digests": self._reference_input_digests(dataset, name),
+                "settings": dict(self._reference_settings() if settings is None else settings),
+            }
+        )
+        guard.reject()
+        return identity
+
+    def _check_reference_resume_context(self) -> None:
+        missing = (
+            not self._reference_resume_given
+            and getattr(self, "ref_model", None) is None
+            and getattr(getattr(self, "args", None), "resume_from_checkpoint", None)
+        )
+        reject_across_ranks(
+            "resume_from_checkpoint is set, but the trainer was built without resume_checkpoint/"
+            "policy_from_checkpoint context. The reference sweep runs inside __init__, before train() "
+            "restores weights; pass the resolved context so trained weights are not their own reference."
+            if missing
+            else None,
+            "Validating reference resume context",
+            exc_type=ValueError,
+        )
+
+    def _restore_reference_split(self, dataset: Dataset, name: str, needed: Sequence[str], identity: Mapping):
+        checkpoint = self._reference_resume_checkpoint
+        if checkpoint is None:
+            return None
+        if not self._reference_saved_loaded:
+            saved, path = consensus_read(
+                os.path.join(checkpoint, REFERENCE_LOGPS_FILE),
+                self._read_reference_checkpoint,
+                what=REFERENCE_LOGPS_FILE,
+                checkpoint=checkpoint,
+            )
+            guard = DeferredRankFailure(f"Reading {REFERENCE_LOGPS_FILE}", exc_type=ValueError)
+            self._resumed_reference_logps = guard.run(lambda: dict(saved) if isinstance(saved, Mapping) else {})
+            guard.reject()
+            self._reference_saved_path = path
+            self._reference_saved_loaded = True
+        entry = self._resumed_reference_logps.get(name)
+        present_all, present_any = rank_consensus(entry is not None)
+        if present_any and not present_all:
+            raise RuntimeError(
+                f"{REFERENCE_LOGPS_FILE} at {checkpoint} holds the '{name}' split on some ranks only — "
+                "the nodes' copies differ. Resume from a complete checkpoint."
+            )
+        required = self._reference_resume_required()
+        if not present_all:
+            if required:
+                raise RuntimeError(self._missing_reference_split(checkpoint, name, needed))
+            logger.info(f"No saved '{name}' reference in {checkpoint}; sweeping untrained reference weights.")
+            return None
+        guard = DeferredRankFailure(f"Validating the '{name}' reference payload", exc_type=ValueError)
+        mismatch = guard.run(lambda: self._reference_entry_mismatch(entry, dataset, needed, identity))
+        guard.reject()
+        if not required and not rank_consensus(mismatch is None)[0]:
+            logger.info(f"Saved '{name}' reference does not match ({mismatch or 'another rank'}); sweeping.")
+            return None
+        reject_across_ranks(
+            None
+            if mismatch is None
+            else f"{self._reference_saved_path} does not belong to this '{name}' dataset: {mismatch}",
+            f"Restoring the '{name}' reference log-probs",
+            exc_type=ValueError,
+        )
+        guard = DeferredRankFailure(f"Attaching the '{name}' reference log-probs", exc_type=ValueError)
+        attached = guard.run(lambda: self._attach_reference_payload(dataset, entry, needed))
+        guard.reject()
+        self._validate_restored_reference_payload(name, entry)
+        self._remember_reference_split(name, identity, entry, attached)
+        logger.info(f"Restored the '{name}' reference log-probs from {self._reference_saved_path}; skipping sweep.")
+        return attached
+
+    def _read_reference_checkpoint(self, path: str):
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+    def _reference_entry_mismatch(self, entry, dataset, needed, identity) -> str | None:
+        if not isinstance(entry, Mapping) or not all(
+            isinstance(entry.get(key), value_type) for key, value_type in _IDENTITY_SCHEMA.items()
+        ):
+            return _identity_mismatch(entry, identity)
+        if entry["num_rows"] != identity["num_rows"]:
+            return _identity_mismatch(entry, identity)
+        return self._reference_payload_mismatch(entry, dataset, needed) or _identity_mismatch(entry, identity)
+
+    def _validate_restored_reference_payload(self, name: str, entry: Mapping) -> None:
+        """Optional rank-consistency check after all local payload validation has succeeded."""
+
+    def _missing_reference_split(self, checkpoint: str, name: str, needed: Sequence[str]) -> str:
+        scratch = f"{os.path.dirname(os.path.abspath(checkpoint))}-reference-recovery"
+        return (
+            f"Cannot resume precompute_ref_log_probs from {checkpoint}: it holds no saved reference "
+            f"log-probs for the '{name}' dataset ({REFERENCE_LOGPS_FILE} is missing or lacks that split), "
+            "and they cannot be recomputed here. With no separate reference model the sweep scores "
+            "the TRAINED weights as the reference and zero every log-ratio. To recover, run this config "
+            f"for one step from the base model into a scratch directory (--output_dir={scratch} "
+            "--max_steps=1 --save_strategy=steps --save_steps=1 --save_only_model=true "
+            f"--resume_from_checkpoint=null) and copy its checkpoint-1/{REFERENCE_LOGPS_FILE} into "
+            f"{checkpoint}, on every node when checkpoints are node-local. A checkpoint whose save "
+            "stopped before this file can take the previous checkpoint's copy instead. Or supply the "
+            f"{list(needed)} columns, computed on the base model, in the dataset."
+        )
+
+    def _remember_reference_split(self, name: str, identity: Mapping, payload: Mapping, dataset: Dataset) -> None:
+        self._reference_logps_by_split[name] = {**payload, **identity}
+        self._reference_state_generation += 1
+
+    def _reference_checkpoint_payload(self) -> dict:
+        return {**self._resumed_reference_logps, **self._reference_logps_by_split}
+
+    def _persist_trainer_sidecars(self, checkpoint_dir: str) -> None:
+        """Commit references before CheckpointingMixin can rotate the previous complete checkpoint."""
+        super()._persist_trainer_sidecars(checkpoint_dir)
+        names = sorted(set(self._resumed_reference_logps) | set(self._reference_logps_by_split))
+        present_all, present_any = rank_consensus(bool(names))
+        if not present_any:
+            return
+        if not present_all:
+            raise RuntimeError("Reference splits exist on only some ranks; refusing a partial checkpoint")
+        reject_divergent_settings(
+            {"splits": names}, "Checkpoint reference splits", "Every rank must save the same split names."
+        )
+        previous = (
+            self._reference_immutable_path
+            if self._reference_saved_generation == self._reference_state_generation
+            else None
+        )
+        path = os.path.join(checkpoint_dir, REFERENCE_LOGPS_FILE)
+        guard = DeferredRankFailure(f"Writing {REFERENCE_LOGPS_FILE} to {checkpoint_dir}")
+        with barrier_on_exit():
+            if fs_aware_save_rank():
+                guard.run(partial(_atomic_reference_save, path, self._reference_checkpoint_payload, previous))
+        guard.reject()
+        self._reference_immutable_path = path
+        self._reference_saved_generation = self._reference_state_generation
