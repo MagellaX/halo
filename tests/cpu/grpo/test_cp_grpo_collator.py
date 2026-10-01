@@ -6,6 +6,7 @@ import torch
 from src.data.collators.offline_grpo import (
     REF_PER_TOKEN_LOGPS_COLUMN,
     OfflineGRPOCPDataCollatorWithPadding,
+    OfflineGRPODataCollatorWithPadding,
 )
 from src.trainers.grpo.offline import tokenize_offline_grpo_rows
 
@@ -66,12 +67,23 @@ def test_cp_rows_keep_completion_targets_and_reference_in_full_row_positions():
     torch.testing.assert_close(shifted_refs[shifted_targets != -100], torch.tensor([-1.0, -2.0, -3.0, -4.0]))
 
 
-def test_empty_completion_is_inert_and_mixed_reference_rows_fail():
-    collator = OfflineGRPOCPDataCollatorWithPadding(pad_token_id=7, cp_size=2)
+@pytest.mark.parametrize("cp", [False, True], ids=["local", "cp"])
+def test_empty_completion_is_inert_and_mixed_reference_rows_fail(cp):
+    collator = (
+        OfflineGRPOCPDataCollatorWithPadding(pad_token_id=7, cp_size=2)
+        if cp
+        else OfflineGRPODataCollatorWithPadding(pad_token_id=7)
+    )
     batch = collator([_row([7], [])])
-    assert batch["input_ids"].tolist() == [[7, 7]]
-    assert batch["attention_mask"].tolist() == [[1, 0]]
-    assert batch["labels"].tolist() == [[-100, -100]]
+    if cp:
+        assert batch["input_ids"].tolist() == [[7, 7]]
+        assert batch["attention_mask"].tolist() == [[1, 0]]
+        assert batch["labels"].tolist() == [[-100, -100]]
+    else:
+        assert batch["completion_input_ids"].tolist() == [[7]]
+        assert batch["completion_attention_mask"].tolist() == [[0]]
+    with pytest.raises(ValueError, match="at least one row"):
+        collator([])
     with pytest.raises(ValueError, match="nonempty tokenized prompt"):
         collator([_row([], [])])
     with pytest.raises(ValueError, match="mix rows"):
@@ -80,15 +92,16 @@ def test_empty_completion_is_inert_and_mixed_reference_rows_fail():
         collator([_row([1], [2, 3], reference=[-1.0])])
 
 
-def test_grouped_supplied_scores_are_refused_before_expansion():
+def test_grouped_tokenization_drops_unused_supplied_scores():
     batch = {
         "prompt": ["p"],
         "completions": [["a b", "c d e"]],
         "rewards": [[1.0, 0.0]],
         REF_PER_TOKEN_LOGPS_COLUMN: [[[-0.1, -0.2], [-0.4, -0.5, -0.6]]],
     }
-    with pytest.raises(ValueError, match="Supplied ref_per_token_logps"):
-        tokenize_offline_grpo_rows(batch, [7], **_TOKENIZE_KWARGS)
+    expanded = tokenize_offline_grpo_rows(batch, [7], **_TOKENIZE_KWARGS)
+    assert len(expanded["completion_input_ids"]) == 2
+    assert REF_PER_TOKEN_LOGPS_COLUMN not in expanded
 
 
 def test_tokenization_does_not_invent_reference_scores():

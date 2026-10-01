@@ -19,6 +19,27 @@ logger = get_logger(__name__, log_level="INFO")
 REF_PER_TOKEN_LOGPS_COLUMN = "ref_per_token_logps"
 
 
+def _validate_reference_rows(features: list[dict[str, Any]]) -> bool:
+    """Both layouts require references to match the same raw completion tokens."""
+    if not features:
+        raise ValueError("Offline GRPO needs at least one row per batch")
+    has_reference = REF_PER_TOKEN_LOGPS_COLUMN in features[0]
+    for row in features:
+        if not row["prompt_input_ids"]:
+            raise ValueError("Offline GRPO needs a nonempty tokenized prompt")
+        if (REF_PER_TOKEN_LOGPS_COLUMN in row) != has_reference:
+            raise ValueError("Offline GRPO cannot mix rows with and without reference log-probs")
+        if has_reference:
+            values, tokens = row[REF_PER_TOKEN_LOGPS_COLUMN], row["completion_input_ids"]
+            if len(values) != len(tokens):
+                raise ValueError(
+                    f"{REF_PER_TOKEN_LOGPS_COLUMN} holds {len(values)} values for a completion of "
+                    f"{len(tokens)} tokens; the raw reference must match tokenization: scores must be "
+                    "one per completion token under the run's own length caps."
+                )
+    return has_reference
+
+
 @dataclass
 class OfflineGRPODataCollatorWithPadding:
     """Pads tokenized prompt/completion inputs to the batch's max length (prompts left-padded)."""
@@ -30,7 +51,7 @@ class OfflineGRPODataCollatorWithPadding:
         completion_input_ids = []
         substituted_completion: list[bool] = []
         ref_logps: list[torch.Tensor] = []
-        has_ref_logps = REF_PER_TOKEN_LOGPS_COLUMN in features[0]
+        has_ref_logps = _validate_reference_rows(features)
 
         for example in features:
             # Never empty: the trainer's tokenize map refuses a prompt with no tokens.
@@ -39,16 +60,7 @@ class OfflineGRPODataCollatorWithPadding:
             comp_ids = example["completion_input_ids"]
             substituted_completion.append(not comp_ids)
             if has_ref_logps:
-                # Row-aligned with the tokenized completion: a length mismatch means the column was
-                # produced under other length caps or another tokenizer, which would anchor the KL
-                # to the wrong tokens. A substituted row carries none.
                 values = example[REF_PER_TOKEN_LOGPS_COLUMN]
-                if len(values) != len(comp_ids):
-                    raise ValueError(
-                        f"{REF_PER_TOKEN_LOGPS_COLUMN} holds {len(values)} values for a completion of "
-                        f"{len(comp_ids)} tokens; the reference log-probs must be one per completion "
-                        f"token under the run's own tokenization and length caps."
-                    )
                 ref_logps.append(torch.tensor(values or [0.0], dtype=torch.float32))
             if not comp_ids:
                 logger.warning("Empty completion_input_ids found, using pad token")
@@ -92,22 +104,16 @@ class OfflineGRPOCPDataCollatorWithPadding:
     cp_size: int = 1
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        if not features:
-            raise ValueError("Offline GRPO CP needs at least one row per batch")
         if self.cp_size < 1:
             raise ValueError("cp_size must be positive")
 
-        has_reference = REF_PER_TOKEN_LOGPS_COLUMN in features[0]
-        if any((REF_PER_TOKEN_LOGPS_COLUMN in row) != has_reference for row in features):
-            raise ValueError("Offline GRPO CP cannot mix rows with and without reference log-probs")
+        has_reference = _validate_reference_rows(features)
 
         rows: list[list[int]] = []
         labels: list[list[int]] = []
         references: list[list[float]] = []
         for row in features:
             prompt = row["prompt_input_ids"]
-            if not prompt:
-                raise ValueError("Offline GRPO CP needs a nonempty tokenized prompt")
             completion = row["completion_input_ids"]
             rows.append([*prompt, *(completion or [self.pad_token_id])])
             labels.append(
@@ -115,11 +121,6 @@ class OfflineGRPOCPDataCollatorWithPadding:
             )
             if has_reference:
                 values = row[REF_PER_TOKEN_LOGPS_COLUMN]
-                if len(values) != len(completion):
-                    raise ValueError(
-                        f"{REF_PER_TOKEN_LOGPS_COLUMN} holds {len(values)} values for a completion of "
-                        f"{len(completion)} tokens; the raw reference must match tokenization."
-                    )
                 references.append([0.0] * len(prompt) + list(values or [0.0]))
 
         width = max(len(row) for row in rows)

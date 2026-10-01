@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""Dense offline GRPO: train, evaluate, restore the original KL, resume, and export.
+"""Offline GRPO: train, evaluate, restore the original KL, resume, and export.
 
-Uses a random tiny Qwen3 and an offline tokenizer, so no Hub model or dataset is needed.
+Qwen3 runs pure CP; GPT-OSS and Cohere2 MoE also exercise EP2+CP2 with fp32 expert masters.
+Every family uses a random tiny checkpoint and an offline tokenizer, with no Hub downloads.
 Run with: torchrun --nproc_per_node=2 tests/gpu/trainers/grpo/test_offline_grpo_cp_resume.py --cp-size {1,2}
 """
 
 import argparse
+import functools
 import math
 import os
 from types import SimpleNamespace
@@ -13,7 +15,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from safetensors.torch import load_file
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -22,20 +23,32 @@ from transformers import (
     TrainerCallback,
 )
 
-from src.checkpoint.format import REFERENCE_LOGPS_FILE
+from src.checkpoint.format import REFERENCE_LOGPS_FILE, load_full_state_dict
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
 from src.data.spans import LABEL_IGNORE_INDEX
+from src.distributed.expert_parallel.base_layer import EPMoELayerBase
+from src.distributed.expert_parallel.extension import deep_ep
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
+from src.models.patches.attention import model_has_sinks
+from src.models.patches.gpt_oss_sinks import (
+    SinksPolicy,
+    apply_sinks_policy,
+    is_sink_key,
+    neutralized_sink_value,
+    stamped_sinks_policy,
+)
 from src.optimizers.adamw_bf16 import AdamWBF16
 from src.trainers.grpo.objective.logratio import KL_LOGRATIO_CLAMP
 from src.trainers.grpo.offline import OfflineGRPOTrainer
 from src.trainers.grpo.reference_logps import OfflineGRPOReferenceLogpsMixin
 from src.training.environment import resolve_resume_weights_source
+from tests.common.checkpoint_io import loading_problems
 from tests.common.harness import gpu_test_main
 from tests.common.offline_grpo import make_offline_tokenizer, offline_grpo_dataset
+from tests.common.tiny_models import TINY_MOE_FAMILIES, tiny_family_model
 from tests.common.tolerances import TOL
 from tests.common.utils import cleanup_memory, log
 
@@ -43,6 +56,7 @@ SEED = 721
 STEPS = 3
 CHECKPOINT_STEP = 2
 LEARNING_RATE = 1e-3
+MOE_FAMILIES = ("gpt_oss", "cohere2_moe")
 
 
 class _ReferenceProbe(OfflineGRPOReferenceLogpsMixin):
@@ -78,12 +92,14 @@ class _StepTwoState(TrainerCallback):
         self.optimizer_moment_sums = None
         self.optimizer_steps = None
         self.optimizer_lrs = None
+        self.expert_masters = {}
 
-    def on_step_end(self, args, state, control, **kwargs):
+    def on_step_end(self, args, state, control, model=None, **kwargs):
         if state.global_step == CHECKPOINT_STEP:
             self.optimizer_moment_sums = _optimizer_moment_sums(kwargs["optimizer"])
             self.optimizer_steps = _optimizer_steps(kwargs["optimizer"])
             self.optimizer_lrs = [group["lr"] for group in kwargs["optimizer"].param_groups]
+            self.expert_masters = _expert_masters(model)
         return control
 
 
@@ -107,22 +123,41 @@ def _optimizer_steps(optimizer):
     return sorted({step_number(step) for item in optimizer.state.values() if (step := item.get("step")) is not None})
 
 
-def _save_tiny_model(path):
+def _expert_masters(model):
+    """Local FSDP-ignored expert masters, by wrapper ownership rather than checkpoint spelling."""
+    expert_ids = {
+        id(parameter)
+        for layer in model.modules()
+        if isinstance(layer, EPMoELayerBase)
+        for _, parameter in layer.expert_named_params()
+    }
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if id(parameter) in expert_ids
+    }
+
+
+def _save_tiny_model(path, family="qwen3"):
     fast = make_offline_tokenizer()
     torch.manual_seed(SEED)
-    model = Qwen3ForCausalLM(
-        Qwen3Config(
-            vocab_size=len(fast),
-            hidden_size=128,
-            intermediate_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=32,
-            max_position_embeddings=128,
-            tie_word_embeddings=False,
-            pad_token_id=fast.pad_token_id,
-            eos_token_id=fast.eos_token_id,
+    model = (
+        tiny_family_model(TINY_MOE_FAMILIES[family], fast, overrides={"num_hidden_layers": 2})
+        if family in MOE_FAMILIES
+        else Qwen3ForCausalLM(
+            Qwen3Config(
+                vocab_size=len(fast),
+                hidden_size=128,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                max_position_embeddings=128,
+                tie_word_embeddings=False,
+                pad_token_id=fast.pad_token_id,
+                eos_token_id=fast.eos_token_id,
+            )
         )
     )
     model.to(torch.bfloat16).save_pretrained(path)
@@ -162,8 +197,24 @@ def _config(output_dir, save):
     )
 
 
-def _build_trainer(source, output_dir, tokenizer, train, evaluation, *, cp_size, checkpoint=None, save=False):
-    parallelism = ParallelismConfig(cp_size=cp_size)
+def _parallelism_config(cp_size, ep_size, fp32_masters):
+    return ParallelismConfig(cp_size=cp_size, ep_size=ep_size, ep_fp32_experts=fp32_masters)
+
+
+def _build_trainer(
+    source,
+    output_dir,
+    tokenizer,
+    train,
+    evaluation,
+    *,
+    cp_size,
+    ep_size=1,
+    fp32_masters=False,
+    checkpoint=None,
+    save=False,
+):
+    parallelism = _parallelism_config(cp_size, ep_size, fp32_masters)
     model, _ = load_distributed_model(
         model_name_or_path=source,
         parallelism_config=parallelism,
@@ -171,6 +222,8 @@ def _build_trainer(source, output_dir, tokenizer, train, evaluation, *, cp_size,
         trust_remote_code=False,
         attn_implementation="flash_attention_2",
         use_liger_kernel=False,
+        reset_sinks=True,
+        preserve_checkpoint_precision=checkpoint is not None,
     )
     trainer = OfflineGRPOTrainer(
         model=model,
@@ -180,11 +233,35 @@ def _build_trainer(source, output_dir, tokenizer, train, evaluation, *, cp_size,
         processing_class=tokenizer,
         parallelism_config=parallelism,
         resume_checkpoint=checkpoint,
+        moe_balancing="none",
     )
     assert trainer.parallelism_config.is_cp_mode == (cp_size > 1)
     if cp_size > 1:
         assert trainer.cp_config.cp_size == cp_size
     return trainer
+
+
+def _eager_oracle(source, device="cpu"):
+    """Same sink-free policy as Ulysses, with independent full-row eager attention."""
+    model, info = AutoModelForCausalLM.from_pretrained(
+        source, dtype=torch.bfloat16, attn_implementation="eager", output_loading_info=True
+    )
+    assert not loading_problems(info), f"incomplete oracle/export checkpoint: {loading_problems(info)}"
+    apply_sinks_policy(model, model.config, policy=SinksPolicy.NEUTRALIZED, attn_implementation="eager")
+    return model.to(device).eval()
+
+
+def _sink_checks(model, checkpoint=None):
+    if not model_has_sinks(model.config):
+        return {}
+    checks = {"gptoss_sink_policy_neutralized": stamped_sinks_policy(model) is SinksPolicy.NEUTRALIZED}
+    if checkpoint is not None:
+        state = load_full_state_dict(checkpoint)
+        sinks = {name: value for name, value in state.items() if is_sink_key(name)}
+        checks["gptoss_exported_sinks_neutralized"] = len(sinks) == model.config.num_hidden_layers and all(
+            torch.all(value == neutralized_sink_value(value.dtype)).item() for value in sinks.values()
+        )
+    return checks
 
 
 def _reference_rows(dataset):
@@ -193,8 +270,7 @@ def _reference_rows(dataset):
 
 def _unsharded_reference_error(source, dataset, swept_rows, device):
     """Compare the initial sweep with a separate full-row causal-LM score."""
-    model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.bfloat16, attn_implementation="eager")
-    model.to(device).eval()
+    model = _eager_oracle(source, device)
     errors = []
     with torch.inference_mode():
         for row, swept in zip(dataset, swept_rows, strict=True):
@@ -242,11 +318,7 @@ def _kl_oracle(ctx, trainer, export):
         valid = batch["completion_attention_mask"].bool()
     expected = torch.zeros((), device=ctx.device)
     if ctx.rank == 0:
-        oracle = (
-            AutoModelForCausalLM.from_pretrained(export, dtype=torch.bfloat16, attn_implementation="eager")
-            .to(ctx.device)
-            .eval()
-        )
+        oracle = _eager_oracle(export, ctx.device)
         with torch.no_grad():
             oracle.get_output_embeddings().weight.mul_(2)
             logits = oracle(input_ids=ids, attention_mask=attention).logits[:, :-1]
@@ -325,48 +397,72 @@ def _negative_sidecar_checks(ctx, checkpoint, tokenized_dataset, settings):
 
 
 def _export_comparison(checkpoint, continuous_export, resumed_export):
-    checkpoint_weights = load_file(os.path.join(checkpoint, "model.safetensors"))
-    continuous = load_file(os.path.join(continuous_export, "model.safetensors"))
-    resumed = load_file(os.path.join(resumed_export, "model.safetensors"))
+    checkpoint_weights = load_full_state_dict(checkpoint)
+    continuous = load_full_state_dict(continuous_export)
+    resumed = load_full_state_dict(resumed_export)
     same_keys = checkpoint_weights.keys() == continuous.keys() == resumed.keys()
     if not same_keys:
         return False, False, False
+    # Export rounding of fp32 masters alone must not count as a third optimizer update.
     step_change = torch.linalg.vector_norm(
-        torch.cat([(continuous[name].float() - checkpoint_weights[name].float()).flatten() for name in continuous])
+        torch.cat(
+            [
+                (continuous[name].float() - checkpoint_weights[name].to(continuous[name].dtype).float()).flatten()
+                for name in continuous
+            ]
+        )
     )
     resume_error = torch.linalg.vector_norm(
         torch.cat([(continuous[name].float() - resumed[name].float()).flatten() for name in continuous])
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        resumed_export, torch_dtype=torch.bfloat16, attn_implementation="eager"
-    )
+    model = _eager_oracle(resumed_export)
     with torch.no_grad():
         logits = model(torch.tensor([[3, 4, 5]], dtype=torch.long)).logits
     log(f"Step-3 export: checkpoint-to-step delta={step_change:.5g}, resume error={resume_error:.5g}")
     return bool(step_change > 0), bool(resume_error == 0), bool(torch.isfinite(logits).all())
 
 
-def run(ctx) -> dict:
+def cp_resume_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp-size", choices=(1, 2), type=int, default=2)
-    cp_size = parser.parse_args().cp_size
+    parser.add_argument("--family", choices=("qwen3", *MOE_FAMILIES), default="qwen3")
+    parser.add_argument("--ep-size", choices=(1, 2), type=int, default=1)
+    parser.add_argument("--fp32-masters", action="store_true")
+    return parser
+
+
+def run(ctx) -> dict:
+    parser = cp_resume_parser()
+    args = parser.parse_args()
+    cp_size, ep_size, fp32_masters = args.cp_size, args.ep_size, args.fp32_masters
+    if fp32_masters and (ep_size != 2 or args.family not in MOE_FAMILIES):
+        parser.error("--fp32-masters requires a MoE family with --ep-size 2")
+    if ep_size > 1:
+        if args.family not in MOE_FAMILIES:
+            parser.error("--ep-size 2 requires a MoE family")
+        # Exact resume compares the same routed-token order, not atomic receive-slot races.
+        buffer_cls = deep_ep().ElasticBuffer
+        buffer_cls.__init__ = functools.partialmethod(buffer_cls.__init__, deterministic=True)
+    log(f"offline GRPO {args.family}: EP{ep_size}/CP{cp_size}, fp32 expert masters={fp32_masters}")
     dirs = [ctx.output_dir]
     dist.broadcast_object_list(dirs, src=0)
     shared = dirs[0]
-    base = os.path.join(shared, "tiny_qwen3")
+    base = os.path.join(shared, f"tiny_{args.family}")
     output = os.path.join(shared, "train")
     continuous_export = os.path.join(shared, "continuous_export")
     resumed_export = os.path.join(shared, "resumed_export")
     if ctx.rank == 0:
-        _save_tiny_model(base)
+        _save_tiny_model(base, args.family)
     dist.barrier()
     tokenizer = AutoTokenizer.from_pretrained(base)
     train, evaluation = offline_grpo_dataset(8), offline_grpo_dataset(4, 6)
 
-    trainer = _build_trainer(base, output, tokenizer, train, evaluation, cp_size=cp_size, save=True)
+    layout = {"cp_size": cp_size, "ep_size": ep_size, "fp32_masters": fp32_masters}
+    trainer = _build_trainer(base, output, tokenizer, train, evaluation, **layout, save=True)
     step_two = _StepTwoState()
     trainer.add_callback(step_two)
     checks = {"run_start_reference_swept": REF_PER_TOKEN_LOGPS_COLUMN in trainer.train_dataset.column_names}
+    checks.update({f"fresh_{name}": value for name, value in _sink_checks(trainer.model).items()})
     initial_train_rows = _reference_rows(trainer.train_dataset)
     initial_eval_rows = _reference_rows(trainer.eval_dataset)
     if ctx.rank == 0:
@@ -402,32 +498,56 @@ def run(ctx) -> dict:
     checks["train_and_eval_reference_saved"] = set(payload) == {"training", "evaluation"} and all(
         payload[split]["values"].numel() > 0 for split in ("training", "evaluation")
     )
+    checks.update({f"checkpoint_{name}": value for name, value in _sink_checks(trainer.model, checkpoint).items()})
     trainer.save_model(continuous_export)
+    dist.barrier()
+    checks.update(
+        {f"continuous_{name}": value for name, value in _sink_checks(trainer.model, continuous_export).items()}
+    )
     checks["kl_oracle_nonzero"], checks["kl_matches_unsharded_after_update"] = _kl_oracle(
         ctx, trainer, continuous_export
     )
     checks["row_reorder_rejected"], checks["missing_reference_rejected"] = _negative_sidecar_checks(
         ctx, checkpoint, tokenized, settings
     )
+    trainer.cleanup_ep()
     del trainer
     cleanup_memory()
     dist.barrier()
 
     source = resolve_resume_weights_source(
-        checkpoint, SimpleNamespace(model_name_or_path=base), ParallelismConfig(cp_size=cp_size)
+        checkpoint, SimpleNamespace(model_name_or_path=base), _parallelism_config(cp_size, ep_size, fp32_masters)
     )
     checks["path_b_uses_trained_checkpoint"] = source == checkpoint
     with patch.object(
         OfflineGRPOTrainer, "_sweep_reference_logps", side_effect=AssertionError("reswept KL reference")
     ):
-        resumed = _build_trainer(source, output, tokenizer, train, evaluation, cp_size=cp_size, checkpoint=checkpoint)
+        resumed = _build_trainer(source, output, tokenizer, train, evaluation, **layout, checkpoint=checkpoint)
+    if fp32_masters:
+        expected_masters = step_two.expert_masters
+        restored_masters = _expert_masters(resumed.model)
+        checks["fp32_expert_masters_off_bf16_grid"] = (
+            bool(expected_masters)
+            and all(value.dtype == torch.float32 for value in expected_masters.values())
+            and any(not torch.equal(value, value.bfloat16().float()) for value in expected_masters.values())
+        )
+        checks["fp32_expert_masters_exact_before_resumed_forward"] = (
+            expected_masters.keys() == restored_masters.keys()
+            and bool(expected_masters)
+            and all(
+                restored_masters[name].dtype == torch.float32
+                and torch.equal(expected_masters[name], restored_masters[name])
+                for name in expected_masters
+            )
+        )
     start_export = os.path.join(shared, "resumed_start_export")
     resumed.save_model(start_export)
     if ctx.rank == 0:
-        saved = load_file(os.path.join(checkpoint, "model.safetensors"))
-        restored = load_file(os.path.join(start_export, "model.safetensors"))
+        saved = load_full_state_dict(checkpoint)
+        restored = load_full_state_dict(start_export)
+        # Serving exports round masters to the run dtype; their exact live values are checked above.
         checks["checkpoint_weights_loaded_exactly"] = saved.keys() == restored.keys() and all(
-            torch.equal(saved[key], restored[key]) for key in saved
+            torch.equal(saved[key].to(restored[key].dtype), restored[key]) for key in saved
         )
     checks["train_reference_restored"] = all(
         torch.equal(before, after)
@@ -479,12 +599,17 @@ def run(ctx) -> dict:
     resumed.save_model(resumed_export)
     dist.barrier()
     if ctx.rank == 0:
+        checks.update(
+            {f"resumed_{name}": value for name, value in _sink_checks(resumed.model, resumed_export).items()}
+        )
         changed, matched, loadable = _export_comparison(checkpoint, continuous_export, resumed_export)
         checks["step_three_changed_weights"] = changed
         checks["resumed_step_matches_continuous"] = matched
         checks["hf_export_loads_and_scores"] = loadable
     checks = ctx.broadcast_checks(checks)
-    return {"checks": checks, "metrics": ctx.metrics(resumed)}
+    metrics = ctx.metrics(resumed)
+    resumed.cleanup_ep()
+    return {"checks": checks, "metrics": metrics}
 
 
 main = gpu_test_main(exact_world_size=2, prefix="offline_grpo_cp_resume")(run)

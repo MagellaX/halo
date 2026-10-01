@@ -640,8 +640,13 @@ MANIFEST: dict[str, TestSpec] = {
     ),
     "trainers/grpo/test_offline_grpo_cp_resume.py": TestSpec(
         nproc=2,
-        markers=("gpu", "full", "2gpu", "cp", "qwen3"),
-        args_matrix=("--cp-size 1", "--cp-size 2"),
+        markers=("gpu", "full", "2gpu", "cp", "ep", "moe", "qwen3", "gptoss", "cohere2_moe"),
+        args_matrix=(
+            "--cp-size 1",
+            "--cp-size 2",
+            "--cp-size 2 --ep-size 2 --family gpt_oss --fp32-masters",
+            "--cp-size 2 --ep-size 2 --family cohere2_moe --fp32-masters",
+        ),
         timeout=2400,
     ),
     "trainers/grpo/test_offline_grpo_ep_cp.py": TestSpec(
