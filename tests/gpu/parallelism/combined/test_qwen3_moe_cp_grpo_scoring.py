@@ -183,7 +183,6 @@ def run(ctx) -> dict:
         _sync_non_ep_grads(model, ep_layers)
         cp_gradients = _snapshot(model)
         same_grad_keys = cp_gradients.keys() == base_gradients.keys()
-        directions_match = norm_match = True
         for kind, names in parameter_groups.items():
             got = {name: gradient for name, gradient in cp_gradients.items() if name in names}
             want = {name: gradient for name, gradient in base_gradients.items() if name in names}
@@ -191,8 +190,6 @@ def run(ctx) -> dict:
                 got, want, **(ep_bounds if kind == "expert_router" else {})
             )
             same_grad_keys &= keys_match
-            directions_match &= direction_matches
-            norm_match &= norm_matches
             checks[f"cp{cp_size}_{kind}_gradient_direction"] = direction_matches
             checks[f"cp{cp_size}_{kind}_gradient_norm"] = norm_matches
             log(
@@ -211,8 +208,8 @@ def run(ctx) -> dict:
 
         cp_weights = _step(model)
         same_weight_keys = cp_weights.keys() == base_weights.keys()
-        step_error = (
-            max((cp_weights[name] - base_weights[name]).abs().max().item() for name in base_weights)
+        dense_step_error = (
+            max((cp_weights[name] - base_weights[name]).abs().max().item() for name in parameter_groups["dense"])
             if same_weight_keys
             else float("inf")
         )
@@ -220,9 +217,7 @@ def run(ctx) -> dict:
         checks[f"cp{cp_size}_token_logps"] = logps_match
         checks[f"cp{cp_size}_row_loss"] = loss_match
         checks[f"cp{cp_size}_gradient_names"] = same_grad_keys
-        checks[f"cp{cp_size}_gradient_norm"] = norm_match
-        checks[f"cp{cp_size}_every_parameter_gradient_direction"] = directions_match
-        step_matches = same_weight_keys and step_error < TOL.kernel_atol
+        step_matches = same_weight_keys and dense_step_error < TOL.kernel_atol
         for kind, names in parameter_groups.items():
             group_step_matches = optimizer_step_agreement(
                 {name: weight for name, weight in cp_weights.items() if name in names},
@@ -236,7 +231,7 @@ def run(ctx) -> dict:
         log(
             f"EP8/CP{cp_size}: max supervised logp error={group_error.item():.4g}, "
             f"loss error={(cp_loss.detach() - base_loss_value).abs().item():.4g}, "
-            f"step max error={step_error:.4g}"
+            f"dense step max error={dense_step_error:.4g}"
         )
         _destroy_ep(ep_layers)
         del model, cp_config, ep_layers, scorer

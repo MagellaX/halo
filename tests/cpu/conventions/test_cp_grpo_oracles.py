@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CP scoring oracles distinguish routed parameters from shared dense parameters."""
+"""Shared CP scoring oracles distinguish routed and dense parameters."""
 
 from types import SimpleNamespace
 
