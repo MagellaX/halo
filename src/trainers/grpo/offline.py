@@ -80,6 +80,7 @@ from src.distributed.runtime import (
     current_device,
     get_global_rank,
     get_global_world_size,
+    is_global_main_process,
     rank_consensus,
     reject_across_ranks,
     reject_divergent_settings,
@@ -99,7 +100,10 @@ from src.trainers.grpo.objective.offline import (
     offline_token_objective,
 )
 from src.trainers.grpo.reference_cache import MappedReferenceScores, ReferenceScoreCache
-from src.trainers.grpo.reference_logps import OfflineGRPOReferenceLogpsMixin, reject_unsupported_reference_input
+from src.trainers.grpo.reference_lifecycle import (
+    OfflineGRPOReferenceLifecycleMixin,
+    reject_unsupported_reference_input,
+)
 from src.trainers.mixins.base import DistributedTrainerMixin
 from src.trainers.mixins.pp_gates import reject_pp_compute_metrics, reject_pp_peft
 
@@ -267,11 +271,6 @@ def tokenize_offline_grpo_rows(
     all_group_ids = []
     all_group_sizes = []
     all_advantages = []
-    if REF_PER_TOKEN_LOGPS_COLUMN in batch:
-        raise ValueError(
-            "Supplied ref_per_token_logps are not supported; let the trainer prepare its run-start reference"
-        )
-
     for prompt, completions_list, rewards_list, idx in zip(
         batch["prompt"], batch["completions"], batch["rewards"], indices, strict=True
     ):
@@ -398,7 +397,7 @@ class MultiGroupSampler(Sampler):
         return len(self.indices_sequence)
 
 
-class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLogpsMixin, DistributedTrainerMixin, Trainer):
+class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin, DistributedTrainerMixin, Trainer):
     """Offline GRPO trainer for pre-computed-reward data (``prompt``/``completions``/``rewards``)
     under EP / TP / PP (see ``_reject_pp_explicit_options`` for the PP-specific rejections).
 
@@ -498,7 +497,8 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLogpsMixin, Di
         reject_unsupported_reference_input(
             train_dataset,
             eval_dataset,
-            presharded=self._precompute_reference and kwargs.get("dataset_presharded", False),
+            active=self._precompute_reference,
+            presharded=kwargs.get("dataset_presharded", False),
         )
 
         # Read by ChunkedLogprobsCore (avoids full [B,T,vocab] logits). Inert under PP: the pipeline
@@ -1107,11 +1107,15 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLogpsMixin, Di
         was_training = self.model.training
         last_batch = None
         real_rows = 0
+        total_batches = int(batch_count.item())
+        progress_interval = max(1, total_batches // 10)
+        if is_global_main_process():
+            logger.info("Preparing run-start KL reference for '%s': %s rows, %s batches before training", split, rows, total_batches)
         try:
             self.model.eval()
             iterator = iter(loader)
             with torch.no_grad():
-                for index in range(int(batch_count.item())):
+                for index in range(total_batches):
                     actual_batch = index < len(loader)
                     guard = DeferredRankFailure(f"Preparing '{split}' reference batch {index}")
                     loaded = guard.run(lambda: next(iterator)) if actual_batch else None
@@ -1121,18 +1125,23 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLogpsMixin, Di
                         batch, real_rows = loaded
                         last_batch = guard.run(lambda batch=batch: self._prepare_inputs(batch))
                     guard.reject()
-                    guard = DeferredRankFailure(f"Scoring '{split}' reference batch {index}")
-                    scored_rows = guard.run(lambda batch=last_batch: self._score_reference_batch(batch))
-                    guard.reject()
+                    # The forward owns collectives: swallowing a rank's exception would strand
+                    # peers inside them while that rank enters a different consensus collective.
+                    scored_rows = self._score_reference_batch(last_batch)
                     cache.collect_batch(
                         scored_rows[:real_rows]
                         if actual_batch and get_global_rank() == representatives[dp_rank]
                         else None,
                         representatives,
                     )
+                    if is_global_main_process() and ((index + 1) % progress_interval == 0 or index + 1 == total_batches):
+                        logger.info("Run-start KL reference '%s': batch %s/%s", split, index + 1, total_batches)
             return cache.finish(dataset)
-        except BaseException:
-            cache.discard()
+        except BaseException as exc:
+            try:
+                cache.discard()
+            except Exception as cleanup_error:
+                exc.add_note(f"Reference cache cleanup also failed: {cleanup_error}")
             raise
         finally:
             self.model.train(was_training)

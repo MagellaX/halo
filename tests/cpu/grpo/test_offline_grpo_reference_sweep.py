@@ -3,6 +3,7 @@
 import datetime
 import math
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -83,7 +84,10 @@ def _ranked_sweep(rank: int, siblings: int, mode: str, root: str, shared: bool) 
         {"row_id": list(range(_ROWS)), "completion_input_ids": [list(range(row % 3 + 1)) for row in range(_ROWS)]}
     )
     values = trainer._sweep_reference_logps(dataset, "training")
-    _assert_row_order(values)
+    _assert_row_order([
+        values.values[int(values.offsets[index]) : int(values.offsets[index + 1])]
+        for index in range(values.lengths.numel())
+    ])
     assert trainer.model.training, "the reference sweep did not restore the model's training mode"
 
     start, end = dp_rank * _ROWS // dp_size, (dp_rank + 1) * _ROWS // dp_size
@@ -136,6 +140,94 @@ def test_node_local_cache_writers_receive_the_same_ordered_scores(tmp_path):
         env={"DIST_OUTPUT_SHARED_FILESYSTEM": "0"},
         pg_timeout=datetime.timedelta(seconds=30),
     )
+
+
+class _ScoringFailure(RuntimeError):
+    """An original forward failure must escape, not become a deferred local-write verdict."""
+
+
+def _failure_trainer(output_dir):
+    trainer = OfflineGRPOTrainer.__new__(OfflineGRPOTrainer)
+    trainer.model = nn.Linear(1, 1).train()
+    trainer.ref_model = None
+    trainer._pp_runtime = None
+    trainer.parallelism_config = SimpleNamespace(is_cp_mode=False, is_pp_mode=False)
+    trainer.args = SimpleNamespace(per_device_train_batch_size=1, output_dir=output_dir)
+    trainer.dp_shard_geometry = lambda: (1, 0)
+    trainer._data_parallel_rank_by_global_rank = lambda: [0] * dist.get_world_size() if dist.is_initialized() else [0]
+    trainer.data_collator = _collate_rows
+    trainer._prepare_inputs = lambda batch: batch
+    return trainer
+
+
+def test_collective_forward_failure_preserves_the_original_exception_and_training_mode(tmp_path):
+    trainer = _failure_trainer(str(tmp_path))
+
+    def fail(batch):
+        raise _ScoringFailure("injected reference forward OOM")
+
+    trainer._score_reference_batch = fail
+    dataset = Dataset.from_dict({"row_id": [0], "completion_input_ids": [[1]]})
+    with pytest.raises(_ScoringFailure, match="injected reference forward OOM"):
+        trainer._sweep_reference_logps(dataset, "training")
+    assert trainer.model.training
+    assert not list((tmp_path / "_reference_cache").glob("*"))
+
+
+def test_reference_sweep_logs_progress_before_the_first_update(tmp_path, caplog):
+    trainer = _failure_trainer(str(tmp_path))
+    trainer._score_reference_batch = lambda batch: [_expected_row(row) for row in batch["row_id"].tolist()]
+    dataset = Dataset.from_dict({"row_id": [0, 1], "completion_input_ids": [[1], [1, 2]]})
+    with caplog.at_level("INFO"):
+        scores = trainer._sweep_reference_logps(dataset, "evaluation")
+    assert scores.lengths.numel() == 2
+    assert "Preparing run-start KL reference for 'evaluation': 2 rows, 2 batches before training" in caplog.text
+    assert "Run-start KL reference 'evaluation': batch 2/2" in caplog.text
+
+
+def test_cleanup_failure_does_not_mask_the_collective_forward_exception(tmp_path, monkeypatch):
+    trainer = _failure_trainer(str(tmp_path))
+
+    def fail(batch):
+        raise _ScoringFailure("injected reference forward OOM")
+
+    def failed_cleanup(cache):
+        raise OSError("cache unlink denied")
+
+    trainer._score_reference_batch = fail
+    monkeypatch.setattr(ReferenceScoreCache, "discard", failed_cleanup)
+    dataset = Dataset.from_dict({"row_id": [0], "completion_input_ids": [[1]]})
+    with pytest.raises(_ScoringFailure, match="injected reference forward OOM") as error:
+        trainer._sweep_reference_logps(dataset, "training")
+    assert error.value.__notes__ == ["Reference cache cleanup also failed: cache unlink denied"]
+    assert trainer.model.training
+
+
+def _ranked_forward_failure(rank, root):
+    trainer = _failure_trainer(root)
+
+    def fail_or_collect(batch):
+        if rank == 0:
+            with open(os.path.join(root, "forward-start.txt"), "w") as output:
+                output.write(str(time.monotonic()))
+            raise _ScoringFailure("injected reference forward OOM")
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        return [value]
+
+    trainer._score_reference_batch = fail_or_collect
+    dataset = Dataset.from_dict({"row_id": [0], "completion_input_ids": [[1]]})
+    trainer._sweep_reference_logps(dataset, "training")
+
+
+def test_a_rank_failing_before_forward_collectives_stops_peers_without_the_pg_timeout(tmp_path):
+    # Gloo can surface the disconnected peer first; the single-rank test above pins the
+    # originating exception, while this real collective test pins prompt process exit.
+    with pytest.raises(torch.multiprocessing.ProcessRaisedException):
+        run_gloo_ranks(_ranked_forward_failure, 2, str(tmp_path), pg_timeout=datetime.timedelta(seconds=30))
+    # Ignore spawned interpreter/import startup: the bound begins at the injected forward fault.
+    started = float((tmp_path / "forward-start.txt").read_text())
+    assert time.monotonic() - started < 15, "a swallowed forward failure waited for the 30-second watchdog"
 
 
 if __name__ == "__main__":

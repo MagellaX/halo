@@ -100,6 +100,11 @@ splits. Pre-sharded KL datasets and supplied `ref_per_token_logps` are refused. 
 deepcopy or second resident reference model is needed. An explicit frozen `ref_model` is accepted
 outside PP, swept once and released.
 
+This preparation finishes before step 1 and logs batch progress for each split. The trainer
+does not resweep on resume. With KL disabled, PEFT, or expert LoRA, unused dataset reference
+columns are dropped during tokenization; the finite-split and pre-sharded restrictions above
+apply only to the full-finetuning sweep.
+
 Raw completion-token scores travel with every training checkpoint in `reference_logps.pt`.
 The live `min_log_prob` clamp is applied at each loss step, not stored in the reference. On resume,
 the sidecar preserves the original anchor instead of scoring the trained policy. Ordered prompt
@@ -115,6 +120,10 @@ sidecar instead of loading a full float32 token table into each rank's heap. Unc
 checkpoints hardlink the immutable sidecar, or copy it when links are unavailable. DPO, KTO and
 offline GRPO share that persistence and resume lifecycle
 ([Checkpoints](../../reference/checkpoints.md#what-gets-saved)).
+
+The temporary `_reference_cache/<uuid>/` files are removed after every rank maps the completed
+scores; those mappings stay valid through training and checkpointing. The cache is not part of
+the exported model.
 
 `evaluate(new_tokenized_dataset)` reuses the original scores for token-identical rows, including
 subsets, reordered rows and duplicates. Unseen rows require the exact original frozen policy:
