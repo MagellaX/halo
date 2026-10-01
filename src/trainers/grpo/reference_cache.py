@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import uuid
@@ -13,6 +14,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 
+from src.checkpoint.atomic import fsync_directory
 from src.distributed.filesystem import store_reject_across_ranks
 from src.distributed.runtime import (
     DeferredRankFailure,
@@ -21,10 +23,7 @@ from src.distributed.runtime import (
     fs_aware_save_rank,
     get_global_rank,
     get_global_world_size,
-    get_local_world_size,
-    is_output_shared_filesystem,
 )
-from src.trainers.mixins.reference_logps import fsync_reference_directory
 
 REFERENCE_BUFFER_VALUES = 1 << 18
 REFERENCE_BATCH_ROWS = 256
@@ -37,31 +36,21 @@ class MappedReferenceScores:
     lengths: torch.Tensor
     values: torch.Tensor
     offsets: torch.Tensor
-    cache_directory: str | None = None
-
-    def __len__(self) -> int:
-        return self.lengths.numel()
-
-    def __iter__(self):
-        for index in range(len(self)):
-            yield self.values[int(self.offsets[index]) : int(self.offsets[index + 1])]
 
     def column(self) -> pa.LargeListArray:
         return pa.LargeListArray.from_arrays(
             pa.array(self.offsets.numpy()), pa.array(self.values.numpy(), type=pa.float32())
         )
 
-    def discard_cache(self) -> None:
-        """Mappings stay valid after unlink; evaluation needs no persistent run-local files."""
-        if self.cache_directory is not None and fs_aware_save_rank() and os.path.isdir(self.cache_directory):
-            shutil.rmtree(self.cache_directory)
-
 
 def reference_cache_writers() -> tuple[int, ...]:
-    """Checkpoint filesystem ownership also owns the run-local reference cache."""
-    if is_output_shared_filesystem():
-        return (0,)
-    return tuple(range(0, get_global_world_size(), get_local_world_size()))
+    """Gather actual filesystem owners once, sharing the checkpoint writer predicate."""
+    owner = torch.tensor([int(fs_aware_save_rank())], dtype=torch.int64, device=collective_device())
+    if get_global_world_size() == 1:
+        return (0,) if bool(owner.item()) else ()
+    gathered = [torch.empty_like(owner) for _ in range(get_global_world_size())]
+    dist.all_gather(gathered, owner)
+    return tuple(rank for rank, flag in enumerate(gathered) if bool(flag.item()))
 
 
 def reference_payload_mismatch(lengths, values, dataset: Dataset) -> str | None:
@@ -73,10 +62,12 @@ def reference_payload_mismatch(lengths, values, dataset: Dataset) -> str | None:
     total = 0
     for start, batch in zip(
         range(0, len(dataset), REFERENCE_BATCH_ROWS),
-        dataset.select_columns(["completion_input_ids"]).iter(batch_size=REFERENCE_BATCH_ROWS),
+        dataset.select_columns(["completion_input_ids"]).with_format("arrow").iter(batch_size=REFERENCE_BATCH_ROWS),
         strict=True,
     ):
-        expected = torch.tensor([len(tokens) for tokens in batch["completion_input_ids"]], dtype=torch.int64)
+        expected = torch.tensor(
+            batch.column("completion_input_ids").combine_chunks().value_lengths().to_numpy(), dtype=torch.int64
+        )
         actual = lengths[start : start + expected.numel()]
         if not torch.equal(actual, expected):
             return "its reference lengths do not match the completions"
@@ -102,8 +93,14 @@ class ReferenceScoreCache:
 
     def __init__(self, output_dir: str, *, dp_size: int):
         identifier = broadcast_from_rank0(uuid.uuid4().hex if get_global_rank() == 0 else None)
-        self.directory = os.path.join(os.fspath(output_dir), ".reference-cache", identifier)
+        # Trainer.push_to_hub excludes underscore-prefixed scratch, including NFS's live-map remnants.
+        self.directory = os.path.join(os.fspath(output_dir), "_reference_cache", identifier)
         self.dp_size = dp_size
+        self.writers = reference_cache_writers()
+        self._transfer_buffers = {
+            dtype: torch.empty(REFERENCE_BUFFER_VALUES, dtype=dtype, device=collective_device())
+            for dtype in (torch.int64, torch.float32)
+        }
         guard = DeferredRankFailure("Creating the offline GRPO reference cache")
         if fs_aware_save_rank():
             guard.run(lambda: os.makedirs(self.directory))
@@ -115,7 +112,17 @@ class ReferenceScoreCache:
     def discard(self) -> None:
         """Remove only this unpublished UUID cache, without requiring a healthy process group."""
         if fs_aware_save_rank() and os.path.isdir(self.directory):
-            shutil.rmtree(self.directory)
+            for name in os.listdir(self.directory):
+                if not name.startswith(".nfs"):
+                    os.unlink(os.path.join(self.directory, name))
+            try:
+                os.rmdir(self.directory)
+            except OSError as exc:
+                # NFS silly-renames an unlinked open mmap until its final reader closes it.
+                if exc.errno != errno.ENOTEMPTY or any(
+                    not name.startswith(".nfs") for name in os.listdir(self.directory)
+                ):
+                    raise
 
     def _append(self, shard: int, kind: str, values: torch.Tensor) -> None:
         with open(self._path(shard, kind), "ab") as destination:
@@ -135,7 +142,7 @@ class ReferenceScoreCache:
         """Only a DP representative transmits, and only filesystem writers receive score values."""
         rank, world = get_global_rank(), get_global_world_size()
         device = collective_device()
-        guard = DeferredRankFailure("Packing an offline GRPO reference batch")
+        guard = DeferredRankFailure("Collecting an offline GRPO reference batch")
 
         def pack():
             lengths = torch.tensor([value.numel() for value in rows], dtype=torch.int64)
@@ -145,8 +152,6 @@ class ReferenceScoreCache:
             return lengths, values
 
         packed = guard.run(pack) if rows is not None else None
-        guard.reject()
-        writers = reference_cache_writers()
         for shard, source in representatives.items():
             header = torch.tensor(
                 [packed[0].numel(), packed[1].numel()] if rank == source and packed is not None else [0, 0],
@@ -158,34 +163,24 @@ class ReferenceScoreCache:
             row_count, value_count = header.cpu().tolist()
             if not row_count:
                 continue
-            guard = DeferredRankFailure("Writing an offline GRPO reference batch")
-            for writer in writers:
+            for writer in self.writers:
                 for kind, count, dtype in (
                     ("lengths", row_count, torch.int64),
                     ("values", value_count, torch.float32),
                 ):
                     for start in range(0, count, REFERENCE_BUFFER_VALUES):
                         size = min(REFERENCE_BUFFER_VALUES, count - start)
-                        buffer = None
-                        transfer = DeferredRankFailure("Preparing a bounded reference transfer")
+                        buffer = self._transfer_buffers[dtype][:size]
                         if rank == source:
                             tensor = packed[0] if kind == "lengths" else packed[1]
-                            buffer = transfer.run(
-                                lambda tensor=tensor, start=start, size=size: tensor[start : start + size].to(device)
-                            )
-                        elif rank == writer:
-                            buffer = transfer.run(
-                                lambda size=size, dtype=dtype: torch.empty(size, dtype=dtype, device=device)
-                            )
-                        transfer.reject()
-                        if rank == source:
+                            buffer.copy_(tensor[start : start + size])
                             if writer != source:
                                 dist.send(buffer, dst=writer)
                         elif rank == writer:
                             dist.recv(buffer, src=source)
                         if rank == writer:
                             guard.run(lambda buffer=buffer, kind=kind, shard=shard: self._append(shard, kind, buffer))
-            guard.reject()
+        guard.reject()
 
     def _map(self, shard: int | str) -> MappedReferenceScores:
         tensors = []
@@ -195,15 +190,16 @@ class ReferenceScoreCache:
             if os.path.getsize(path) % itemsize:
                 raise ValueError(f"Malformed reference cache '{path}': truncated {kind}")
             tensors.append(torch.from_file(path, shared=False, size=os.path.getsize(path) // itemsize, dtype=dtype))
-        scores = mapped_reference_scores(*tensors)
-        scores.cache_directory = self.directory
-        return scores
+        return mapped_reference_scores(*tensors)
 
     def finish(self, dataset: Dataset) -> MappedReferenceScores:
         try:
             return self._finish(dataset)
-        except BaseException:
-            self.discard()
+        except BaseException as failure:
+            try:
+                self.discard()
+            except Exception as cleanup_failure:
+                failure.add_note(f"Reference scratch cleanup also failed: {cleanup_failure}")
             raise
 
     def _finish(self, dataset: Dataset) -> MappedReferenceScores:
@@ -238,9 +234,13 @@ class ReferenceScoreCache:
                     path = self._path(shard, kind)
                     if os.path.exists(path):
                         guard.run(lambda path=path: os.unlink(path))
-            guard.run(lambda: fsync_reference_directory(self.directory))
+            guard.run(lambda: fsync_directory(self.directory))
         guard.reject()
         guard = DeferredRankFailure("Mapping the offline GRPO reference cache", exc_type=ValueError)
         mapped = guard.run(lambda: self._map("complete"))
+        guard.reject()
+        # Every reader must map first; on Linux the tensors retain the unlinked backing storage.
+        guard = DeferredRankFailure("Removing the offline GRPO reference scratch files")
+        guard.run(self.discard)
         guard.reject()
         return mapped

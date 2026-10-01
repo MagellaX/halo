@@ -63,8 +63,15 @@ phase, main-first ordering, the output-FS probe, the load throttle) import it, n
 ## Trainers
 
 Offline GRPO's `src/trainers/grpo/reference_cache.py` owns bounded score transfers, per-DP cache
-assembly and memory-mapped token buffers. `reference_logps.py` owns the ragged payload and
-evaluation reuse; the shared `mixins/reference_logps.py` owns checkpoint identity and persistence.
+assembly and memory-mapped token buffers. `reference_logps.py` owns the ragged payload;
+the shared `mixins/reference_logps.py` owns checkpoint identity and persistence. Cache writers
+are elected from the checkpoint filesystem-owner predicate. Score transfers retain one local-I/O
+failure join per batch, independent of DP size, writer count and chunk count.
+
+Run-local `_reference_cache/<uuid>/` files are unlinked once every rank has mapped them. Linux
+readers retain the mapped storage through training and checkpoint serialization, without a second
+in-memory token table. NFS may retain `.nfs*` inodes until their final mapped reader closes;
+underscore-prefixed scratch is excluded by Trainer's default Hub upload patterns.
 
 Every distributed trainer uses multiple inheritance: a base trainer (`trl.SFTTrainer`,
 `transformers.Trainer`, `trl.GRPOTrainer`, …) plus `DistributedTrainerMixin`
