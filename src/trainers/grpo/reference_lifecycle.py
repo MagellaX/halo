@@ -11,13 +11,25 @@ import torch
 from datasets import Dataset
 
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
-from src.distributed.runtime import DeferredRankFailure, fs_aware_save_rank, rank_consensus, reject_across_ranks, reject_divergent_settings
+from src.distributed.runtime import (
+    DeferredRankFailure,
+    fs_aware_save_rank,
+    rank_consensus,
+    reject_across_ranks,
+    reject_divergent_settings,
+)
 from src.models.structure import base_transformers_model
 from src.trainers.grpo.reference_cache import REFERENCE_BATCH_ROWS, ReferenceScoreCache
-from src.trainers.grpo.reference_logps import OfflineGRPOReferenceLogpsMixin, _assert_replicated_scores, _attach_reference_column
+from src.trainers.grpo.reference_logps import (
+    OfflineGRPOReferenceLogpsMixin,
+    _assert_replicated_scores,
+    _attach_reference_column,
+)
 
 
-def reject_unsupported_reference_input(train_dataset, eval_dataset, *, active: bool = True, presharded: bool = False) -> None:
+def reject_unsupported_reference_input(
+    train_dataset, eval_dataset, *, active: bool = True, presharded: bool = False
+) -> None:
     """Validate only the finite splits consumed by a run-start full-finetuning sweep."""
     if not active:
         return
@@ -30,14 +42,22 @@ def reject_unsupported_reference_input(train_dataset, eval_dataset, *, active: b
         reason = "Offline GRPO constructor KL reference preparation requires one finite evaluation Dataset. Use evaluate() for named tokenized splits after construction."
     elif eval_dataset is not None and not isinstance(eval_dataset, Dataset):
         reason = "Offline GRPO KL reference preparation requires a finite datasets.Dataset evaluation split."
-    elif any(REF_PER_TOKEN_LOGPS_COLUMN in split.column_names for split in (train_dataset, eval_dataset) if split is not None):
+    elif any(
+        REF_PER_TOKEN_LOGPS_COLUMN in split.column_names
+        for split in (train_dataset, eval_dataset)
+        if split is not None
+    ):
         reason = "Supplied ref_per_token_logps are not supported by offline GRPO full-finetuning KL; load an unsharded dataset and let the trainer prepare its checkpointed run-start reference."
     reject_across_ranks(reason, "Validating offline GRPO reference inputs", exc_type=ValueError)
 
 
 def _token_row_keys(dataset: Dataset):
     """Hash each ordered token row without converting Arrow token arrays into Python lists."""
-    for batch in dataset.select_columns(["prompt_input_ids", "completion_input_ids"]).with_format("arrow").iter(batch_size=REFERENCE_BATCH_ROWS):
+    for batch in (
+        dataset.select_columns(["prompt_input_ids", "completion_input_ids"])
+        .with_format("arrow")
+        .iter(batch_size=REFERENCE_BATCH_ROWS)
+    ):
         columns = [batch.column(name).combine_chunks() for name in ("prompt_input_ids", "completion_input_ids")]
         for index in range(len(batch)):
             digest = hashlib.sha256()

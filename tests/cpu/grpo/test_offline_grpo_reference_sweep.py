@@ -84,10 +84,12 @@ def _ranked_sweep(rank: int, siblings: int, mode: str, root: str, shared: bool) 
         {"row_id": list(range(_ROWS)), "completion_input_ids": [list(range(row % 3 + 1)) for row in range(_ROWS)]}
     )
     values = trainer._sweep_reference_logps(dataset, "training")
-    _assert_row_order([
-        values.values[int(values.offsets[index]) : int(values.offsets[index + 1])]
-        for index in range(values.lengths.numel())
-    ])
+    _assert_row_order(
+        [
+            values.values[int(values.offsets[index]) : int(values.offsets[index + 1])]
+            for index in range(values.lengths.numel())
+        ]
+    )
     assert trainer.model.training, "the reference sweep did not restore the model's training mode"
 
     start, end = dp_rank * _ROWS // dp_size, (dp_rank + 1) * _ROWS // dp_size

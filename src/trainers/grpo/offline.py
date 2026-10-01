@@ -491,7 +491,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         self._precompute_reference = (
             self.beta != 0.0
             and peft_config is None
-            and not is_peft_model(model)
+            and not (isinstance(model, nn.Module) and is_peft_model(model))
             and (parallelism_config is None or parallelism_config.expert_lora is None)
         )
         reject_unsupported_reference_input(
@@ -1110,7 +1110,12 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         total_batches = int(batch_count.item())
         progress_interval = max(1, total_batches // 10)
         if is_global_main_process():
-            logger.info("Preparing run-start KL reference for '%s': %s rows, %s batches before training", split, rows, total_batches)
+            logger.info(
+                "Preparing run-start KL reference for '%s': %s rows, %s batches before training",
+                split,
+                rows,
+                total_batches,
+            )
         try:
             self.model.eval()
             iterator = iter(loader)
@@ -1134,7 +1139,9 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
                         else None,
                         representatives,
                     )
-                    if is_global_main_process() and ((index + 1) % progress_interval == 0 or index + 1 == total_batches):
+                    if is_global_main_process() and (
+                        (index + 1) % progress_interval == 0 or index + 1 == total_batches
+                    ):
                         logger.info("Run-start KL reference '%s': batch %s/%s", split, index + 1, total_batches)
             return cache.finish(dataset)
         except BaseException as exc:

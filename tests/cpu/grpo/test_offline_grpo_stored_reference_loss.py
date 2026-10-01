@@ -61,7 +61,7 @@ def test_loss_consumes_stored_raw_reference_at_the_live_scheduled_floor(loss_typ
     trainer = OfflineGRPOTrainer.__new__(OfflineGRPOTrainer)
     trainer.model = _Policy()
     trainer.model.min_log_prob = floor
-    trainer.min_log_prob = -9.0
+    trainer.min_log_prob = -2.5
     trainer.parallelism_config = SimpleNamespace(is_cp_mode=False)
     trainer._use_chunked_grpo_logprobs = False
     trainer._precompute_reference = True

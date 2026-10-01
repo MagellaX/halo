@@ -185,7 +185,9 @@ def test_original_reference_restore_failure_does_not_replace_the_forward_failure
     with pytest.raises(RuntimeError, match="original reference forward OOM") as error:
         trainer.evaluate(unseen, original_reference_model=reference)
     assert trainer.ref_model is None
-    assert error.value.__notes__ == ["Original evaluation reference device restoration also failed: original device restoration failed"]
+    assert error.value.__notes__ == [
+        "Original evaluation reference device restoration also failed: original device restoration failed"
+    ]
 
 
 def test_rank_local_object_identity_does_not_skip_collectives(tmp_path):

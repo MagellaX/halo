@@ -121,9 +121,9 @@ checkpoints hardlink the immutable sidecar, or copy it when links are unavailabl
 offline GRPO share that persistence and resume lifecycle
 ([Checkpoints](../../reference/checkpoints.md#what-gets-saved)).
 
-The temporary `_reference_cache/<uuid>/` files are removed after every rank maps the completed
-scores; those mappings stay valid through training and checkpointing. The cache is not part of
-the exported model.
+The temporary `_reference_cache/<uuid>/` filenames are unlinked after every rank maps the
+completed scores; those mappings stay valid through training and checkpointing. NFS may keep
+hidden files until their last mapped reader closes. The scratch cache is excluded from Hub uploads.
 
 `evaluate(new_tokenized_dataset)` reuses the original scores for token-identical rows, including
 subsets, reordered rows and duplicates. Unseen rows require the exact original frozen policy:
