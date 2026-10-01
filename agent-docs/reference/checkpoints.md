@@ -147,8 +147,8 @@ bf16 ([Saving by parallelism mode](#saving-by-parallelism-mode)). fp32 masters (
 checkpoint: `fp32_experts` doubles an MoE checkpoint's expert bytes and `fp32_non_ep_params` its
 non-expert bytes, while the routers alone are negligible. An adapter restore reads them back exactly. A
 full fine-tune built from the checkpoint at construction (Path B, [Resuming training](#resuming-training))
-still loads at the run dtype before the trainer's fp32 upcast, so its fp32 masters resume rounded to
-bf16.
+still loads at the resolved run dtype before the trainer's fp32 upcast, so its fp32 masters may
+resume rounded to that dtype (bf16 by default).
 
 `ReferenceLogpsCheckpointMixin` persists DPO/KTO precompute scores on the filesystem-aware
 save rank. The save completes only after its file and parent directory are synced. Unchanged

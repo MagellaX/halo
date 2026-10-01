@@ -538,7 +538,7 @@ def _atomic_save_inputs(tmp_path, monkeypatch, reuse):
         raise OSError(errno.EXDEV, "separate mounts")
 
     if reuse == "copy":
-        monkeypatch.setattr(precompute_mod.os, "link", cross_filesystem)
+        monkeypatch.setattr(atomic_mod.os, "link", cross_filesystem)
     return previous, payload, build_payload, calls
 
 
@@ -557,8 +557,8 @@ def test_reference_save_syncs_file_then_rename_then_directory(tmp_path, monkeypa
         original_replace(source, destination)
         events.append("rename")
 
-    monkeypatch.setattr(precompute_mod.os, "fsync", recording_sync)
-    monkeypatch.setattr(precompute_mod.os, "replace", recording_replace)
+    monkeypatch.setattr(atomic_mod.os, "fsync", recording_sync)
+    monkeypatch.setattr(atomic_mod.os, "replace", recording_replace)
     atomic_mod.atomic_torch_save(str(path), build_payload, None if reuse == "serialize" else str(previous))
 
     assert events == ["file_sync", "rename", "directory_sync"]
@@ -579,7 +579,7 @@ def test_reference_directory_sync_failure_propagates_and_closes_descriptor(tmp_p
             raise OSError(errno.EIO, "reference directory sync failed")
         original_sync(descriptor)
 
-    monkeypatch.setattr(precompute_mod.os, "fsync", failed_directory_sync)
+    monkeypatch.setattr(atomic_mod.os, "fsync", failed_directory_sync)
     with pytest.raises(OSError, match="reference directory sync failed"):
         atomic_mod.atomic_torch_save(str(path), build_payload, None if reuse == "serialize" else str(previous))
     assert len(directory_descriptors) == 1
@@ -603,7 +603,7 @@ def test_directory_sync_failure_keeps_the_previous_reference_checkpoint(kind, tm
             raise OSError(errno.EIO, "reference directory sync failed")
         original_sync(descriptor)
 
-    monkeypatch.setattr(precompute_mod.os, "fsync", failed_directory_sync)
+    monkeypatch.setattr(atomic_mod.os, "fsync", failed_directory_sync)
     with pytest.raises(RuntimeError, match="reference directory sync failed"):
         trainer._persist_trainer_sidecars(str(second))
     assert trainer._reference_immutable_path == str(first / REFERENCE_LOGPS_FILE)
@@ -632,7 +632,7 @@ def _reference_writer_failure_worker(rank: int, root: str, shared: bool) -> None
 
             with pytest.MonkeyPatch.context() as patch:
                 if rank == failing_rank:
-                    patch.setattr(precompute_mod.os, "replace", fail_publish)
+                    patch.setattr(atomic_mod.os, "replace", fail_publish)
                 with pytest.raises(RuntimeError, match="reference writer ran out of space") as raised:
                     trainer._persist_trainer_sidecars(second)
             assert f"1 of {_REFERENCE_WORLD_SIZE} rank(s)" in str(raised.value)
@@ -681,7 +681,7 @@ def test_unchanged_reference_checkpoints_do_not_serialize_the_token_table_again(
 
     monkeypatch.setattr(precompute_mod.torch, "save", refuse_save)
     if copy_fallback:
-        monkeypatch.setattr(precompute_mod.os, "link", cross_filesystem)
+        monkeypatch.setattr(atomic_mod.os, "link", cross_filesystem)
     trainer._persist_trainer_sidecars(str(second))
     assert (first / REFERENCE_LOGPS_FILE).read_bytes() == (second / REFERENCE_LOGPS_FILE).read_bytes()
     (first / REFERENCE_LOGPS_FILE).unlink()
