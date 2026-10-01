@@ -24,7 +24,7 @@ from scripts.training.offline_grpo import build_chat_template_row_fn
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
 from src.data.pipeline.row_processors import prepare_generative_row
 from src.trainers.grpo.offline import tokenize_prompt_completion
-from src.trainers.grpo.reference_logps import reject_unsupported_reference_input
+from src.trainers.grpo.reference_lifecycle import reject_unsupported_reference_input
 from src.trainers.preference.smpo import tokenize_preference_row
 
 BOS_ID = 1
