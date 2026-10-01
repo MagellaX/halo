@@ -1,4 +1,4 @@
-"""Reference sweeps keep DP row order and discard equalization replays across native/PP siblings."""
+"""Reference sweeps keep DP row order and discard equalization replays across CP/PP siblings."""
 
 import datetime
 import math
@@ -48,7 +48,8 @@ def _ranked_sweep(rank: int, siblings: int, mode: str, root: str, shared: bool) 
     trainer.model = nn.Linear(1, 1)
     trainer.ref_model = None
     trainer._pp_runtime = None
-    trainer.parallelism_config = SimpleNamespace(is_cp_mode=False, is_pp_mode=mode == "pp")
+    trainer.parallelism_config = SimpleNamespace(is_cp_mode=mode == "cp", is_pp_mode=mode == "pp")
+    trainer.cp_config = SimpleNamespace(cp_size=siblings)
     if not shared:
         os.environ.update(LOCAL_WORLD_SIZE="1", LOCAL_RANK="0")
     trainer.args = SimpleNamespace(
@@ -124,7 +125,7 @@ def _ranked_sweep(rank: int, siblings: int, mode: str, root: str, shared: bool) 
         ReferenceScoreCache.collect_batch = original_collect
 
 
-@pytest.mark.parametrize("siblings,mode", [(1, "native"), (2, "pp")])
+@pytest.mark.parametrize("siblings,mode", [(1, "native"), (2, "cp"), (2, "pp")])
 def test_reference_sweep_dp_order_replays_and_sibling_deduplication(tmp_path, siblings, mode):
     run_gloo_ranks(
         _ranked_sweep, 2 * siblings, siblings, mode, str(tmp_path), True, pg_timeout=datetime.timedelta(seconds=30)

@@ -1,11 +1,7 @@
 #!/usr/bin/env python
-"""Distributed offline GRPO training with Expert, Tensor and Expert-Tensor Parallelism support.
+"""Distributed offline GRPO training with Expert, Tensor, Expert-Tensor and Context Parallelism support.
 
 Group-relative policy optimization over pre-computed completions and rewards — no live generation.
-
-CP is not supported (the trainer uses the ``logits_to_keep`` optimization); use EP, TP, ETP and their
-supported combinations. PP is declared but not yet available in this release.
-
 Usage:
     torchrun --nproc_per_node=8 scripts/training/offline_grpo.py \\
         examples/grpo/offline/qwen3_5/offline-grpo-qwen3.6-35b-a3b-gsm8k.yaml
@@ -110,6 +106,13 @@ def _load_kl_reference(
     )
 
 
+def _requested_attention(model_config, parallelism_config, *, sinks_reset: bool) -> str | None:
+    """CP leaves the default to the loader's hardware-aware FlashAttention selection."""
+    if parallelism_config.is_cp_mode and not model_config.attn_implementation:
+        return None
+    return padded_workload_attn_implementation(model_config, sinks_reset=sinks_reset)
+
+
 def main():
     parser = H4ArgumentParser((OfflineGRPOScriptArguments, OfflineGRPOConfig, ModelConfig, DistributedArguments))
     args, offline_grpo_config, model_config, dist_args = parser.parse()
@@ -124,8 +127,8 @@ def main():
     )
     parallelism_config = runtime.parallelism_config
 
-    # Every batch is padded here: prompts left, completions right.
-    requested_attn = padded_workload_attn_implementation(model_config, sinks_reset=dist_args.reset_sinks)
+    # The CP collator right-pads full rows; the existing non-CP layout left-pads prompts.
+    requested_attn = _requested_attention(model_config, parallelism_config, sinks_reset=dist_args.reset_sinks)
     model, tokenizer = load_script_model(
         runtime, offline_grpo_config, model_config, dist_args, attn_implementation=requested_attn
     )
