@@ -62,6 +62,10 @@ phase, main-first ordering, the output-FS probe, the load throttle) import it, n
 
 ## Trainers
 
+Offline GRPO's `src/trainers/grpo/reference_cache.py` owns bounded score transfers, per-DP cache
+assembly and memory-mapped token buffers. `reference_logps.py` owns the ragged payload and
+evaluation reuse; the shared `mixins/reference_logps.py` owns checkpoint identity and persistence.
+
 Every distributed trainer uses multiple inheritance: a base trainer (`trl.SFTTrainer`,
 `transformers.Trainer`, `trl.GRPOTrainer`, …) plus `DistributedTrainerMixin`
 (`src/trainers/mixins/base.py`), which composes the sub-mixins listed in
