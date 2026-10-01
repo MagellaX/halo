@@ -145,10 +145,10 @@ A training checkpoint (`checkpoint-N`) writes every tensor at its live dtype
 bf16 ([Saving by parallelism mode](#saving-by-parallelism-mode)). fp32 masters (`fp32_router`,
 `fp32_experts`, `fp32_non_ep_params`) and fp32 adapters therefore take 4 bytes per element in a
 checkpoint: `fp32_experts` doubles an MoE checkpoint's expert bytes and `fp32_non_ep_params` its
-non-expert bytes, while the routers alone are negligible. An adapter restore reads them back exactly. A
-full fine-tune built from the checkpoint at construction (Path B, [Resuming training](#resuming-training))
-still loads at the run dtype before the trainer's fp32 upcast, so its fp32 masters resume rounded to
-bf16.
+non-expert bytes, while the routers alone are negligible. An adapter restore reads them back exactly.
+Full-finetune EP and EP+CP resumes (`ep_size > 1`, no TP/ETP/PP) preserve configured fp32 masters
+before the model is wrapped. EP1 and other Path-B modes still load at the run dtype before the
+trainer's fp32 upcast, so their fp32 masters resume rounded to bf16.
 
 The exported `config.json` is serialized with run-scoped router mutations restored
 (`config_export_ready`): the balancing strategy's zeroed `router_aux_loss_coef`, forced

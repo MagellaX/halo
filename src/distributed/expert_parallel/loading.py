@@ -21,6 +21,7 @@ from src.distributed.expert_parallel.config import EPConfig, get_num_experts
 from src.distributed.expert_parallel.lazy_loader import (
     lazy_loader_supports_checkpoint,
     load_ep_model_lazy,
+    restore_fp32_master_parameters,
 )
 from src.distributed.expert_parallel.patching import (
     create_ep_buffers,
@@ -177,6 +178,7 @@ def load_ep_model(
     lazy: bool = True,
     revision: str | None = None,
     keep_fp32_params: bool = False,
+    preserve_checkpoint_precision: bool = False,
     **model_kwargs,
 ) -> torch.nn.Module:
     """Load a MoE model for EP training.
@@ -188,6 +190,8 @@ def load_ep_model(
     Hub id (resolved to the cached snapshot dir), local path, or EP checkpoint dir. ``config`` is the
     caller's already-loaded model config, required so that no loader re-reads it per rank.
     ``keep_fp32_params`` is :func:`cast_loaded_parameters`' ``keep_fp32`` on either path.
+    ``preserve_checkpoint_precision`` additionally reads configured masters at fp32 when the caller
+    identifies this source as the full-finetune resume checkpoint; false keeps fresh-load casting.
     """
     rank = get_global_rank()
 
@@ -213,6 +217,7 @@ def load_ep_model(
                 max_concurrent_loading=max_concurrent_loading,
                 revision=revision,
                 keep_fp32_params=keep_fp32_params,
+                preserve_checkpoint_precision=preserve_checkpoint_precision,
                 **model_kwargs,
             ),
         )
@@ -239,6 +244,7 @@ def load_ep_model(
                 trust_remote_code=trust_remote_code,
                 model_class=model_class,
                 keep_fp32_params=keep_fp32_params,
+                preserve_checkpoint_precision=preserve_checkpoint_precision,
                 **model_kwargs,
             ),
         )
@@ -267,6 +273,7 @@ def load_ep_model(
             max_concurrent_loading=max_concurrent_loading,
             revision=revision,
             keep_fp32_params=keep_fp32_params,
+            preserve_checkpoint_precision=preserve_checkpoint_precision,
             **model_kwargs,
         ),
     )
@@ -297,6 +304,7 @@ def _load_ep_model_huggingface(
     max_concurrent_loading: int | None = None,
     revision: str | None = None,
     keep_fp32_params: bool = False,
+    preserve_checkpoint_precision: bool = False,
     **model_kwargs,
 ) -> torch.nn.Module:
     """Load EP model from HuggingFace checkpoint.
@@ -325,6 +333,7 @@ def _load_ep_model_huggingface(
 
     # Bounded ranks per node at a time — an unbounded fan-in CPU-OOMs on large MoE.
     logger.info(f"[Rank {rank}] Waiting for sequential model loading (local_rank={get_local_rank()})...")
+    precision_guard = DeferredRankFailure(f"FP32-master checkpoint load from {model_name_or_path}")
     with sequential_load_within_node(max_concurrent=max_concurrent_loading):
         logger.info(f"[Rank {rank}] Loading model to CPU...")
         model = from_pretrained_verified(
@@ -338,10 +347,20 @@ def _load_ep_model_huggingface(
             **model_kwargs,
         )
         cast_loaded_parameters(model, dtype, keep_fp32=keep_fp32_params, ep_wrapped=True)
+        if preserve_checkpoint_precision:
+            precision_guard.run(
+                lambda: restore_fp32_master_parameters(
+                    model, model_name_or_path, ep_config, keep_non_ep=keep_fp32_params
+                )
+            )
+        if precision_guard.reason is None:
+            logger.info(f"[Rank {rank}] Applying EP patching...")
+            model = patch_moe_model_for_ep(model, ep_config)
+            model = move_model_to_local_device(model)
 
-        logger.info(f"[Rank {rank}] Applying EP patching...")
-        model = patch_moe_model_for_ep(model, ep_config)
-        model = move_model_to_local_device(model)
+    # Outside the node-serialized region: a world collective inside it would wait on queued ranks.
+    if preserve_checkpoint_precision:
+        precision_guard.reject()
 
     # Collective — every EP rank must participate, and only once all ranks are loaded and on GPU.
     create_ep_buffers(model)

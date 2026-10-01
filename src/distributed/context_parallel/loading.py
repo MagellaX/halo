@@ -104,6 +104,7 @@ def load_model_for_ep_cp(
     lazy: bool = True,
     revision: str | None = None,
     keep_fp32_params: bool = False,
+    preserve_checkpoint_precision: bool = False,
     **model_kwargs,
 ) -> nn.Module:
     """Load a MoE model with both EP and Ulysses CP support.
@@ -135,6 +136,7 @@ def load_model_for_ep_cp(
         lazy=lazy,
         revision=revision,
         keep_fp32_params=keep_fp32_params,
+        preserve_checkpoint_precision=preserve_checkpoint_precision,
         **model_kwargs,
     )
 
