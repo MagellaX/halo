@@ -22,16 +22,24 @@ from transformers import AutoConfig, AutoModel
 from transformers.core_model_loading import (
     Chunk,
     Concatenate,
+    GroupWeightRename,
     Interleave,
     PermuteForRope,
+    PrefixChange,
     WeightConverter,
     WeightRenaming,
 )
 
 import src.distributed.expert_parallel.hub_conversion as hub_conversion
+from src.distributed.expert_parallel.config import EPConfig
 from src.distributed.expert_parallel.expert_weights import ep_layer_class_by_model_type
-from src.distributed.expert_parallel.hub_conversion import resolve_conversion_steps
-from src.distributed.expert_parallel.lazy_loader import EPWeightPlanner, WeightAction, build_family_key_mapping
+from src.distributed.expert_parallel.hub_conversion import resolve_conversion_steps, resolve_loaded_conversion_steps
+from src.distributed.expert_parallel.lazy_loader import (
+    EPWeightPlanner,
+    WeightAction,
+    build_family_key_mapping,
+    restore_fp32_master_parameters,
+)
 from src.models.loading.lazy_safetensors.conversion import (
     Concat,
     Deinterleave,
@@ -560,6 +568,67 @@ def test_the_canonical_key_oracle_reaches_the_walker(model_type):
     key list is empty or never reaches ``convert_disk_keys``."""
     drifted = _steps([WeightRenaming(source_patterns=r"experts\.gate_up_proj", target_patterns="experts.w13_weight")])
     assert convert_disk_keys(list(_canonical_checkpoint_keys(model_type)), drifted)
+
+
+@pytest.mark.parametrize("recorded", ("absent", None, ()))
+def test_eager_replay_does_not_invent_conversions_for_a_canonical_load(recorded):
+    model = torch.nn.Module()
+    if recorded != "absent":
+        model._weight_conversions = recorded
+    assert resolve_loaded_conversion_steps(model) is None
+
+
+def test_eager_replay_accepts_text_only_prefix_changes():
+    model = _model_with_keys(["model.linear.weight"])
+    model.base_model_prefix = "model"
+    model.config = SimpleNamespace(model_type="qwen3_moe")
+    model._weight_conversions = [PrefixChange(prefix_to_remove="language_model", model_prefix="model")]
+    disk_key = "model.language_model.linear.weight"
+    steps = resolve_loaded_conversion_steps(model)
+    assert steps and convert_disk_keys([disk_key], steps) == {disk_key: (("model.linear.weight", ()),)}
+    mapping, fanout = build_family_key_mapping(model, [disk_key], loaded_conversions=True)
+    assert mapping == {disk_key: "model.linear.weight"}
+    assert fanout == {disk_key: (("model.linear.weight", ()),)}
+
+
+def test_eager_fp32_reread_uses_the_loaded_nested_rename_and_its_scope(tmp_path):
+    vision_key = "model.vision_model.q_proj.weight"
+    text_key = "model.language_model.wq_du.weight"
+    disk_vision_key = "model.vision_model.wq_du.weight"
+    model = _model_with_keys([vision_key, text_key]).to(torch.bfloat16)
+    model.base_model_prefix = "model"
+    model.config = SimpleNamespace(model_type="qwen3_moe")
+    rename = WeightRenaming(source_patterns=r"^wq_du\.", target_patterns="q_proj.")
+    rename.scope_prefix = "vision_model"
+    model._weight_conversions = [rename]
+    stored = {disk_vision_key: torch.tensor([1.00001]), text_key: torch.tensor([2.00001])}
+    assert all(not torch.equal(value, value.bfloat16().float()) for value in stored.values())
+    save_file(stored, str(tmp_path / "model.safetensors"))
+    state = model.state_dict(keep_vars=True)
+    for key, disk_key in ((vision_key, disk_vision_key), (text_key, text_key)):
+        state[key].data.copy_(stored[disk_key])
+    plain_mapping, _ = build_family_key_mapping(model, list(stored))
+    assert plain_mapping[disk_vision_key] not in state, "the declared lazy family cannot do this nested rename"
+    restore_fp32_master_parameters(model, str(tmp_path), EPConfig(ep_size=1), keep_non_ep=True)
+    restored = model.state_dict(keep_vars=True)
+    for key, disk_key in ((vision_key, disk_vision_key), (text_key, text_key)):
+        assert restored[key] is state[key]
+        assert restored[key].dtype == torch.float32 and torch.equal(restored[key], stored[disk_key])
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        GroupWeightRename(source_patterns=[r"norm0", r"norm1"], target_patterns=["norm1", "norm2"]),
+        WeightRenaming(source_patterns=[r"old0", r"old1"], target_patterns=["new0", "new1"]),
+    ),
+    ids=("conditional_group_rename", "multi_pattern_rename"),
+)
+def test_eager_replay_refuses_renames_it_cannot_reproduce_without_silent_loss(entry):
+    model = torch.nn.Module()
+    model._weight_conversions = [entry]
+    with pytest.raises(ValueError, match="rename|renaming|Renaming"):
+        resolve_loaded_conversion_steps(model)
 
 
 if __name__ == "__main__":

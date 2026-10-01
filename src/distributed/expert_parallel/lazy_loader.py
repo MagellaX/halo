@@ -30,6 +30,11 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
 
+from src.checkpoint.format import (
+    StreamingCheckpointReader,
+    read_checkpoint_key_set,
+    resolve_checkpoint_weights,
+)
 from src.distributed.expert_parallel.config import (
     EPConfig,
     get_num_experts,
@@ -41,12 +46,13 @@ from src.distributed.expert_parallel.expert_weights import (
     hub_to_module_key_renames,
     per_expert_fusion_map,
 )
-from src.distributed.expert_parallel.hub_conversion import resolve_conversion_steps
+from src.distributed.expert_parallel.hub_conversion import resolve_conversion_steps, resolve_loaded_conversion_steps
 from src.distributed.expert_parallel.patching import (
     create_ep_buffers,
     ep_claimed_blocks,
     patch_moe_model_for_ep,
 )
+from src.distributed.expert_parallel.precision import fp32_master_param_keys, verify_fp32_master_coverage
 from src.distributed.filesystem import fs_aware_main_first
 from src.distributed.runtime import DeferredRankFailure, get_local_rank
 from src.log import KEY_PREVIEW_COUNT
@@ -61,6 +67,7 @@ from src.models.loading.lazy_safetensors.weights import (
     assign_tensor_to_model,
     build_key_mapping,
     init_checkpoint_absent_modules,
+    materialize_weight_plan,
     resolve_run_dtype,
     resolve_safetensors_index,
     verify_loaded_shape,
@@ -146,6 +153,8 @@ def lazy_loader_supports_checkpoint(model_path: str) -> bool:
 def build_family_key_mapping(
     model: nn.Module,
     disk_keys: list[str],
+    *,
+    loaded_conversions: bool = False,
 ) -> tuple[dict[str, str], dict[str, tuple]]:
     """:func:`~src.models.loading.lazy_safetensors.weights.build_key_mapping` with the family's
     conversion steps and hub renames resolved off the EP layer registry (see ``hub_conversion``).
@@ -158,7 +167,9 @@ def build_family_key_mapping(
     return build_key_mapping(
         model,
         disk_keys,
-        steps=resolve_conversion_steps(model_type, model),
+        steps=resolve_loaded_conversion_steps(model)
+        if loaded_conversions
+        else resolve_conversion_steps(model_type, model),
         hub_renames=hub_to_module_key_renames(model_type),
     )
 
@@ -436,6 +447,10 @@ class ExpertFuser:
         model_path: str,
         dtype: torch.dtype | None,
         device: str,
+        *,
+        keep_fp32: frozenset[str] = frozenset(),
+        reader: StreamingCheckpointReader | None = None,
+        preserve_parameters: bool = False,
     ) -> set[str]:
         """Load and fuse individual expert weights into 3D model parameters.
 
@@ -450,7 +465,11 @@ class ExpertFuser:
                 for _, shard_file in suffixes.values():
                     needed_shards.add(shard_file)
 
-        handles = {sf: safe_open(os.path.join(model_path, sf), framework="pt", device=device) for sf in needed_shards}
+        handles = (
+            reader
+            if reader is not None
+            else {sf: safe_open(os.path.join(model_path, sf), framework="pt", device=device) for sf in needed_shards}
+        )
 
         fused_keys: set[str] = set()
         try:
@@ -471,12 +490,13 @@ class ExpertFuser:
                 )
                 reject_fp8_tensor(model_key, tensor, dtype)
                 if dtype is not None and tensor.is_floating_point():
-                    tensor = tensor.to(dtype)
+                    tensor = tensor.to(device=device, dtype=torch.float32 if model_key in keep_fp32 else dtype)
 
-                assign_tensor_to_model(model, model_key, tensor)
+                assign_tensor_to_model(model, model_key, tensor, preserve_parameter=preserve_parameters)
                 fused_keys.add(model_key)
         finally:
-            handles.clear()
+            if reader is None:
+                handles.clear()
 
         return fused_keys
 
@@ -499,7 +519,7 @@ class ExpertFuser:
     def _fuse_gate_up(
         self,
         expert_dict: dict[int, dict[str, tuple[str, str]]],
-        handles: dict,
+        handles: dict | StreamingCheckpointReader,
     ) -> torch.Tensor:
         """Fuse the gate + up halves → gate_up_proj [E_local, 2M, H] (halves resolved by position)."""
         slices = []
@@ -513,22 +533,79 @@ class ExpertFuser:
                 )
             gate_dk, gate_sf = by_pos[0]
             up_dk, up_sf = by_pos[1]
-            gate = handles[gate_sf].get_slice(gate_dk)[...]
-            up = handles[up_sf].get_slice(up_dk)[...]
+            gate = self._read_tensor(handles, gate_dk, gate_sf)
+            up = self._read_tensor(handles, up_dk, up_sf)
             slices.append(torch.cat([gate, up], dim=0))  # [M,H]+[M,H] → [2M,H]
         return torch.stack(slices, dim=0)  # [E_local, 2M, H]
 
     def _fuse_down(
         self,
         expert_dict: dict[int, dict[str, tuple[str, str]]],
-        handles: dict,
+        handles: dict | StreamingCheckpointReader,
     ) -> torch.Tensor:
         """Fuse the single down projection → [E_local, H, M] (``down_proj`` or ``w2``)."""
         slices = []
         for expert_idx in sorted(expert_dict.keys()):
             dk, sf = next(iter(expert_dict[expert_idx].values()))
-            slices.append(handles[sf].get_slice(dk)[...])
+            slices.append(self._read_tensor(handles, dk, sf))
         return torch.stack(slices, dim=0)  # [E_local, H, M]
+
+    @staticmethod
+    def _read_tensor(handles: dict | StreamingCheckpointReader, key: str, shard: str) -> torch.Tensor:
+        if isinstance(handles, StreamingCheckpointReader):
+            return handles.get(key)
+        return handles[shard].get_slice(key)[...]
+
+
+def restore_fp32_master_parameters(
+    model: nn.Module, model_path: str, ep_config: EPConfig, *, keep_non_ep: bool
+) -> None:
+    """Reread configured masters before an eager model receives its EP wrappers.
+
+    ``from_pretrained(dtype=run_dtype)`` has already rounded these tensors. Replay the lazy loader's
+    family mapping/fusion for only the master set, not a whole-model fp32 load. Reads remain local;
+    the eager caller fences failures after its node-serialized loading region.
+    """
+    masters = fp32_master_param_keys(model, ep_config, keep_non_ep=keep_non_ep)
+    if not masters:
+        return
+    state = model.state_dict(keep_vars=True)
+    layout = resolve_checkpoint_weights(model_path)
+    disk_keys = read_checkpoint_key_set(model_path)
+    weight_map = {key: layout.legacy_bin for key in disk_keys} if layout.legacy_bin is not None else layout.weight_map
+    disk_to_model, fanout = build_family_key_mapping(model, list(weight_map), loaded_conversions=True)
+    plans = EPWeightPlanner(None).build(weight_map, disk_to_model, set(state), fanout=fanout)
+    plans = [plan for plan in plans if plan.model_key in masters]
+
+    tasks = []
+    fuser = None
+    if CheckpointFormat.detect(weight_map) == CheckpointFormat.INDIVIDUAL:
+        fuser = ExpertFuser(0, ep_config.num_experts)
+        tasks = [task for task in fuser.detect_tasks(weight_map, disk_to_model, set(state)) if task[0] in masters]
+    fusion_keys = {task[0] for task in tasks}
+    plans = [plan for plan in plans if plan.model_key not in fusion_keys]
+    requested = {key for plan in plans for key in plan.disk_keys}
+    requested.update(
+        key for _target, _kind, experts in tasks for slots in experts.values() for key, _sf in slots.values()
+    )
+    restored = set()
+    with StreamingCheckpointReader(model_path, requested) as reader:
+        if tasks:
+            restored.update(
+                fuser.execute(tasks, model, model_path, torch.float32, "cpu", reader=reader, preserve_parameters=True)
+            )
+        for plan in plans:
+            tensor = materialize_weight_plan(plan, lambda key, _plan: reader.get(key))
+            verify_loaded_shape(model, plan.model_key, f"checkpoint key(s) {plan.disk_keys}", tensor)
+            reject_fp8_tensor(plan.model_key, tensor, torch.float32)
+            assign_tensor_to_model(
+                model,
+                plan.model_key,
+                tensor.to(device=state[plan.model_key].device, dtype=torch.float32),
+                preserve_parameter=True,
+            )
+            restored.add(plan.model_key)
+    verify_fp32_master_coverage(state, masters, restored, source=model_path)
 
 
 @dataclass(frozen=True)
@@ -612,6 +689,7 @@ def load_ep_model_lazy(
     trust_remote_code: bool = True,
     model_class=None,
     keep_fp32_params: bool = False,
+    preserve_checkpoint_precision: bool = False,
     **model_kwargs,
 ) -> nn.Module:
     """Load a MoE model for EP using lazy safetensors slicing.
@@ -620,6 +698,8 @@ def load_ep_model_lazy(
     checkpoints (GptOss, LFM2, GLM4) and individual-expert checkpoints (Qwen3, Qwen3.5, Bailing).
     ``keep_fp32_params`` materializes in fp32 what the eager loaders keep fp32 under
     ``cast_loaded_parameters(keep_fp32=True)``: the shell's fp32 parameters outside the MoE blocks.
+    ``preserve_checkpoint_precision`` retains configured router/expert/non-EP masters on their first
+    read or fusion, before the EP wrappers upcast them.
     """
     if model_class is None:
         model_class = AutoModelForCausalLM
@@ -658,6 +738,14 @@ def load_ep_model_lazy(
     # rank alone, so the failure is deferred to the collective below instead of leaving the peers to
     # time out in it. Same discipline as the save side (see saving.save_ep_model).
     guard = DeferredRankFailure(f"EP lazy load from {model_name_or_path}")
+    master_state = None
+    masters = frozenset()
+    if preserve_checkpoint_precision:
+        master_state = guard.run(lambda: model.state_dict(keep_vars=True))
+        masters = (
+            guard.run(lambda: fp32_master_param_keys(model, ep_config, keep_non_ep=keep_fp32_params)) or frozenset()
+        )
+        keep_fp32 |= masters
 
     fused_keys: set[str] = set()
     if ckpt_format == CheckpointFormat.INDIVIDUAL:
@@ -673,6 +761,7 @@ def load_ep_model_lazy(
                         model_name_or_path,
                         dtype=dtype,
                         device=device,
+                        keep_fp32=keep_fp32,
                     )
                 )
                 or set()
@@ -692,6 +781,8 @@ def load_ep_model_lazy(
     # (``score`` on a CausalLM base for reward / classification) is initialized nowhere downstream,
     # and the trainer's meta sweep would leave it uninitialized and differing per rank.
     planned = {plan.model_key for plan in plans} | fused_keys
+    if preserve_checkpoint_precision:
+        guard.run(partial(verify_fp32_master_coverage, master_state, masters, planned, source=model_name_or_path))
     guard.run(
         partial(
             init_checkpoint_absent_modules,

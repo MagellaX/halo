@@ -235,6 +235,7 @@ def load_distributed_model(
     init_from_scratch: bool = False,
     revision: str | None = None,
     text_only_model: bool = False,
+    preserve_checkpoint_precision: bool = False,
     **model_kwargs,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
     """Load model with a ``ParallelismConfig`` (EP, CP, TP, or combinations).
@@ -243,6 +244,9 @@ def load_distributed_model(
     resolve to the GptOss :class:`SinksPolicy` (neutralized / live-frozen / trainable).
     ``text_only_model`` steers the auto-resolution to the text-only CausalLM class for a multimodal
     checkpoint (ignored, with a warning, when the caller pins ``model_class``).
+    ``preserve_checkpoint_precision`` marks a policy built from its resolved full-finetune resume
+    source: EP and EP+CP keep configured fp32 masters before any forward. Fresh loads and the other
+    parallel-axis combinations retain their existing precision behavior.
     """
     _validate_launch_method_for_parallelism(parallelism_config)
     sinks_policy = SinksPolicy.from_flags(reset_sinks=reset_sinks, train_sinks=train_sinks)
@@ -362,6 +366,14 @@ def load_distributed_model(
         attn_implementation=attn_implementation,
         **model_kwargs,
     )
+    if (
+        preserve_checkpoint_precision
+        and parallelism_config.ep_size > 1
+        and not (
+            parallelism_config.is_tp_mode or parallelism_config.is_expert_tp_mode or parallelism_config.is_pp_mode
+        )
+    ):
+        common_kwargs["preserve_checkpoint_precision"] = True
     if revision is not None:
         common_kwargs["revision"] = revision
     if quantization_config is not None:
