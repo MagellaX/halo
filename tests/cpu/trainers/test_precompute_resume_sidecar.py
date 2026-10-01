@@ -32,6 +32,7 @@ from accelerate import PartialState
 from datasets import Dataset, Features, List, Value, concatenate_datasets
 from trl import DPOConfig, KTOConfig, ModelConfig
 
+import src.checkpoint.atomic as atomic_mod
 import src.trainers.mixins.reference_logps as precompute_mod
 from src.args.distributed_args import DistributedArguments
 from src.args.dpo_args import DPOScriptArguments
@@ -118,6 +119,19 @@ def test_the_swept_columns_are_persisted_as_training_reads_them(kind, tmp_path):
     for name in REFERENCE_COLUMNS[kind]:
         assert prepared.features[name].dtype == "float32"
         assert torch.equal(entry["columns"][name], column(prepared, name))
+
+
+@pytest.mark.parametrize("umask", [0o002, 0o022, 0o077])
+def test_a_fresh_reference_sidecar_takes_the_umask_mode(kind, tmp_path, umask):
+    previous = os.umask(umask)
+    try:
+        _save_base_run(kind, tmp_path, {"train": token_rows(kind)})
+    finally:
+        os.umask(previous)
+
+    path = tmp_path / REFERENCE_LOGPS_FILE
+    assert stat.S_IMODE(path.stat().st_mode) == 0o666 & ~umask
+    assert torch.load(path, weights_only=True)["train"]["num_rows"] == N_ROWS
 
 
 def test_a_resume_attaches_the_saved_columns_instead_of_sweeping_the_trained_policy(kind, tmp_path):
@@ -307,6 +321,23 @@ def test_changed_reference_settings_refuse(tmp_path, kind, changed):
 
     with pytest.raises(ValueError, match="computed under"):
         trainer._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
+
+
+@pytest.mark.parametrize("changed", ["tokens", "settings"])
+def test_a_reference_mismatch_names_the_data_and_settings_to_resume_with(kind, tmp_path, changed):
+    _save_base_run(kind, tmp_path, {"train": token_rows(kind)})
+    trainer = _resumed(kind, tmp_path)
+    dataset = token_rows(kind, bump="prompt_ids") if changed == "tokens" else token_rows(kind)
+    if changed == "settings":
+        trainer.args.max_length = MAX_LENGTH // 2
+
+    with pytest.raises(ValueError, match="does not belong to this 'train' dataset") as raised:
+        trainer._precompute_ref_logps(dataset, "train", SWEEP_BATCH_SIZE)
+
+    message = str(raised.value)
+    assert "Resume with the data and reference settings the checkpoint was written with" in message
+    assert "row's reference" in message
+    assert trainer.compute_ref_log_probs.batches == 0
 
 
 @pytest.mark.parametrize(
@@ -528,7 +559,7 @@ def test_reference_save_syncs_file_then_rename_then_directory(tmp_path, monkeypa
 
     monkeypatch.setattr(precompute_mod.os, "fsync", recording_sync)
     monkeypatch.setattr(precompute_mod.os, "replace", recording_replace)
-    precompute_mod._atomic_reference_save(str(path), build_payload, None if reuse == "serialize" else str(previous))
+    atomic_mod.atomic_torch_save(str(path), build_payload, None if reuse == "serialize" else str(previous))
 
     assert events == ["file_sync", "rename", "directory_sync"]
     assert calls == (["serialize"] if reuse == "serialize" else [])
@@ -550,9 +581,7 @@ def test_reference_directory_sync_failure_propagates_and_closes_descriptor(tmp_p
 
     monkeypatch.setattr(precompute_mod.os, "fsync", failed_directory_sync)
     with pytest.raises(OSError, match="reference directory sync failed"):
-        precompute_mod._atomic_reference_save(
-            str(path), build_payload, None if reuse == "serialize" else str(previous)
-        )
+        atomic_mod.atomic_torch_save(str(path), build_payload, None if reuse == "serialize" else str(previous))
     assert len(directory_descriptors) == 1
     with pytest.raises(OSError) as closed:
         os.fstat(directory_descriptors[0])

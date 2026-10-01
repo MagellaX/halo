@@ -156,6 +156,10 @@ checkpoints hardlink the immutable file, falling back to a copy where links are 
 adding a scored split writes a new payload. Write failures rendezvous across ranks before
 checkpoint rotation can remove the previous complete checkpoint.
 
+Staging and durable publication live in `src/checkpoint/atomic.py`. Fresh files use `0o666` under
+the process umask, matching ordinary checkpoint-file permissions. Export copies omit staging files
+left by interrupted reference or model-card writes.
+
 The exported `config.json` is serialized with run-scoped router mutations restored
 (`config_export_ready`): the balancing strategy's zeroed `router_aux_loss_coef`, forced
 `output_router_logits` and toolkit stamp configure the run, not the artifact — exported, they would

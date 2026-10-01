@@ -40,7 +40,8 @@ hands to `_apply_ep_aware_dp_fsdp2`.
 
 `ReferenceLogpsCheckpointMixin` supplies DPO/KTO precompute with reference identity checks,
 resume attachment and atomic sidecar persistence. The preference mixin owns the score columns
-and DP sweep ([Checkpoints](checkpoints.md#what-gets-saved)).
+and DP sweep ([Checkpoints](checkpoints.md#what-gets-saved)). It precedes `DistributedTrainerMixin`
+in the trainer's bases so the checkpointing default cannot shadow its sidecar hook.
 
 Three modules are imported as plain functions — `grad_clip.py` (`clip_coefficient` and
 `scale_shards_to_max_norm_`, the shared clip coefficient, below),

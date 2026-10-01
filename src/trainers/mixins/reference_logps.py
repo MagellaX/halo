@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
-import shutil
-import tempfile
 from collections.abc import Mapping, Sequence
 from functools import partial
 
@@ -16,6 +13,7 @@ import torch
 from accelerate.logging import get_logger
 from datasets import Dataset
 
+from src.checkpoint.atomic import atomic_torch_save
 from src.checkpoint.format import REFERENCE_LOGPS_FILE
 from src.distributed.checkpoint.coordination import consensus_read
 from src.distributed.runtime import (
@@ -32,7 +30,6 @@ logger = get_logger(__name__, log_level="info")
 _DIGEST_BATCH_ROWS = 256
 _DIGEST_CHUNK_VALUES = 1 << 22
 _IDENTITY_SCHEMA = {"num_rows": int, "token_digests": Mapping, "settings": Mapping}
-_LINK_COPY_ERRNOS = {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EOPNOTSUPP}
 
 
 def is_token_type(arrow_type: pa.DataType) -> bool:
@@ -43,7 +40,12 @@ def is_token_type(arrow_type: pa.DataType) -> bool:
 
 
 def token_digest(dataset: Dataset, column: str) -> str:
-    """Hash ordered row lengths and int64 values, independent of Arrow batches and integer width."""
+    """Hash ordered row lengths and int64 values, independent of Arrow batches and integer width.
+
+    Dataset fingerprints can hash trainer state through TRL's tokenize map and become random when
+    it cannot be pickled. Reference identity must depend on token content, not that fingerprint.
+    Separate length and value hashes keep batching and chunk boundaries out of the digest.
+    """
     lengths, values = hashlib.sha256(), hashlib.sha256()
     for batch in dataset.select_columns([column]).with_format("arrow").iter(batch_size=_DIGEST_BATCH_ROWS):
         array = batch.column(column).combine_chunks()
@@ -60,61 +62,12 @@ def token_digest(dataset: Dataset, column: str) -> str:
     return hashlib.sha256(lengths.digest() + values.digest()).hexdigest()
 
 
-def _identity_mismatch(entry: object, identity: Mapping) -> str | None:
-    if not isinstance(entry, Mapping) or not all(isinstance(entry.get(k), t) for k, t in _IDENTITY_SCHEMA.items()):
-        return f"its entry is not a saved reference split (expected {sorted(_IDENTITY_SCHEMA)})"
-    if entry["num_rows"] != identity["num_rows"]:
-        return f"it was saved for {entry['num_rows']} rows and this dataset has {identity['num_rows']}"
-    if entry["settings"] != identity["settings"]:
-        return f"it was computed under {entry['settings']} and this run sets {identity['settings']}"
-    changed = sorted(
-        column for column, digest in identity["token_digests"].items() if entry["token_digests"].get(column) != digest
-    )
-    if changed:
-        return (
-            f"this dataset's {changed} differ from the saved run's (a changed dataset, split, chat template "
-            "or tokenizer — or, for KTO's KL completions, per_device_train_batch_size or dataset_num_proc)"
-        )
-    return None
-
-
-def _atomic_reference_save(path: str, payload, previous: str | None = None) -> None:
-    """Commit one complete sidecar; immutable references can share storage across checkpoints."""
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{REFERENCE_LOGPS_FILE}.", dir=directory)
-    os.close(descriptor)
-    try:
-        if previous is not None and os.path.isfile(previous):
-            os.unlink(temporary)
-            try:
-                os.link(previous, temporary)
-            except OSError as exc:
-                if exc.errno not in _LINK_COPY_ERRNOS:
-                    raise
-                shutil.copyfile(previous, temporary)
-        else:
-            torch.save(payload(), temporary)
-        with open(temporary, "rb") as completed:
-            os.fsync(completed.fileno())
-        os.replace(temporary, path)
-        fsync_reference_directory(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def fsync_reference_directory(directory: str) -> None:
-    """Persist the rename/link directory entry before earlier checkpoints can rotate."""
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 class ReferenceLogpsCheckpointMixin:
-    """Shared frozen-reference lifecycle; subclasses own the score payload and the sweep."""
+    """Shared frozen-reference lifecycle; subclasses own the score payload and the sweep.
+
+    Place this mixin before DistributedTrainerMixin in the trainer's bases so its checkpoint hook
+    overrides CheckpointingMixin's empty default and the reference rides every checkpoint.
+    """
 
     def _init_reference_state(self, *, checkpoint, given: bool, policy_from_checkpoint: bool) -> None:
         self._reference_resume_given = given
@@ -149,7 +102,8 @@ class ReferenceLogpsCheckpointMixin:
             and getattr(getattr(self, "args", None), "resume_from_checkpoint", None)
         )
         reject_across_ranks(
-            "resume_from_checkpoint is set, but the trainer was built without resume_checkpoint/"
+            f"resume_from_checkpoint={self.args.resume_from_checkpoint!r} is set, but the trainer was built "
+            "without resume_checkpoint/"
             "policy_from_checkpoint context. The reference sweep runs inside __init__, before train() "
             "restores weights; pass the resolved context so trained weights are not their own reference."
             if missing
@@ -196,7 +150,12 @@ class ReferenceLogpsCheckpointMixin:
         reject_across_ranks(
             None
             if mismatch is None
-            else f"{self._reference_saved_path} does not belong to this '{name}' dataset: {mismatch}",
+            else (
+                f"{self._reference_saved_path} does not belong to this '{name}' dataset: {mismatch}. "
+                "Each saved value is its own row's reference, so attaching it to different data would "
+                "score rows against references they were not computed for. Resume with the data and "
+                "reference settings the checkpoint was written with."
+            ),
             f"Restoring the '{name}' reference log-probs",
             exc_type=ValueError,
         )
@@ -215,10 +174,24 @@ class ReferenceLogpsCheckpointMixin:
         if not isinstance(entry, Mapping) or not all(
             isinstance(entry.get(key), value_type) for key, value_type in _IDENTITY_SCHEMA.items()
         ):
-            return _identity_mismatch(entry, identity)
+            return f"its entry is not a saved reference split (expected {sorted(_IDENTITY_SCHEMA)})"
         if entry["num_rows"] != identity["num_rows"]:
-            return _identity_mismatch(entry, identity)
-        return self._reference_payload_mismatch(entry, dataset, needed) or _identity_mismatch(entry, identity)
+            return f"it was saved for {entry['num_rows']} rows and this dataset has {identity['num_rows']}"
+        if mismatch := self._reference_payload_mismatch(entry, dataset, needed):
+            return mismatch
+        if entry["settings"] != identity["settings"]:
+            return f"it was computed under {entry['settings']} and this run sets {identity['settings']}"
+        changed = sorted(
+            column
+            for column, digest in identity["token_digests"].items()
+            if entry["token_digests"].get(column) != digest
+        )
+        if changed:
+            return (
+                f"this dataset's {changed} differ from the saved run's (a changed dataset, split, chat template "
+                "or tokenizer — or, for KTO's KL completions, per_device_train_batch_size or dataset_num_proc)"
+            )
+        return None
 
     def _validate_restored_reference_payload(self, name: str, entry: Mapping) -> None:
         """Optional rank-consistency check after all local payload validation has succeeded."""
@@ -246,7 +219,11 @@ class ReferenceLogpsCheckpointMixin:
         return {**self._resumed_reference_logps, **self._reference_logps_by_split}
 
     def _persist_trainer_sidecars(self, checkpoint_dir: str) -> None:
-        """Commit references before CheckpointingMixin can rotate the previous complete checkpoint."""
+        """Commit references before CheckpointingMixin can rotate the previous complete checkpoint.
+
+        This hook must precede the checkpointing default in the trainer's MRO. Its cooperative
+        super() preserves other sidecars, and every rank joins the filesystem-aware writers.
+        """
         super()._persist_trainer_sidecars(checkpoint_dir)
         names = sorted(set(self._resumed_reference_logps) | set(self._reference_logps_by_split))
         present_all, present_any = rank_consensus(bool(names))
@@ -266,7 +243,7 @@ class ReferenceLogpsCheckpointMixin:
         guard = DeferredRankFailure(f"Writing {REFERENCE_LOGPS_FILE} to {checkpoint_dir}")
         with barrier_on_exit():
             if fs_aware_save_rank():
-                guard.run(partial(_atomic_reference_save, path, self._reference_checkpoint_payload, previous))
+                guard.run(partial(atomic_torch_save, path, self._reference_checkpoint_payload, previous))
         guard.reject()
         self._reference_immutable_path = path
         self._reference_saved_generation = self._reference_state_generation
