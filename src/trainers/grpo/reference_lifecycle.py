@@ -158,9 +158,9 @@ class OfflineGRPOReferenceLifecycleMixin(OfflineGRPOReferenceLogpsMixin):
             reason = "The trained/live policy cannot be original_reference_model"
         elif model.training or any(parameter.requires_grad for parameter in model.parameters()):
             reason = "original_reference_model must be frozen (requires_grad=False) and in eval mode"
-        elif getattr(self, "_pp_runtime", None) is not None:
+        elif self.parallelism_config.is_cp_mode or getattr(self, "_pp_runtime", None) is not None:
             reason = (
-                "An external original_reference_model is not supported for PP evaluation. "
+                "An external original_reference_model is not supported for CP/PP evaluation. "
                 "Declare the evaluation split before training so the original policy precomputes it."
             )
         reject_across_ranks(reason, "Validating the original evaluation reference", exc_type=ValueError)
@@ -204,7 +204,7 @@ class OfflineGRPOReferenceLifecycleMixin(OfflineGRPOReferenceLogpsMixin):
         missing = any(match is None for match in matches)
         reject_across_ranks(
             "Evaluation contains unseen token rows whose original KL reference was not precomputed. "
-            "Declare this eval split before training, or outside PP call "
+            "Declare this eval split before training, or outside CP/PP call "
             "evaluate(new_dataset, original_reference_model=original_frozen_policy). "
             "Use the exact run-start weights, not the trained checkpoint or a different base revision."
             if missing and original_reference_model is None
