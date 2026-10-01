@@ -152,15 +152,19 @@ class ReferenceScoreCache:
             return lengths, values
 
         packed = guard.run(pack) if rows is not None else None
+        header = torch.tensor(
+            [packed[0].numel(), packed[1].numel()] if packed is not None else [0, 0],
+            dtype=torch.int64,
+            device=device,
+        )
+        if world > 1:
+            headers = torch.empty(world * 2, dtype=torch.int64, device=device)
+            dist.all_gather_into_tensor(headers, header)
+        else:
+            headers = header
+        batch_sizes = headers.reshape(world, 2).cpu().tolist()
         for shard, source in representatives.items():
-            header = torch.tensor(
-                [packed[0].numel(), packed[1].numel()] if rank == source and packed is not None else [0, 0],
-                dtype=torch.int64,
-                device=device,
-            )
-            if world > 1:
-                dist.broadcast(header, src=source)
-            row_count, value_count = header.cpu().tolist()
+            row_count, value_count = batch_sizes[source]
             if not row_count:
                 continue
             for writer in self.writers:
