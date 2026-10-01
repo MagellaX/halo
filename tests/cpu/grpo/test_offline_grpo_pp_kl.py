@@ -100,9 +100,11 @@ def _stub(*, beta, loss_type, pg, min_log_prob, policy, reference) -> types.Simp
         min_log_prob=min_log_prob,
         max_completion_length=COMPLETION,
         padding_value=PAD,
+        parallelism_config=types.SimpleNamespace(is_cp_mode=False),
         args=types.SimpleNamespace(max_length=MAX_LENGTH),
         model=types.SimpleNamespace(training=True),
         ref_model=_FixedLogits(reference),
+        _precompute_reference=False,
         _use_chunked_grpo_logprobs=False,
         _sign_metric_buffer={"train": defaultdict(list), "eval": defaultdict(list)},
         _pp_ref_sweep=None,
@@ -257,6 +259,25 @@ def test_collator_carries_reference_logps_aligned_with_completions():
     rows[0][REF_PER_TOKEN_LOGPS_COLUMN] = [-0.1, -0.2]
     with pytest.raises(ValueError, match="one per completion token"):
         collator(rows)
+
+
+def test_all_empty_completions_keep_reference_and_completion_shapes_aligned():
+    collator = OfflineGRPODataCollatorWithPadding(pad_token_id=PAD)
+    rows = [
+        {
+            "prompt_input_ids": [5],
+            "completion_input_ids": [],
+            "group_id": 0,
+            "group_size": 2,
+            "advantage": advantage,
+            REF_PER_TOKEN_LOGPS_COLUMN: [],
+        }
+        for advantage in (1.0, -1.0)
+    ]
+    batch = collator(rows)
+    assert batch[REF_PER_TOKEN_LOGPS_COLUMN].shape == batch["completion_input_ids"].shape == (2, 1)
+    assert batch[REF_PER_TOKEN_LOGPS_COLUMN].eq(0).all()
+    assert batch["completion_attention_mask"].eq(0).all()
 
 
 def test_the_pp_ctor_gate_accepts_a_kl_term():

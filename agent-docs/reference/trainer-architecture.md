@@ -38,10 +38,12 @@ on-policy trainers decouple the completions table from the metric drain.
 per-mode setup, and the EP one derives the FSDP ignored-module set in a single module-tree walk it
 hands to `_apply_ep_aware_dp_fsdp2`.
 
-`ReferenceLogpsCheckpointMixin` supplies DPO/KTO precompute with reference identity checks,
-resume attachment and atomic sidecar persistence. The preference mixin owns the score columns
-and DP sweep ([Checkpoints](checkpoints.md#what-gets-saved)). It precedes `DistributedTrainerMixin`
-in the trainer's bases so the checkpointing default cannot shadow its sidecar hook.
+`ReferenceLogpsCheckpointMixin` is mixed in by DPO/KTO precompute and offline GRPO. It owns
+reference identity checks, resume attachment and atomic sidecar persistence; each trainer owns its
+score payload and sweep ([Checkpoints](checkpoints.md#what-gets-saved)).
+Offline GRPO's `reference_cache.py` streams current-batch scores to filesystem-aware writers and
+maps the ordered ragged token values; its reference mixin attaches those buffers without repacking
+them ([Reference model](../training-methods/grpo/offline-grpo.md#reference-model)).
 
 Three modules are imported as plain functions — `grad_clip.py` (`clip_coefficient` and
 `scale_shards_to_max_norm_`, the shared clip coefficient, below),
@@ -459,9 +461,9 @@ Around it the mixin keeps the non-weight parts of a checkpoint: `_save_checkpoin
 `_restore_router_balancing_biases` for the `router_balancing_biases.pt` sidecar.
 `_persist_trainer_sidecars` is a trainer's own hook, called on every rank before rotation, and
 `_restore_trainer_sidecars` its read-back, called on every rank of a resume (never a best-model
-load). The shared reference mixin overrides the write for DPO/KTO precompute's `reference_logps.pt`,
-which it reads back during TRL's `__init__` instead; the async GRPO rollout mixin overrides both for
-its pending prefetch rounds. Each trainer lists the overriding mixin ahead of
+load). The shared reference mixin overrides the write for DPO/KTO and offline GRPO's `reference_logps.pt`.
+DPO/KTO read it back during TRL's `__init__`, and offline GRPO restores it during construction,
+not through the resume hook. The async GRPO rollout mixin overrides both for its pending prefetch rounds. Each trainer lists the overriding mixin ahead of
 `DistributedTrainerMixin` in its bases, so the empty defaults do not shadow it.
 
 `load_best_model_at_end` is refused at construction for every shape whose end-of-run reload is
