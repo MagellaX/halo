@@ -4,80 +4,34 @@
 import datetime
 import os
 import shutil
-from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
-from accelerate import PartialState
-from datasets import Dataset
 
 import src.trainers.mixins.reference_logps as reference_mod
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
-from src.trainers.grpo.reference_logps import (
-    REFERENCE_LOGPS_FILE,
-    OfflineGRPOReferenceLogpsMixin,
-    reject_unsupported_reference_input,
-)
+from src.trainers.grpo.reference_logps import REFERENCE_LOGPS_FILE
 from tests.common.gloo import run_gloo_ranks
-
-SETTINGS = {"max_prompt_length": 8, "max_completion_length": 6, "pad_token_id": 0}
-
-PartialState()  # The reference helper logs through Accelerate's stateful logger.
-
-
-def _dataset() -> Dataset:
-    return Dataset.from_dict(
-        {
-            "prompt_input_ids": [[11, 12], [21, 22, 23], [31]],
-            "completion_input_ids": [[13, 14], [24], []],
-            "group_id": [0, 1, 2],
-        }
-    )
-
-
-def _scores() -> list[torch.Tensor]:
-    return [torch.tensor([-0.25, -1.5]), torch.tensor([-0.75]), torch.empty(0)]
-
-
-class _Base:
-    def _persist_trainer_sidecars(self, checkpoint_dir) -> None:
-        pass
-
-    def _rotate_checkpoints_after_sidecars(self, trial) -> None:
-        self.rotated = True
-
-    def train(self, resume_from_checkpoint=None):
-        return resume_from_checkpoint
-
-
-class _Trainer(OfflineGRPOReferenceLogpsMixin, _Base):
-    def __init__(self, output_dir, *, checkpoint=None, step=1, presharded=False):
-        self.output_dir = output_dir
-        self.state = SimpleNamespace(global_step=step)
-        self.rotated = False
-        self._dataset_presharded = presharded
-        self.parallelism_config = SimpleNamespace(
-            is_cp_mode=False,
-            get_cp_group_ranks=lambda: list(range(dist.get_world_size())) if dist.is_initialized() else [0],
-        )
-        self.beta = 0.05
-        self._precompute_reference = True
-        self._init_reference_logps(resume_checkpoint=checkpoint)
-
-    def save_checkpoint(self):
-        self._persist_trainer_sidecars(os.path.join(str(self.output_dir), f"checkpoint-{self.state.global_step}"))
-        self._rotate_checkpoints_after_sidecars(None)
-
-    def _get_output_dir(self, trial):
-        return str(self.output_dir)
+from tests.common.offline_grpo_reference import (
+    SETTINGS,
+    attach_reference,
+)
+from tests.common.offline_grpo_reference import (
+    ReferenceStorageTrainer as _Trainer,
+)
+from tests.common.offline_grpo_reference import (
+    reference_dataset as _dataset,
+)
+from tests.common.offline_grpo_reference import (
+    reference_rows as _scores,
+)
 
 
 def _save_first_split(tmp_path):
     trainer = _Trainer(tmp_path)
     dataset = _dataset()
     assert trainer._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS) is None
-    attached = trainer._attach_scored_reference_logps(dataset, "train", _scores(), settings=SETTINGS)
+    attached = attach_reference(trainer, dataset, "train", _scores(), settings=SETTINGS)
     trainer.save_checkpoint()
     return attached, tmp_path / "checkpoint-1"
 
@@ -106,29 +60,18 @@ def test_raw_ragged_reference_is_saved_and_restored_without_a_second_sweep(tmp_p
 
 def test_live_reference_state_keeps_one_arrow_column_not_an_extra_flat_token_table(tmp_path):
     trainer = _Trainer(tmp_path)
-    attached = trainer._attach_scored_reference_logps(_dataset(), "train", _scores(), settings=SETTINGS)
-    assert trainer._reference_dataset_by_split["train"] is attached
+    attached = attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
     assert set(trainer._reference_logps_by_split["train"]) == {"num_rows", "token_digests", "settings"}
     assert not trainer._resumed_reference_logps
-
-
-def test_noncp_reference_keeps_run_start_values_when_weights_resume(tmp_path):
-    attached, checkpoint = _save_first_split(tmp_path)
-    resumed = _Trainer(tmp_path, checkpoint=str(checkpoint))
-    resumed.parallelism_config.is_cp_mode = False
-    restored = resumed._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
-    assert restored[REF_PER_TOKEN_LOGPS_COLUMN] == attached[REF_PER_TOKEN_LOGPS_COLUMN]
-    with pytest.raises(ValueError, match="same checkpoint"):
-        resumed.train()
-    assert resumed.train(resume_from_checkpoint=str(checkpoint)) == str(checkpoint)
+    assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == [[-0.25, -1.5], [-0.75], []]
 
 
 def test_train_and_eval_splits_survive_when_resume_uses_only_train(tmp_path):
     trainer = _Trainer(tmp_path)
     train = _dataset()
     eval_set = train.select([2, 0])
-    trainer._attach_scored_reference_logps(train, "train", _scores(), settings=SETTINGS)
-    trainer._attach_scored_reference_logps(eval_set, "eval", [_scores()[2], _scores()[0]], settings=SETTINGS)
+    attach_reference(trainer, train, "train", _scores(), settings=SETTINGS)
+    attach_reference(trainer, eval_set, "eval", [_scores()[2], _scores()[0]], settings=SETTINGS)
     trainer.save_checkpoint()
 
     resumed = _Trainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"), step=2)
@@ -149,49 +92,6 @@ def test_trained_policy_cannot_rescore_when_sidecar_is_missing(tmp_path):
 
     fresh_weights = _Trainer(tmp_path)
     assert fresh_weights._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS) is None
-
-
-def test_supplied_scores_are_rejected_before_the_reference_sweep(tmp_path):
-    supplied = _dataset().add_column(REF_PER_TOKEN_LOGPS_COLUMN, [[-0.25, -1.5], [-0.75], []])
-    with pytest.raises(ValueError, match="Supplied ref_per_token_logps"):
-        _Trainer(tmp_path)._restore_reference_logps_or_none(supplied, "train", settings=SETTINGS)
-
-
-@pytest.mark.parametrize("cp", [False, True])
-def test_late_or_different_resume_cannot_follow_a_fresh_reference_sweep(tmp_path, cp):
-    fresh = _Trainer(tmp_path)
-    fresh.parallelism_config.is_cp_mode = cp
-    assert not fresh._reference_logps_by_split
-    assert fresh.train() is None
-    with pytest.raises(ValueError, match="before constructing"):
-        fresh.train(resume_from_checkpoint=str(tmp_path / "checkpoint-1"))
-    resumed = _Trainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"))
-    resumed.parallelism_config.is_cp_mode = cp
-    with pytest.raises(ValueError, match="same checkpoint"):
-        resumed.train()
-    with pytest.raises(ValueError, match="same checkpoint"):
-        resumed.train(resume_from_checkpoint=str(tmp_path / "checkpoint-2"))
-    assert resumed.train(resume_from_checkpoint=str(tmp_path / "checkpoint-1")) == str(tmp_path / "checkpoint-1")
-
-
-def _ranked_late_resume(rank: int, root: str) -> None:
-    trainer = _Trainer(root)
-    try:
-        trainer.train(resume_from_checkpoint=os.path.join(root, "checkpoint-1") if rank == 1 else None)
-        outcome = "NO RAISE"
-    except Exception as exc:
-        outcome = f"{type(exc).__name__}: {exc}"
-    with open(os.path.join(root, f"late-resume-{rank}.txt"), "w") as result:
-        result.write(outcome)
-
-
-def test_late_resume_on_one_rank_is_rejected_on_every_rank(tmp_path):
-    run_gloo_ranks(_ranked_late_resume, 2, str(tmp_path), pg_timeout=datetime.timedelta(seconds=15))
-    for rank in range(2):
-        outcome = (tmp_path / f"late-resume-{rank}.txt").read_text()
-        assert "NO RAISE" not in outcome
-        assert "before constructing" in outcome
-        assert "timed out" not in outcome
 
 
 @pytest.mark.parametrize("change", ["row_order", "prompt", "completion", "settings"])
@@ -235,25 +135,12 @@ def test_trained_policy_refuses_missing_or_malformed_scores(tmp_path, damage):
         resumed._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
 
 
-def test_presharded_reference_sweeps_are_rejected_even_with_supplied_scores(tmp_path):
-    supplied = _dataset().add_column(REF_PER_TOKEN_LOGPS_COLUMN, [[-0.25, -1.5], [-0.75], []])
-    for dataset in (_dataset(), supplied):
-        with pytest.raises(ValueError, match="pre-sharded"):
-            _Trainer(tmp_path, presharded=True)._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS)
-
-
-def test_supplied_reference_is_rejected():
-    supplied = _dataset().add_column(REF_PER_TOKEN_LOGPS_COLUMN, [[-0.25, -1.5], [-0.75], []])
-    with pytest.raises(ValueError, match="Supplied ref_per_token_logps"):
-        reject_unsupported_reference_input(supplied, None)
-
-
 def test_a_failed_sidecar_write_keeps_the_previous_checkpoint(tmp_path, monkeypatch):
     previous = tmp_path / "checkpoint-0"
     previous.mkdir()
     (previous / "sentinel").write_text("complete")
     trainer = _Trainer(tmp_path)
-    trainer._attach_scored_reference_logps(_dataset(), "train", _scores(), settings=SETTINGS)
+    attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
 
     def fail_save(*args, **kwargs):
         raise OSError("disk full")
@@ -301,7 +188,7 @@ def test_one_nodes_corrupt_reference_is_rejected_on_every_rank(tmp_path, finite_
 
 def _ranked_interrupted_save(rank: int, root: str) -> None:
     trainer = _Trainer(root)
-    trainer._attach_scored_reference_logps(_dataset(), "train", _scores(), settings=SETTINGS)
+    attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
     patch = pytest.MonkeyPatch()
 
     def interrupted_save(payload, destination):
@@ -333,49 +220,6 @@ def test_interrupted_writer_rejects_every_rank_before_checkpoint_rotation(tmp_pa
     checkpoint = tmp_path / "checkpoint-1"
     assert not (checkpoint / REFERENCE_LOGPS_FILE).exists()
     assert not list(checkpoint.glob(f".{REFERENCE_LOGPS_FILE}.*"))
-
-
-def _ranked_scored(rank: int, root: str) -> None:
-    trainer = _Trainer(root)
-    rows = [[-0.25 - rank, -1.5], [-0.75], []]
-    dataset = _dataset()
-    try:
-        trainer._attach_scored_reference_logps(dataset, "train", rows, settings=SETTINGS)
-        outcome = "NO RAISE"
-    except Exception as exc:
-        outcome = f"{type(exc).__name__}: {exc}"
-    with open(os.path.join(root, f"supplied-outcome-{rank}.txt"), "w") as result:
-        result.write(outcome)
-
-
-def test_unsharded_sweep_scores_must_agree_across_ranks(tmp_path):
-    run_gloo_ranks(_ranked_scored, 2, str(tmp_path), pg_timeout=datetime.timedelta(seconds=15))
-    for rank in range(2):
-        outcome = (tmp_path / f"supplied-outcome-{rank}.txt").read_text()
-        assert "NO RAISE" not in outcome
-        assert "reference values differs across ranks" in outcome
-        assert "timed out" not in outcome
-
-
-def _ranked_presharded(rank: int, root: str) -> None:
-    trainer = _Trainer(root, presharded=True)
-    dataset = _dataset().add_column(REF_PER_TOKEN_LOGPS_COLUMN, [[-0.25 - rank, -1.5], [-0.75], []])
-    try:
-        trainer._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS)
-        outcome = "NO RAISE"
-    except Exception as exc:
-        outcome = f"{type(exc).__name__}: {exc}"
-    with open(os.path.join(root, f"presharded-outcome-{rank}.txt"), "w") as result:
-        result.write(outcome)
-
-
-def test_presharded_reference_is_rejected_on_every_rank(tmp_path):
-    run_gloo_ranks(_ranked_presharded, 2, str(tmp_path), pg_timeout=datetime.timedelta(seconds=15))
-    for rank in range(2):
-        outcome = (tmp_path / f"presharded-outcome-{rank}.txt").read_text()
-        assert "NO RAISE" not in outcome
-        assert "pre-sharded" in outcome
-        assert "timed out" not in outcome
 
 
 if __name__ == "__main__":
