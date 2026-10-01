@@ -69,6 +69,7 @@ from src.data.pipeline.processing import coordinated_map
 from src.data.pipeline.rendered import lacks_emitted_bos
 from src.data.spans import LABEL_IGNORE_INDEX, lacks_terminator, resolve_eos_token_ids
 from src.distributed.context_parallel.autograd import cp_sum_rows
+from src.distributed.context_parallel.config import cp_chunk_bounds
 from src.distributed.loading.frozen_models import place_and_freeze
 from src.distributed.loading.model_loading import load_model_from_pretrained
 from src.distributed.loading.peft_setup import peft_bf16_autocast, prepare_peft_model
@@ -466,6 +467,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             resume_checkpoint=kwargs.pop("resume_checkpoint", None),
             resume_context_given=resume_context_given,
         )
+        self._reject_cp_explicit_options(model, parallelism_config, peft_config, ref_model)
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._sign_metric_buffer = {"train": defaultdict(list), "eval": defaultdict(list)}
 
@@ -532,17 +534,6 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         self._peft_has_been_casted_to_bf16 = False
         if peft_config is not None:
             model, self._peft_has_been_casted_to_bf16 = prepare_peft_model(model, peft_config, args)
-
-        if (
-            parallelism_config is not None
-            and parallelism_config.is_cp_mode
-            and (peft_config is not None or is_peft_model(model) or parallelism_config.expert_lora is not None)
-        ):
-            raise ValueError(
-                "Offline GRPO with CP currently requires a full policy fine-tune. PEFT and native "
-                "expert LoRA need a separately validated adapter-disabled reference sweep and "
-                "adapter checkpoint path; refusing to silently anchor KL to adapted weights."
-            )
 
         self.is_encoder_decoder = model.config.is_encoder_decoder
         # The canonical predicate, not a raw ITT-mapping membership test: mistral4's ITT entry is a
@@ -790,6 +781,27 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
                 f"max_length={args.max_length} is below max_prompt_length + max_completion_length "
                 f"({fixed_length}): a batch at the caps would not fit the pipeline's fixed shape, "
                 f"and truncating there would silently drop loss tokens."
+            )
+
+    @staticmethod
+    def _reject_cp_explicit_options(model, parallelism_config, peft_config, ref_model) -> None:
+        """Reject unsupported CP references and adapters before allocating policy weights."""
+        if parallelism_config is None or not parallelism_config.is_cp_mode:
+            return
+        if (
+            peft_config is not None
+            or parallelism_config.expert_lora is not None
+            or (isinstance(model, nn.Module) and is_peft_model(model))
+        ):
+            raise ValueError(
+                "Offline GRPO with CP requires a full policy fine-tune. PEFT and native expert LoRA "
+                "need a separately validated adapter-disabled reference sweep and adapter checkpoint "
+                "path; refusing to silently anchor KL to adapted weights."
+            )
+        if ref_model is not None:
+            raise ValueError(
+                "Offline GRPO with CP scores its run-start reference through the distributed policy. "
+                "An explicit ref_model would never be read. Drop ref_model."
             )
 
     @staticmethod
@@ -1104,8 +1116,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             full_reference = inputs[REF_PER_TOKEN_LOGPS_COLUMN]
             if full_reference.shape != labels.shape:
                 raise ValueError("CP reference log-probs must align with the full-row target grid")
-            chunk = ids.size(1) // self.cp_config.cp_size
-            start = self.cp_config.cp_rank * chunk
+            start, _ = cp_chunk_bounds(ids.size(1), self.cp_config.cp_rank, self.cp_config.cp_size)
             ref_logps_unclamped = full_reference[:, start + 1 : start + 1 + local_logps.size(1)]
             ref_logps = clamp_negative_advantage_logps(ref_logps_unclamped, advantages, current_min_log_prob)
 
@@ -1252,13 +1263,16 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         ]
 
     def _cp_score_reference_batch(self, batch) -> list[torch.Tensor]:
+        if self.ref_model is not None:
+            raise ValueError("CP reference scoring uses the distributed policy; drop the explicit ref_model.")
         local_logps, local_labels = self._cp_chunked_logps(
             self.model,
             batch["input_ids"],
             batch["attention_mask"],
             batch["labels"],
         )
-        chunk = batch["input_ids"].size(1) // self.cp_config.cp_size
+        start, end = cp_chunk_bounds(batch["input_ids"].size(1), self.cp_config.cp_rank, self.cp_config.cp_size)
+        chunk = end - start
         local_logps = F.pad(local_logps.float(), (0, chunk - local_logps.size(1)))
         local_valid = F.pad(local_labels != LABEL_IGNORE_INDEX, (0, chunk - local_labels.size(1)))
         logp_shards = [torch.empty_like(local_logps) for _ in range(self.cp_config.cp_size)]
