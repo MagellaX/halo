@@ -85,7 +85,11 @@ def test_token_row_identity_matches_content_across_arrow_widths_and_chunks(dtype
     )
     expected = []
     for prompt, completion in zip(dataset["prompt_input_ids"], dataset["completion_input_ids"], strict=True):
-        expected.append(hashlib.sha256(np.asarray([len(prompt), *prompt, len(completion), *completion], dtype=np.int64).tobytes()).digest())
+        expected.append(
+            hashlib.sha256(
+                np.asarray([len(prompt), *prompt, len(completion), *completion], dtype=np.int64).tobytes()
+            ).digest()
+        )
     assert list(_token_row_keys(dataset)) == expected
     assert list(_token_row_keys(dataset.select([1, 0, 1, 2]))) == [expected[1], expected[0], expected[1], expected[2]]
 
