@@ -3,6 +3,7 @@
 
 The oracle runs full rows through an EP8/CP1 trainer model and independently reduces its logits.
 Run: torchrun --nproc_per_node=8 tests/gpu/trainers/grpo/test_offline_grpo_ep_cp.py
+Set HALO_TEST_OFFLINE_GRPO_EP_LAZY=0 to exercise eager checkpoint loading.
 """
 
 import functools
@@ -28,6 +29,7 @@ from src.distributed.expert_parallel.extension import deep_ep
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.loading.model_loading import load_distributed_model
 from src.distributed.parallelism_config import ParallelismConfig
+from src.env import env_flag
 from src.optimizers.adamw_bf16 import AdamWBF16
 from src.trainers.grpo.offline import OfflineGRPOTrainer
 from tests.common.cp_grpo import (
@@ -62,7 +64,12 @@ def _dataset(groups, offset=0):
 
 
 def _build_trainer(source, output, cp_size, train, evaluation=None, checkpoint=None, *, kl_beta=BETA):
-    parallelism = ParallelismConfig(ep_size=8, cp_size=cp_size, ep_fp32_router=True)
+    parallelism = ParallelismConfig(
+        ep_size=8,
+        cp_size=cp_size,
+        ep_fp32_router=True,
+        ep_lazy_loading=env_flag("HALO_TEST_OFFLINE_GRPO_EP_LAZY", True),
+    )
     model, _ = load_distributed_model(
         model_name_or_path=source,
         parallelism_config=parallelism,
@@ -70,6 +77,7 @@ def _build_trainer(source, output, cp_size, train, evaluation=None, checkpoint=N
         trust_remote_code=False,
         attn_implementation="flash_attention_2",
         use_liger_kernel=False,
+        preserve_checkpoint_precision=checkpoint is not None,
     )
     args = OfflineGRPOConfig(
         output_dir=output,
