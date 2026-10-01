@@ -241,31 +241,45 @@ def test_node_local_cache_is_complete_replicated_and_removed(tmp_path, damage):
         assert "timed out" not in outcome
 
 
-def _bounded_batch(rank, root, failure):
+def _bounded_batch(rank, root, failure, dp_size, writers, buffer_values):
     os.environ["LOCAL_RANK"] = "0"
     os.environ["LOCAL_WORLD_SIZE"] = "1"
     patch = pytest.MonkeyPatch()
-    patch.setattr(cache_module, "REFERENCE_BUFFER_VALUES", 2)
-    cache = ReferenceScoreCache(os.path.join(root, f"writer-{rank}"), dp_size=2)
+    patch.setattr(cache_module, "REFERENCE_BUFFER_VALUES", buffer_values)
+    cache = ReferenceScoreCache(os.path.join(root, f"writer-{rank}"), dp_size=dp_size)
+    cache.writers = writers
     rejects = []
+    metadata = []
     original_gather = dist.all_gather_object
+    original_metadata_gather = dist.all_gather_into_tensor
 
     def record_reject(output, value):
         rejects.append(value)
         return original_gather(output, value)
 
+    def record_metadata(output, value):
+        assert value.dtype == torch.int64 and value.shape == (2,)
+        assert output.dtype == torch.int64 and output.shape == (4,)
+        metadata.append(value.cpu().tolist())
+        return original_metadata_gather(output, value)
+
+    def unexpected_broadcast(*args, **kwargs):
+        pytest.fail("batch metadata used per-shard broadcasts")
+
     patch.setattr(dist, "all_gather_object", record_reject)
-    if failure == "write" and rank == 1:
+    patch.setattr(dist, "all_gather_into_tensor", record_metadata)
+    patch.setattr(dist, "broadcast", unexpected_broadcast)
+    if failure == "write" and rank == writers[-1]:
 
         def fail_append(*args):
             raise OSError("node-local disk full")
 
         patch.setattr(cache, "_append", fail_append)
-    rows = [torch.arange(7, dtype=torch.float32).neg() - rank]
-    if failure == "pack" and rank == 1:
+    rows = [torch.arange(7, dtype=torch.float32).neg() - rank] if rank < dp_size else None
+    if failure == "pack" and rank == dp_size - 1:
         rows[0][0] = float("nan")
     try:
-        cache.collect_batch(rows, {0: 0, 1: 1})
+        cache.collect_batch(rows, {shard: shard for shard in range(dp_size)})
         outcome = "NO RAISE"
     except Exception as exc:
         outcome = f"{type(exc).__name__}: {exc}"
@@ -273,17 +287,26 @@ def _bounded_batch(rank, root, failure):
         patch.undo()
         cache.discard()
     assert len(rejects) == 1, "failure gathers grew with chunks, DP shards or filesystem writers"
+    assert metadata == [[0, 0] if rows is None or (failure == "pack" and rank == dp_size - 1) else [1, 7]], (
+        "metadata gathers grew with chunks, DP shards or filesystem writers"
+    )
     with open(os.path.join(root, f"bounded-outcome-{rank}.txt"), "w") as result:
         result.write(outcome)
 
 
 @pytest.mark.parametrize("failure", ["none", "pack", "write"])
-def test_bounded_transfers_have_one_failure_join_and_drain_after_local_errors(tmp_path, failure):
+@pytest.mark.parametrize("dp_size,writers,buffer_values", [(1, (0,), 32), (2, (0, 1), 2)])
+def test_bounded_transfers_have_one_metadata_gather_and_failure_join(
+    tmp_path, failure, dp_size, writers, buffer_values
+):
     run_gloo_ranks(
         _bounded_batch,
         2,
         str(tmp_path),
         failure,
+        dp_size,
+        writers,
+        buffer_values,
         env={"DIST_OUTPUT_SHARED_FILESYSTEM": "0"},
         pg_timeout=datetime.timedelta(seconds=20),
     )
@@ -360,7 +383,12 @@ def test_transport_failure_is_not_deferred_to_a_world_failure_join(tmp_path, mon
     cache = ReferenceScoreCache(tmp_path, dp_size=1)
     cache.writers = (1,)
     monkeypatch.setattr(cache_module, "get_global_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "broadcast", lambda *args, **kwargs: None)
+
+    def gather_metadata(output, value):
+        output[:2].copy_(value)
+        output[2:].zero_()
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", gather_metadata)
     original = OSError("original reference transport failed")
 
     def fail_send(*args, **kwargs):
