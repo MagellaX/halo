@@ -57,7 +57,7 @@ vocabulary, below).
 |---------|-----------|:--:|:--:|:--:|:--:|:--:|
 | `DistributedSFTTrainer` | `SFTTrainer` | Yes | Yes | Yes | Yes | Yes |
 | `SmoothMarginPOTrainer` | `Trainer` | Yes | Yes | Yes | Yes | Yes (no VLM / `padding_free` / clip percentile / PEFT; `label_pad_token_id: -100`) |
-| `OfflineGRPOTrainer` | `ChunkedLogprobsCore`, `Trainer` | Yes | No | Yes | Yes | Yes (`kl_beta > 0` via a construction-time reference sweep) |
+| `OfflineGRPOTrainer` | `ChunkedLogprobsCore`, `Trainer` | Yes | Yes (full fine-tuning) | Yes | Yes | Yes (`kl_beta > 0` via a construction-time reference sweep) |
 | `DistributedDPOTrainer` | `DPOTrainer` | Yes | No | Yes | Yes | Yes (precompute-only; `sigmoid`/`hinge`/`ipo`) |
 | `DistributedKTOTrainer` | `KTOTrainer` | Yes | No | Yes | Yes | Yes (`apo_zero_unpaired`, precompute-only) |
 | `DistributedRewardTrainer` | `RewardTrainer` | Yes | No | Yes | Yes | Yes |
@@ -85,10 +85,15 @@ gated by `_supports_ep`.
 **CP** works only where the loss is computable from a sequence chunk. The rest inherit the default
 `_supports_cp = False`.
 
-The reasons: the trainer uses `logits_to_keep` (offline GRPO, Async GRPO with Environments), needs
+The reasons: the trainer uses `logits_to_keep` (Async GRPO with Environments), needs
 global log-probability sums (DPO, KTO), needs full-sequence pooling (classification, reward,
 embedding), wraps two models (distillation), or runs a separate-length privileged-teacher or rollout
 sequence (self distillation, SDPG, online GRPO).
+
+Offline GRPO scores boundary-aligned local hidden states through the chunked head and reduces its
+token objective across CP with the shared autograd SUM. Its CP path rejects adapters; its
+[full-FT reference](../training-methods/grpo/offline-grpo.md#reference-model) is persisted, not
+recomputed from trained weights on resume.
 
 **PP** needs a single-forward objective on one stage's logits, and the conditional rows above are
 constructor-time gates rather than class attributes. Rejections land in three places.

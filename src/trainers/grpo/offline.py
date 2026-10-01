@@ -9,10 +9,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline GRPO trainer (pre-computed rewards) under EP / TP / PP.
+"""Offline GRPO trainer (pre-computed rewards) under EP / TP / CP / PP.
 
-Full fine-tuning scores raw run-start reference log-probs once and persists them through
-checkpoint resume. CP is refused at trainer construction.
+Full fine-tuning scores raw run-start reference log-probs once, carries them as a per-example side
+tensor, and persists them through checkpoint resume in every mode. CP owns token shards of the
+same rows; PP's microbatch numerators share the local loss's whole-batch denominators.
 """
 
 import random
@@ -27,6 +28,7 @@ import datasets
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from accelerate.logging import get_logger
 from accelerate.utils import is_peft_model
 from peft import PeftConfig
@@ -58,10 +60,15 @@ from trl.trainer.utils import (
 
 from src.callbacks.variable_scheduler import VariableSchedulerCallback
 from src.configs.offline_grpo_config import OfflineGRPOConfig
-from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN, OfflineGRPODataCollatorWithPadding
+from src.data.collators.offline_grpo import (
+    REF_PER_TOKEN_LOGPS_COLUMN,
+    OfflineGRPOCPDataCollatorWithPadding,
+    OfflineGRPODataCollatorWithPadding,
+)
 from src.data.pipeline.processing import coordinated_map
 from src.data.pipeline.rendered import lacks_emitted_bos
 from src.data.spans import LABEL_IGNORE_INDEX, lacks_terminator, resolve_eos_token_ids
+from src.distributed.context_parallel.autograd import cp_sum_rows
 from src.distributed.loading.frozen_models import place_and_freeze
 from src.distributed.loading.model_loading import load_model_from_pretrained
 from src.distributed.loading.peft_setup import peft_bf16_autocast, prepare_peft_model
@@ -400,7 +407,7 @@ class MultiGroupSampler(Sampler):
 
 class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin, DistributedTrainerMixin, Trainer):
     """Offline GRPO trainer for pre-computed-reward data (``prompt``/``completions``/``rewards``)
-    under EP / TP / PP (see ``_reject_pp_explicit_options`` for the PP-specific rejections).
+    under EP / TP / CP / PP (see ``_reject_pp_explicit_options`` for the PP-specific rejections).
 
     Full fine-tuning freezes run-start per-token reference scores in each checkpoint. PEFT scores
     its base with adapters disabled; native expert LoRA uses an explicit frozen base model.
@@ -411,6 +418,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     # Single-forward objective whose denominators come from batch metadata alone; the KL reference
     # is scored by the shared reference sweep before training.
     _supports_pp = True
+    _supports_cp = True
     # The objective never passes labels into the forward, so Liger CE/FLCE cannot fire.
     _loss_outside_model_forward = True
     # The objective divides by its own loss-type denominator, so the parent's grad-accum scaling stands.
@@ -505,7 +513,9 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         # Read by ChunkedLogprobsCore (avoids full [B,T,vocab] logits). Inert under PP: the pipeline
         # drives stages through the PP loss adapter and never calls _get_per_token_logps (the last
         # stage still materializes its own logits plane — see _pp_loss_adapter).
-        self._use_chunked_grpo_logprobs = args.use_chunked_grpo_logprobs
+        self._use_chunked_grpo_logprobs = args.use_chunked_grpo_logprobs or (
+            parallelism_config is not None and parallelism_config.is_cp_mode
+        )
         # Stored completions carry no sampling distribution to match, so log-probs are plain
         # (the full-logits path's implicit temperature); the chunked kernel divides by this.
         self.temperature = 1.0
@@ -522,6 +532,17 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         self._peft_has_been_casted_to_bf16 = False
         if peft_config is not None:
             model, self._peft_has_been_casted_to_bf16 = prepare_peft_model(model, peft_config, args)
+
+        if (
+            parallelism_config is not None
+            and parallelism_config.is_cp_mode
+            and (peft_config is not None or is_peft_model(model) or parallelism_config.expert_lora is not None)
+        ):
+            raise ValueError(
+                "Offline GRPO with CP currently requires a full policy fine-tune. PEFT and native "
+                "expert LoRA need a separately validated adapter-disabled reference sweep and "
+                "adapter checkpoint path; refusing to silently anchor KL to adapted weights."
+            )
 
         self.is_encoder_decoder = model.config.is_encoder_decoder
         # The canonical predicate, not a raw ITT-mapping membership test: mistral4's ITT entry is a
@@ -551,8 +572,10 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model_id, padding_side="right")
 
-        data_collator = OfflineGRPODataCollatorWithPadding(
-            pad_token_id=self.padding_value,
+        data_collator = (
+            OfflineGRPOCPDataCollatorWithPadding(pad_token_id=self.padding_value, cp_size=parallelism_config.cp_size)
+            if parallelism_config.is_cp_mode
+            else OfflineGRPODataCollatorWithPadding(pad_token_id=self.padding_value)
         )
 
         if args.remove_unused_columns:
@@ -795,7 +818,11 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     def _holds_kl_reference(model, kl_beta: float, parallelism_config: "ParallelismConfig", peft_config) -> bool:
         """Whether an external frozen reference can be read by this run."""
         return (
-            kl_beta != 0.0 and peft_config is None and not is_peft_model(model) and not parallelism_config.is_pp_mode
+            kl_beta != 0.0
+            and peft_config is None
+            and not is_peft_model(model)
+            and not parallelism_config.is_pp_mode
+            and not parallelism_config.is_cp_mode
         )
 
     @classmethod
@@ -814,7 +841,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             if ref_model is not None:
                 raise ValueError(
                     "ref_model was passed, but this run holds no KL reference model (kl_beta 0, a PEFT policy "
-                    "scored with its adapters disabled, or PP, which scores the reference through "
+                    "scored with its adapters disabled, or CP/PP, which scores the reference through "
                     "the policy's distributed path), so it would never be read. Drop ref_model."
                 )
             return None
@@ -983,6 +1010,8 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             return self._compute_loss_inner(model, inputs)
 
     def _compute_loss_inner(self, model, inputs):
+        if self.parallelism_config.is_cp_mode:
+            return self._compute_cp_loss_inner(model, inputs)
         prompt_ids, prompt_mask = (
             inputs["prompt_input_ids"],
             inputs["prompt_attention_mask"],
@@ -1051,6 +1080,54 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         )
 
         self._buffer_sign_metrics(sample_values, advantages, completion_mask)
+        return loss
+
+    def _compute_cp_loss_inner(self, model, inputs):
+        """Score local CP targets and reduce only each logical row's token sums.
+
+        The collator right-pads full rows. The scorer shifts the target at every shard boundary;
+        reference values are stored at the target-token positions in that same full-row grid.
+        """
+        ids, attention_mask, labels = inputs["input_ids"], inputs["attention_mask"], inputs["labels"]
+        local_logps, local_labels = self._cp_chunked_logps(model, ids, attention_mask, labels)
+        advantages = inputs["advantage"]
+        current_min_log_prob = live_min_log_prob(self.model, self.min_log_prob)
+        policy_logps = clamp_negative_advantage_logps(local_logps, advantages, current_min_log_prob)
+
+        ref_logps = ref_logps_unclamped = None
+        if self.beta != 0.0:
+            if REF_PER_TOKEN_LOGPS_COLUMN not in inputs:
+                raise RuntimeError(
+                    "CP offline GRPO with kl_beta > 0 needs the run-start raw reference log-probs "
+                    "on every row; a fresh run must sweep them before training."
+                )
+            full_reference = inputs[REF_PER_TOKEN_LOGPS_COLUMN]
+            if full_reference.shape != labels.shape:
+                raise ValueError("CP reference log-probs must align with the full-row target grid")
+            chunk = ids.size(1) // self.cp_config.cp_size
+            start = self.cp_config.cp_rank * chunk
+            ref_logps_unclamped = full_reference[:, start + 1 : start + 1 + local_logps.size(1)]
+            ref_logps = clamp_negative_advantage_logps(ref_logps_unclamped, advantages, current_min_log_prob)
+
+        per_token_loss, sample_values = offline_token_objective(
+            policy_logps,
+            local_logps,
+            advantages,
+            policy_gradient_formulation=self.policy_gradient_formulation,
+            beta=self.beta,
+            ref_logps=ref_logps,
+            ref_logps_unclamped=ref_logps_unclamped,
+        )
+        supervised = local_labels != LABEL_IGNORE_INDEX
+        loss = offline_loss(
+            per_token_loss,
+            supervised,
+            inputs["group_size"],
+            loss_type=self.loss_type,
+            max_completion_length=self.max_completion_length,
+            cp_config=self.cp_config,
+        )
+        self._buffer_sign_metrics(sample_values, advantages, supervised)
         return loss
 
     def _reference_settings(self) -> dict:
@@ -1157,6 +1234,8 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
 
     def _score_reference_batch(self, batch) -> list[torch.Tensor]:
         """Mode-specific scoring inside the shared reference-sweep lifecycle."""
+        if self.parallelism_config.is_cp_mode:
+            return self._cp_score_reference_batch(batch)
         if self._pp_runtime is not None:
             return self._pp_score_reference_batch(batch)
         ids = torch.cat([batch["prompt_input_ids"], batch["completion_input_ids"]], dim=1)
@@ -1171,6 +1250,24 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             values[valid.bool()].float().cpu()
             for values, valid in zip(logps, batch["completion_attention_mask"], strict=True)
         ]
+
+    def _cp_score_reference_batch(self, batch) -> list[torch.Tensor]:
+        local_logps, local_labels = self._cp_chunked_logps(
+            self.model,
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["labels"],
+        )
+        chunk = batch["input_ids"].size(1) // self.cp_config.cp_size
+        local_logps = F.pad(local_logps.float(), (0, chunk - local_logps.size(1)))
+        local_valid = F.pad(local_labels != LABEL_IGNORE_INDEX, (0, chunk - local_labels.size(1)))
+        logp_shards = [torch.empty_like(local_logps) for _ in range(self.cp_config.cp_size)]
+        valid_shards = [torch.empty_like(local_valid) for _ in range(self.cp_config.cp_size)]
+        dist.all_gather(logp_shards, local_logps, group=self.cp_config.process_group)
+        dist.all_gather(valid_shards, local_valid, group=self.cp_config.process_group)
+        full_logps = torch.cat(logp_shards, dim=1)
+        full_valid = torch.cat(valid_shards, dim=1)
+        return [logps[valid].cpu() for logps, valid in zip(full_logps, full_valid, strict=True)]
 
     def _buffer_sign_metrics(
         self,
@@ -1187,12 +1284,21 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         all-ignore labels and a zero advantage, and would otherwise count as zero-valued
         positive-advantage samples. The mode keys the buffer ``log`` drains.
         """
-        counts = mask.sum(dim=1).clamp(min=1)
+        # Count and every diagnostic travel in one non-autograd collective. Each CP shard owns
+        # tokens of the same logical rows; off CP this is the same local row reduction.
+        keys = tuple(sample_values)
+        totals = torch.stack(
+            [mask.sum(dim=1, dtype=torch.float32)]
+            + [(sample_values[key].detach() * mask).sum(dim=1, dtype=torch.float32) for key in keys]
+        )
+        cp_config = getattr(self, "cp_config", None) if self.parallelism_config.is_cp_mode else None
+        totals = cp_sum_rows(totals, cp_config)
+        counts = totals[0].clamp(min=1)
         buffer = self._sign_metric_buffer["train" if self.model.training else "eval"]
         positive = advantages.detach() >= 0
         buffer["positive_mask"].append(positive if rows is None else positive[rows])
-        for key, tensor in sample_values.items():
-            values = ((tensor.detach() * mask).sum(dim=1) / counts).float()
+        for index, key in enumerate(keys, start=1):
+            values = totals[index] / counts
             buffer[key].append(values if rows is None else values[rows])
 
     def _drain_sign_metrics(self, mode: str) -> None:

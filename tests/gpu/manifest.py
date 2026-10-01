@@ -638,6 +638,15 @@ MANIFEST: dict[str, TestSpec] = {
         markers=("gpu", "core", "2gpu", "qwen3"),
         timeout=900,
     ),
+    "trainers/grpo/test_offline_grpo_cp_resume.py": TestSpec(
+        nproc=2,
+        markers=("gpu", "full", "2gpu", "cp", "qwen3"),
+        args_matrix=("--cp-size 1", "--cp-size 2"),
+        timeout=2400,
+    ),
+    "trainers/grpo/test_offline_grpo_ep_cp.py": TestSpec(
+        nproc=8, markers=("gpu", "full", "8gpu", "ep", "cp", "moe", "qwen3"), timeout=1800
+    ),
     "trainers/grpo/test_offline_grpo_expert_lora_kl.py": TestSpec(
         nproc=8, markers=("gpu", "full", "8gpu", "ep", "moe", "lora", "qwen3"), timeout=1800
     ),

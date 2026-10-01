@@ -11,6 +11,8 @@ import torch
 from accelerate.logging import get_logger
 from trl.trainer.utils import pad
 
+from src.data.spans import LABEL_IGNORE_INDEX
+
 logger = get_logger(__name__, log_level="INFO")
 
 # Raw reference scores align with completion tokens, independent of the scoring parallelism.
@@ -75,4 +77,74 @@ class OfflineGRPODataCollatorWithPadding:
         if has_ref_logps:
             output[REF_PER_TOKEN_LOGPS_COLUMN] = pad(ref_logps, padding_value=0)
 
+        return output
+
+
+@dataclass
+class OfflineGRPOCPDataCollatorWithPadding:
+    """Right-pad whole rows so CP attention never sees a pad before a real token.
+
+    The supervision and optional raw reference grid are indexed by the target token's position
+    in ``input_ids``. The CP scorer shifts both grids at shard boundaries after its hidden forward.
+    """
+
+    pad_token_id: int = 0
+    cp_size: int = 1
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        if not features:
+            raise ValueError("Offline GRPO CP needs at least one row per batch")
+        if self.cp_size < 1:
+            raise ValueError("cp_size must be positive")
+
+        has_reference = REF_PER_TOKEN_LOGPS_COLUMN in features[0]
+        if any((REF_PER_TOKEN_LOGPS_COLUMN in row) != has_reference for row in features):
+            raise ValueError("Offline GRPO CP cannot mix rows with and without reference log-probs")
+
+        rows: list[list[int]] = []
+        labels: list[list[int]] = []
+        references: list[list[float]] = []
+        for row in features:
+            prompt = row["prompt_input_ids"]
+            if not prompt:
+                raise ValueError("Offline GRPO CP needs a nonempty tokenized prompt")
+            completion = row["completion_input_ids"]
+            rows.append([*prompt, *(completion or [self.pad_token_id])])
+            labels.append(
+                [LABEL_IGNORE_INDEX] * len(prompt) + (list(completion) if completion else [LABEL_IGNORE_INDEX])
+            )
+            if has_reference:
+                values = row[REF_PER_TOKEN_LOGPS_COLUMN]
+                if len(values) != len(completion):
+                    raise ValueError(
+                        f"{REF_PER_TOKEN_LOGPS_COLUMN} holds {len(values)} values for a completion of "
+                        f"{len(completion)} tokens; the raw reference must match tokenization."
+                    )
+                references.append([0.0] * len(prompt) + list(values or [0.0]))
+
+        width = max(len(row) for row in rows)
+        width = max(self.cp_size, ((width + self.cp_size - 1) // self.cp_size) * self.cp_size)
+        token_rows = torch.full((len(rows), width), self.pad_token_id, dtype=torch.long)
+        attention = torch.zeros_like(token_rows)
+        target_rows = torch.full_like(token_rows, LABEL_IGNORE_INDEX)
+        reference_rows = torch.zeros((len(rows), width), dtype=torch.float32) if has_reference else None
+        for index, (tokens, targets) in enumerate(zip(rows, labels, strict=True)):
+            token_rows[index, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+            target_rows[index, : len(targets)] = torch.tensor(targets, dtype=torch.long)
+            attention[index, : len(tokens)] = 1
+            if not features[index]["completion_input_ids"]:
+                attention[index, len(features[index]["prompt_input_ids"])] = 0
+            if reference_rows is not None:
+                reference_rows[index, : len(references[index])] = torch.tensor(references[index], dtype=torch.float32)
+
+        output = {
+            "input_ids": token_rows,
+            "attention_mask": attention,
+            "labels": target_rows,
+            "group_id": torch.tensor([row["group_id"] for row in features]),
+            "group_size": torch.tensor([row["group_size"] for row in features]),
+            "advantage": torch.tensor([row["advantage"] for row in features]),
+        }
+        if reference_rows is not None:
+            output[REF_PER_TOKEN_LOGPS_COLUMN] = reference_rows
         return output
