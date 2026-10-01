@@ -23,6 +23,7 @@ from src.trainers.grpo.offline import OfflineGRPOTrainer
 from tests.common.ep_stubs import StubEPLayerBase
 from tests.common.frozen_loader import captured_load, stub_frozen_loader
 from tests.common.offline_grpo import make_offline_tokenizer, offline_grpo_dataset
+from tests.common.offline_grpo_reference import mapped_scores
 
 PartialState()  # the trainer's accelerate logger requires an initialized state
 
@@ -142,6 +143,70 @@ def test_constructor_places_and_freezes_every_external_reference(tmp_path, monke
     assert reference.device == policy.device
     for before, after in zip(original_weights, reference.parameters(), strict=True):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+def _raw_model_reference(model, dataset):
+    rows = []
+    with torch.no_grad():
+        for row in dataset:
+            prompt, completion = row["prompt_input_ids"], row["completion_input_ids"]
+            ids = torch.tensor([prompt + completion])
+            logits = model(input_ids=ids).logits[:, len(prompt) - 1 : -1].float()
+            targets = torch.tensor(completion).view(1, -1, 1)
+            rows.append(logits.log_softmax(-1).gather(-1, targets).flatten())
+    return rows
+
+
+def test_explicit_reference_scores_both_splits_once_instead_of_the_live_policy(tmp_path):
+    torch.manual_seed(711)
+    policy = _tiny_llama()
+    torch.manual_seed(991)
+    reference = _tiny_llama()
+    reference_calls = []
+    original_forward = reference.forward
+
+    def observed_forward(*args, **kwargs):
+        reference_calls.append(1)
+        return original_forward(*args, **kwargs)
+
+    reference.forward = observed_forward
+    args = OfflineGRPOConfig(
+        output_dir=str(tmp_path),
+        kl_beta=0.2,
+        use_cpu=True,
+        bf16=False,
+        use_liger_kernel=False,
+        report_to="none",
+        max_prompt_length=16,
+        max_completion_length=16,
+        per_device_train_batch_size=2,
+        dataset_num_proc=1,
+        remove_unused_columns=False,
+    )
+    trainer = OfflineGRPOTrainer(
+        model=policy,
+        ref_model=reference,
+        args=args,
+        train_dataset=offline_grpo_dataset(2),
+        eval_dataset=offline_grpo_dataset(2, 4),
+        processing_class=make_offline_tokenizer(),
+        parallelism_config=ParallelismConfig(),
+    )
+    assert len(reference_calls) == 4, "the supplied reference was not swept once over each split"
+    assert trainer.ref_model is None
+    assert not reference.training and not any(parameter.requires_grad for parameter in reference.parameters())
+    for dataset in (trainer.train_dataset, trainer.eval_dataset):
+        reference.forward = original_forward
+        expected = _raw_model_reference(reference, dataset)
+        policy.eval()
+        live = _raw_model_reference(policy, dataset)
+        assert max((ref - own).abs().max().item() for ref, own in zip(expected, live, strict=True)) > 1e-3
+        for row, score in zip(dataset, expected, strict=True):
+            torch.testing.assert_close(torch.tensor(row[REF_PER_TOKEN_LOGPS_COLUMN]), score, rtol=1e-6, atol=1e-6)
+    reference.forward = lambda *args, **kwargs: pytest.fail("released reference was scored again")
+    batch = trainer.data_collator([trainer.train_dataset[index] for index in range(2)])
+    assert torch.isfinite(trainer._compute_loss_inner(policy, batch))
+    assert len(reference_calls) == 4
 
 
 @pytest.mark.parametrize("policy_fn", [_tiny_llama, _wrapped_moe_policy], ids=["dense", "wrapped-moe"])
@@ -311,7 +376,8 @@ def _anchor_trainer(*, checkpoint=None, trained=False, output_dir=None):
     def sweep(dataset, split):
         trainer.sweep_count += 1
         initial = float(trainer.model.lm_head.weight[0, 0].detach())
-        return [torch.arange(len(row), dtype=torch.float32).neg() + initial for row in dataset["completion_input_ids"]]
+        rows = [torch.arange(len(row), dtype=torch.float32).neg() + initial for row in dataset["completion_input_ids"]]
+        return mapped_scores(trainer.args.output_dir, dataset, rows)
 
     trainer._sweep_reference_logps = sweep
     return trainer
