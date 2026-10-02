@@ -83,7 +83,13 @@ from src.models.structure import base_transformers_model, resolve_tokenizer
 from src.trainers.grpo.mixins.chunked_logprobs import ChunkedLogprobsCore, LogitsWidth
 from src.trainers.grpo.mixins.dataloader import MultiGroupSampler
 from src.trainers.grpo.objective.advantages import STD_EPS
-from src.trainers.grpo.objective.offline import clamp_negative_advantage_logps, offline_token_objective
+from src.trainers.grpo.objective.offline import (
+    clamp_negative_advantage_logps,
+    offline_loss,
+    offline_loss_normalizer,
+    offline_loss_numerator,
+    offline_token_objective,
+)
 from src.trainers.mixins.base import DistributedTrainerMixin
 from src.trainers.mixins.ep_introspection import named_ep_layers
 from src.trainers.mixins.pp_gates import reject_pp_compute_metrics, reject_pp_peft
@@ -381,10 +387,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
         self.best_completion_emphasis = args.best_completion_emphasis
         self.min_log_prob = args.min_log_prob
         self.loss_type = args.loss_type
-        # Every loss/PG dispatch in this file (compute_loss, _pp_normalizer, _pp_token_loss) branches
-        # on these strings; validate once at construction, not per microbatch or PP-only. Each
-        # three-way ``loss_type`` ladder still ends in a raise, since a fallthrough would substitute a
-        # different denominator instead of failing; the two-way PG choice ends in a labelled else.
+        # Refuse invalid objective settings before model and dataset construction.
         if self.loss_type not in LOSS_TYPES:
             raise ValueError(f"Unknown loss type: {self.loss_type!r}. Supported types: {list(LOSS_TYPES)}")
         if args.policy_gradient_formulation not in PG_FORMULATIONS:
@@ -937,29 +940,13 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
             ref_logps_unclamped=ref_per_token_logps_unclamped,
         )  # [B, T]
 
-        # 1/group_size so every original group contributes equally.
-        group_weights = 1.0 / inputs["group_size"].float()  # [B]
-
-        weighted_per_token_loss = per_token_loss * group_weights.unsqueeze(1)  # [B, T]
-        weighted_completion_mask = completion_mask.float() * group_weights.unsqueeze(1)  # [B, T]
-
-        if self.loss_type == "grpo":
-            per_sequence_loss = (weighted_per_token_loss * completion_mask).sum(1) / completion_mask.sum(dim=1).clamp(
-                min=1.0
-            )  # [B]
-            loss = per_sequence_loss.sum() / group_weights.sum()
-
-        elif self.loss_type == "bnpo":
-            loss = (weighted_per_token_loss * completion_mask).sum() / weighted_completion_mask.sum().clamp(min=1.0)
-
-        elif self.loss_type == "dr_grpo":
-            effective_batch_size = group_weights.sum()
-            loss = (weighted_per_token_loss * completion_mask).sum() / (
-                effective_batch_size * self.max_completion_length
-            )
-
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type!r}. Supported types: {list(LOSS_TYPES)}")
+        loss = offline_loss(
+            per_token_loss,
+            completion_mask,
+            inputs["group_size"],
+            loss_type=self.loss_type,
+            max_completion_length=self.max_completion_length,
+        )
 
         self._buffer_sign_metrics(sample_values, advantages, completion_mask)
         return loss
@@ -1116,15 +1103,12 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
         group count × max_completion_length. Shifted and unshifted completion-token counts are equal
         (the collator guarantees a non-empty prompt, so position 0 is never a completion token).
         """
-        group_weights = 1.0 / inputs["group_size"].float()
-        if self.loss_type == "grpo":
-            return group_weights.sum()
-        if self.loss_type == "bnpo":
-            token_counts = loss_token_counts_per_row(inputs["labels"]).float()
-            return (group_weights * token_counts).sum().clamp(min=1.0)
-        if self.loss_type == "dr_grpo":
-            return group_weights.sum() * self.max_completion_length
-        raise ValueError(f"Unknown loss type: {self.loss_type!r}. Supported types: {list(LOSS_TYPES)}")
+        return offline_loss_normalizer(
+            loss_token_counts_per_row(inputs["labels"]).float(),
+            inputs["group_size"],
+            loss_type=self.loss_type,
+            max_completion_length=self.max_completion_length,
+        )
 
     def _pp_token_loss(self, logits: torch.Tensor, target: dict[str, torch.Tensor]) -> torch.Tensor:
         """The offline-GRPO numerator over one microbatch; contributions sum to the full-batch loss.
@@ -1144,7 +1128,6 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
             return token_logps.new_zeros(())
 
         advantages = target["advantage"].float()
-        group_weights = 1.0 / target["group_size"].float()
 
         token_logps_unclamped = token_logps
         token_logps = clamp_negative_advantage_logps(token_logps, advantages, self._pp_min_log_prob)
@@ -1163,10 +1146,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, DistributedTrainerMixin, Trainer):
             ref_logps_unclamped=ref_logps_unclamped,
         )
         self._buffer_sign_metrics(sample_values, advantages, mask, rows=rows_with_labels(target["labels"]))
-        weighted = per_token_loss * mask * group_weights.unsqueeze(1)
-        if self.loss_type == "grpo":
-            return (weighted.sum(dim=1) / mask.sum(dim=1).clamp(min=1)).sum()
-        return weighted.sum()  # bnpo / dr_grpo share the numerator; only the normalizer differs
+        return offline_loss_numerator(per_token_loss, mask, target["group_size"], loss_type=self.loss_type)
 
     def _pp_precompute_reference_logps(self, dataset: "datasets.Dataset", what: str) -> "datasets.Dataset":
         """Score the KL reference through the pipeline and return ``dataset`` with the values as a column.
