@@ -1,4 +1,4 @@
-"""Group-relative advantages for GRPO: baseline, scaling, and negative-side surgery.
+"""Group-relative advantages for GRPO: baseline, scaling, and the degenerate-group mask.
 
 Pure functions over a rank-local reward tensor: ``RepeatSampler`` keeps each prompt's completions
 together on one rank, so the baseline needs no cross-rank gather (except ``scale_rewards="batch"``,
@@ -9,7 +9,6 @@ on before any of them raises).
 import torch
 from accelerate.utils import gather
 
-from src.args.mixins import AdvantageShaping
 from src.distributed.runtime import rank_consensus
 
 # Matches TRL, so env-, online- and offline-GRPO agree on near-degenerate groups.
@@ -31,13 +30,32 @@ def _grouped(rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
     return rewards.view(-1, num_generations)
 
 
+def valid_group_stats(
+    rewards: torch.Tensor, num_generations: int, valid_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each group's reward mean and unbiased std over its valid members, both ``[groups, 1]``.
+
+    A group with no valid member takes its plain mean; one with fewer than two has std 0, the spread
+    a group-scaled advantage of 0 divides by.
+    """
+    grouped = _grouped(rewards, num_generations)
+    valid = _grouped(valid_mask.to(grouped.dtype), num_generations)
+    valid_count = valid.sum(dim=1, keepdim=True)
+    group_mean = torch.where(
+        valid_count > 0,
+        (grouped * valid).sum(dim=1, keepdim=True) / valid_count.clamp_min(1.0),
+        grouped.mean(dim=1, keepdim=True),
+    )
+    squares = (((grouped - group_mean) ** 2) * valid).sum(dim=1, keepdim=True)
+    var = squares / (valid_count - 1.0).clamp_min(1.0)
+    return group_mean, torch.where(valid_count > 1, var.sqrt(), torch.zeros_like(var))
+
+
 def group_relative_advantages(
     rewards: torch.Tensor,
     num_generations: int,
     scale_rewards: str | bool | None,
     valid_mask: torch.Tensor | None = None,
-    shaping: AdvantageShaping | None = None,
-    gate_rewards: torch.Tensor | None = None,
     already_gathered: bool = False,
     std_floor: float = 0.0,
 ) -> torch.Tensor:
@@ -52,33 +70,17 @@ def group_relative_advantages(
     ``"group"`` divides by the per-group std (risky on sparse reward, where degenerate groups have
     std → 0); ``"batch"`` divides by the global-batch std, holding the gradient scale steady.
 
-    ``std_floor`` bounds the scaling amplification: the divisor is ``max(std, std_floor)``. A batch or
-    group with every reward within a few hundredths otherwise divides its own shaping noise by a
-    near-zero std, inflating it to full-scale advantages.
-
-    ``shaping`` (default None) selects :class:`AdvantageShaping`; ``gate_rewards`` supplies the
-    objective-component gate for ``neg_mask_hard``.
+    ``std_floor`` bounds the scaling amplification: the divisor is ``max(std, std_floor)``. A
+    behaviorally-degenerate batch/group (every reward within a few hundredths) otherwise divides its own
+    shaping noise by a near-zero std, inflating it to full-scale advantages; batches with real spread
+    (std above the floor) are unaffected.
     """
     grouped = _grouped(rewards, num_generations)
-    if shaping is not None and shaping.mode == "qae" and num_generations > 1:
-        vals = grouped.float()
-        if valid_mask is not None:
-            vals = vals.masked_fill(~_grouped(valid_mask, num_generations).bool(), float("nan"))
-        baseline = vals.nanquantile(shaping.quantile, dim=1, keepdim=True)
-        baseline = torch.where(baseline.isnan(), grouped.mean(dim=1, keepdim=True), baseline)
-        group_baseline = baseline.to(grouped.dtype).expand_as(grouped).flatten()
-    elif valid_mask is not None:
-        valid = _grouped(valid_mask.to(grouped.dtype), num_generations)
-        valid_count = valid.sum(dim=1, keepdim=True)
-        safe_mean = torch.where(
-            valid_count > 0,
-            (grouped * valid).sum(dim=1, keepdim=True) / valid_count.clamp_min(1.0),
-            grouped.mean(dim=1, keepdim=True),
-        )
-        group_baseline = safe_mean.expand_as(grouped).flatten()
+    if valid_mask is not None:
+        group_mean, valid_std = valid_group_stats(rewards, num_generations, valid_mask)
     else:
-        group_baseline = grouped.mean(dim=1, keepdim=True).expand_as(grouped).flatten()
-    advantages = rewards - group_baseline
+        group_mean = grouped.mean(dim=1, keepdim=True)
+    advantages = rewards - group_mean.expand_as(grouped).flatten()
 
     if scale_rewards not in (None, False, "none"):
         # The std divisor applies ``valid_mask`` like the baseline: a placeholder would bias every valid row.
@@ -91,20 +93,10 @@ def group_relative_advantages(
             std = batch_rewards.std() if batch_rewards.numel() > 1 else torch.zeros_like(rewards[:1])
             advantages = advantages / (std.clamp_min(std_floor) + STD_EPS)
         elif num_generations > 1:
-            if valid_mask is not None:
-                # Unbiased std over valid members; groups with < 2 of them get std 0 (advantage already 0).
-                valid = _grouped(valid_mask.to(grouped.dtype), num_generations)
-                n = valid.sum(dim=1, keepdim=True)
-                vmean = (grouped * valid).sum(dim=1, keepdim=True) / n.clamp_min(1.0)
-                var = (((grouped - vmean) ** 2) * valid).sum(dim=1, keepdim=True) / (n - 1.0).clamp_min(1.0)
-                std = torch.where(n > 1, var.sqrt(), torch.zeros_like(var)).expand_as(grouped).flatten()
-            else:
-                std = grouped.std(dim=1, keepdim=True).expand_as(grouped).flatten()
-            advantages = advantages / (std.clamp_min(std_floor) + STD_EPS)
+            group_std = valid_std if valid_mask is not None else grouped.std(dim=1, keepdim=True)
+            advantages = advantages / (group_std.expand_as(grouped).flatten().clamp_min(std_floor) + STD_EPS)
         # num_generations == 1: singleton groups have advantage 0; leave unscaled rather than /NaN.
 
-    if shaping is not None and shaping.mode in ("asymmetric", "neg_mask_hard"):
-        advantages = _negative_side_surgery(advantages, num_generations, shaping, gate_rewards, rewards, valid_mask)
     _require_finite(rewards, advantages)
     return advantages
 
@@ -123,32 +115,6 @@ def _require_finite(rewards: torch.Tensor, advantages: torch.Tensor) -> None:
         f"environment returning NaN/Inf; under scale_rewards='batch' a single one makes every advantage "
         f"of the step non-finite."
     )
-
-
-def _negative_side_surgery(
-    advantages: torch.Tensor,
-    num_generations: int,
-    shaping: AdvantageShaping,
-    gate_rewards: torch.Tensor | None,
-    rewards: torch.Tensor,
-    valid_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Post-baseline negative-advantage treatment (see :class:`AdvantageShaping`).
-
-    ``asymmetric`` scales each sign unconditionally; ``neg_mask_hard`` zeroes negatives only in groups
-    whose best ``gate_rewards`` member stayed below ``hard_group_threshold``. ``valid_mask`` takes that
-    maximum over real completions like the baseline above: a placeholder's forced reward is not a score,
-    and one sitting at or above the threshold lifts a hard group out of the gate. A group with no valid
-    member gates as hard, its rows being masked out of the loss anyway.
-    """
-    if shaping.mode == "asymmetric":
-        return torch.where(advantages >= 0, advantages * shaping.pos_scale, advantages * shaping.neg_scale)
-    gate = gate_rewards if gate_rewards is not None else rewards
-    grouped_gate = _grouped(gate, num_generations)
-    if valid_mask is not None:
-        grouped_gate = grouped_gate.masked_fill(~_grouped(valid_mask, num_generations).bool(), float("-inf"))
-    hard = (grouped_gate.max(dim=1, keepdim=True).values < shaping.hard_group_threshold).expand_as(grouped_gate)
-    return torch.where(hard.flatten() & (advantages < 0), torch.zeros_like(advantages), advantages)
 
 
 def degenerate_group_mask(

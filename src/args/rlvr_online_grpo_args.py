@@ -7,6 +7,7 @@ from src.args.common_script_args import CommonScriptArguments
 from src.args.mixins import (
     AdvantageShapingArguments,
     ChunkedLogprobsArguments,
+    GRPOEarlyStopArguments,
     PromptDatasetArguments,
     RLRRArguments,
     SDPGArguments,
@@ -23,6 +24,7 @@ class RLVROnlineGRPOScriptArguments(
     PromptDatasetArguments,
     ChunkedLogprobsArguments,
     AdvantageShapingArguments,
+    GRPOEarlyStopArguments,
     RLRRArguments,
     SDPGArguments,
     CommonScriptArguments,
@@ -33,7 +35,7 @@ class RLVROnlineGRPOScriptArguments(
     ``format`` graders, a generative ``judge``, a served ``reward_model`` — each ``weight * score ** exponent``.
 
     RLRR (arXiv:2601.23058, :class:`RLRRArguments`) replaces the group-normalized advantages with
-    relative-ranking ones and is mutually exclusive with the AdvantageShapingArguments surgery.
+    relative-ranking ones, so the trainer refuses it beside the std floor or the degenerate-group drop.
     """
 
     # The tunables ``use_sdpg`` gates: the shared block plus the RLVR-only advantage gate.
@@ -109,6 +111,12 @@ class RLVROnlineGRPOScriptArguments(
     def reward_terms(self) -> tuple[RewardTerm, ...]:
         """The typed reward terms of ``rewards``, parsed and validated (also at parse time)."""
         return parse_reward_terms(self.rewards, RLVR_REWARD_SOURCES)
+
+    def _validate_hint_template(self) -> None:
+        # With use_sdpg off a null template is a value set beside the closed gate, which the script's
+        # gate refusal names as such; a template that is set is held to its placeholders either way.
+        if self.use_sdpg or self.sdpg_hint_template is not None:
+            super()._validate_hint_template()
 
     def _validate_ranges(self) -> None:
         super()._validate_ranges()

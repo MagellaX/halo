@@ -165,12 +165,24 @@ def test_submitted_solutions_keep_only_the_calls_the_environment_admitted():
         ("w", "python"),
     ]
     fixed = CodeContestsEnvironment(language="python", sandbox_backend="local")
-    # A fixed-language run has no language argument: the schema filter drops it and every coded call binds.
-    assert regrade_trajectories.submitted_solutions(episode, fixed.registry.get("submit_solution")) == [
-        ("x", None),
-        ("y", None),
-        ("z", None),
-        ("w", None),
+    # A fixed-language run declares no language argument, so a call naming one is refused like any other
+    # undeclared argument, and only the bare coded call binds.
+    assert regrade_trajectories.submitted_solutions(episode, fixed.registry.get("submit_solution")) == [("y", None)]
+
+
+def test_submitted_solutions_read_arguments_the_way_the_environment_admitted_them():
+    """The environment admits a Python-literal ``arguments`` string (single quotes, ``True``/``None``)
+    and runs the submission; a re-grade reading JSON alone would drop that submission and score the
+    episode on a different prefix than the one the run graded."""
+    tool_calls = [
+        {"function": {"name": "submit_solution", "arguments": "{'code': 'print(1)', 'language': 'python'}"}},
+        {"function": {"name": "submit_solution", "arguments": {"code": "print(2)", "language": "python"}}},
+    ]
+    episode = {"messages": [{"role": "assistant", "tool_calls": tool_calls}]}
+    env = CodeContestsEnvironment(language=["python", "cpp"], sandbox_backend="local")
+    assert regrade_trajectories.submitted_solutions(episode, env.registry.get("submit_solution")) == [
+        ("print(1)", "python"),
+        ("print(2)", "python"),
     ]
 
 

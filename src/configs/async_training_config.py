@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, fields
 from math import isfinite
 from typing import Any, Literal
 
-from src.args.mixins import AdvantageShapingArguments, ChunkedLogprobsArguments
+from src.args.mixins import AdvantageShapingArguments, ChunkedLogprobsArguments, GRPOEarlyStopArguments
 from src.configs.rollout_config import (
     DEFAULT_EPISODE_TIMEOUT_SECONDS,
     DEFAULT_MAX_RETRIES,
@@ -19,12 +19,14 @@ from src.configs.rollout_config import (
     DEFAULT_THINKING_BUDGET_SCOPE,
     DEFAULT_THINKING_TURN_RESERVE,
     REASONING_BUDGET_TEMPLATE_VAR,
+    REASONING_END_TOKEN_EXAMPLES,
     REASONING_SCOPE_TEMPLATE_VAR,
     THINKING_BUDGET_SCOPES,
     THINKING_SCOPE_EPISODE,
     RolloutConfig,
     ThinkingBudgetScope,
 )
+from src.distributed.runtime import is_global_main_process
 from src.env import WATCHDOG_WARN_FRACTION, resolve_nccl_timeout_minutes
 
 logger = logging.getLogger(__name__)
@@ -60,7 +62,7 @@ def rollout_field_sources(config_cls) -> dict[str, str]:
 
 
 @dataclass
-class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
+class AsyncTrainingConfig(AdvantageShapingArguments, GRPOEarlyStopArguments, ChunkedLogprobsArguments):
     """Async training infrastructure: Ray workers, rollout-server connections, weight sync, rollout
     prefetch. Environment selection is in EnvironmentConfig, the trainer in
     src/trainers/grpo/environmental.py."""
@@ -204,10 +206,12 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
     rollout_reasoning_end_token: str = field(
         default=DEFAULT_REASONING_END_TOKEN,
         metadata={
-            "help": "The token that closes the model's reasoning (Qwen3.x '</think>'); under "
+            "help": "The string the server's reasoning parser ends reasoning with, encoded as vLLM encodes it "
+            f"({REASONING_END_TOKEN_EXAMPLES}). "
+            "Wherever a vLLM thinking budget can bind, a forced run of its ids gets ratio 0 in the loss (under "
+            "the turn scope a marker holding none of the tokenizer's added tokens only warns). Under "
             "rollout_thinking_budget_scope=episode a turn's reasoning is counted as the sampled ids up to and "
-            "including it. Resolved through the tokenizer by the trainer and the eval scripts; it must be a "
-            "token of it."
+            "including it, which needs it to be one added token."
         },
     )
 
@@ -237,19 +241,6 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
         },
     )
 
-    isr_band_min: float | None = field(
-        default=None,
-        metadata={
-            "help": "Bidirectional TOKEN band on the vLLM->trainer IS ratio: a corrected token whose "
-            "raw ratio leaves [isr_band_min, isr_band_max] is MASKED (ratio 0, gradient removed) instead "
-            "of merely truncated — the production-convergent MoE-mismatch treatment (GLM-5, IcePop). "
-            "Set both bounds to activate; start [0.5, 2]. None (default) = truncation only."
-        },
-    )
-    isr_band_max: float | None = field(
-        default=None,
-        metadata={"help": "Upper bound of the token band (see isr_band_min)."},
-    )
     isr_geo_band_min: float | None = field(
         default=None,
         metadata={
@@ -337,6 +328,15 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
             "`sampling/is_masked_token_frac`. None (default) = off; 0.3-0.5 is a sane range."
         },
     )
+    early_stop_on_skipped_updates: bool = field(
+        default=False,
+        metadata={
+            "help": "Early stop (GRPOEarlyStopArguments): end training once the trust-region breaker "
+            "(`skip_update_masked_frac`) skipped every update on `early_stop_patience` readings in a row (one "
+            "generation round each at `logging_steps: 1`). Past that the policy is frozen where the rollouts no "
+            "longer agree with it, and the run only spends compute. Raises without `skip_update_masked_frac`."
+        },
+    )
 
     truncation_alarm_rate: float | None = field(
         default=0.25,
@@ -354,12 +354,12 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
     drop_degenerate_groups: bool = field(
         default=True,
         metadata={
-            "help": "Drop GRPO groups whose completions ALL scored the same reward. Their advantage is "
-            "already 0 (no policy gradient), but their tokens would still inflate the loss normalizer and "
-            "dilute the groups that do carry signal — on a sparse verifiable reward these dead groups "
-            "dominate the batch. Masking them restores the effective batch size (the cheap half of DAPO's "
-            "dynamic sampling: drop, without resampling replacements). Logged as "
-            "`sampling/degenerate_group_frac`. Default on."
+            "help": "Drop GRPO groups whose completions ALL settled the same environment reward (grade, "
+            "shaping and external scores; the trainer's effort-length terms excluded, since they make every "
+            "total distinct). Such a group has no contrast to learn from beyond the length terms, and its "
+            "tokens would still inflate the loss normalizer and dilute the groups that do carry signal. "
+            "Masking them restores the effective batch size (the cheap half of DAPO's dynamic sampling: "
+            "drop, without resampling replacements). Logged as `sampling/degenerate_group_frac`. Default on."
         },
     )
 
@@ -625,6 +625,12 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
         # A rate is never above 1, so a threshold at 1 would never fire.
         if self.truncation_alarm_rate is not None and not 0.0 <= self.truncation_alarm_rate < 1.0:
             raise ValueError(f"truncation_alarm_rate must be in [0, 1) or null, got {self.truncation_alarm_rate}")
+        # The breaker is the only writer of the skip flag: without it the condition could never fire.
+        if self.early_stop_on_skipped_updates and self.skip_update_masked_frac is None:
+            raise ValueError(
+                "early_stop_on_skipped_updates needs skip_update_masked_frac: the trust-region breaker is "
+                "what skips an update, so without it the condition never holds."
+            )
         if not isinstance(self.rollout_chat_template_kwargs, Mapping):
             raise ValueError(
                 "rollout_chat_template_kwargs must be a mapping of template variables, got "
@@ -643,6 +649,9 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
                 "rollout_thinking_budget_scope, which sets it."
             )
         self._validate_backend_capabilities()
+
+    def _stops_on_skipped_updates(self) -> bool:
+        return self.early_stop_on_skipped_updates
 
     def _validate_effort_length_terms(self) -> None:
         """A NaN passes every ordered comparison, a non-positive scale inverts or zeroes the price, and a
@@ -705,6 +714,11 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
             return [c["url"] for c in self.rollout_server_configs]
         return [self.rollout_server_url]
 
+    def prefetch_active(self) -> bool:
+        """Whether the run prefetches: ``enable_prefetch`` with two or more rollout servers. A weight sync
+        pauses a lone engine for its whole push, so with one server there is nothing to overlap against."""
+        return self.enable_prefetch and len(self.get_server_urls()) > 1
+
     def rollout_template_variables(self) -> dict[str, Any]:
         """The run-wide chat-template variables every request and every trainer-side render carries: the
         YAML's ``rollout_chat_template_kwargs`` plus, under the episode thinking scope, the scope variable
@@ -723,10 +737,10 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
     ):
         """Build RolloutConfig from this config. ``stop_token_ids`` (from ``rollout_stop_tokens``) and
         ``reasoning_end_token_id`` (from ``rollout_reasoning_end_token``) are resolved by the caller that
-        owns the tokenizer; the episode thinking scope refuses to count reasoning without the latter.
-        ``in_process_group`` says the rollout runs inside a training process group, whose NCCL collective
-        watchdog its timeouts must stay under (the trainer, the default); an eval sampling under a
-        training contract joins none and passes False."""
+        owns the tokenizer; the latter only matters under the episode thinking scope, whose reasoning
+        count refuses to run without it. ``in_process_group`` says the rollout runs inside a training
+        process group, whose NCCL collective watchdog its timeouts must stay under (the trainer, the
+        default); an eval sampling under a training contract joins none and passes False."""
         if in_process_group:
             self._validate_timeouts_against_nccl_watchdog()
         mirrored = {target: getattr(self, source) for target, source in rollout_field_sources(type(self)).items()}
@@ -762,7 +776,8 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
                 f"episode_timeout (keep ≥15 min margin so the cancelled rank can unwind and rejoin), or "
                 f"lower episode_timeout."
             )
-        if self.episode_timeout >= WATCHDOG_WARN_FRACTION * watchdog:
+        # Every rank builds a rollout config; a warning about the config itself is said once.
+        if self.episode_timeout >= WATCHDOG_WARN_FRACTION * watchdog and is_global_main_process():
             logger.warning(
                 f"episode_timeout ({self.episode_timeout:.0f}s) is within "
                 f"{(1 - WATCHDOG_WARN_FRACTION) * 100:.0f}% of the NCCL watchdog "
@@ -773,7 +788,7 @@ class AsyncTrainingConfig(AdvantageShapingArguments, ChunkedLogprobsArguments):
         attempts = self.max_retries + 1
         backoff = self.retry_base_wait * (2**self.max_retries - 1)
         worst_case = attempts * self.request_timeout + backoff
-        if worst_case >= WATCHDOG_WARN_FRACTION * watchdog:
+        if worst_case >= WATCHDOG_WARN_FRACTION * watchdog and is_global_main_process():
             logger.warning(
                 f"Rollout retry budget (~{worst_case:.0f}s = {attempts}×{self.request_timeout:.0f}s "
                 f"request_timeout + backoff) is close to the {watchdog:.0f}s NCCL collective watchdog. "

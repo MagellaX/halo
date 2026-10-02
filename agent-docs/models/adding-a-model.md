@@ -17,7 +17,7 @@ Multimodal models work too: the loaders resolve the class through `resolve_auto_
 
 Auto-detection covers a family whose attention the installed kernels already run. It falls short on a head dim no flash kernel accepts, a NaN-prone backward, attention sinks, or position IDs the modeling never forwards.
 
-Two seams handle those. `resolve_attn_implementation` (`src/models/patches/attention.py`) narrows the backend from the family's own capabilities; `apply_family_attention_patches` (`src/models/loading/model_preparation.py`) applies the family's patches to trainable and frozen loads alike.
+Two seams handle those. `resolve_attn_implementation` (`src/models/patches/attention.py`) narrows the backend from the family's own capabilities; `apply_family_attention_patches` (`src/models/loading/model_preparation.py`) applies the family's patches, keyed on that backend, to trainable and frozen loads alike, and returns the implementation both loaders build with (the backend, or a variant of it such as Gemma 4's `sdpa_flex_sliding`).
 
 Add the family predicate beside the existing ones and wire it into whichever seam applies. The per-family matrix is in [Flash Attention](../optimization/flash-attention.md#model-specific-handling).
 
@@ -130,7 +130,7 @@ No hook may allocate state sized by `world_size` either — invisible at 8 GPUs,
 
     A family with a non-standard combine (DeepSeek-V4 and GLM-5 Next's clamped SwiGLU, Step-3.7's post-activation clamp) rebinds it in `_init_expert_compute`: a `functools.partial` over the kernel with the family's bound, or a bound method for a gate no kernel implements.
 
-    Latch it rather than overriding `_glu_combine`. The construction summary names the latched callable, so an override makes the reported combine and the running one two declarations that can disagree.
+    Latch it rather than overriding `_glu_combine`. The construction summary names the latched callable, so an override makes the reported combine and the running one two declarations that can disagree, and the fused `[gate | up]` path runs a latch's packed form without calling `_glu_combine` at all.
 
 - `_OPTIONAL_ROUTING_KNOBS` — for a `EPGroupLimitedMoELayerBase` family only: the routing knobs (any spelling) its block, router and config genuinely do not declare, so the shared `_init_routing` may substitute a neutral default.
 
@@ -202,7 +202,7 @@ Upstream Liger's `MODEL_TYPE_TO_APPLY_LIGER_FN` doesn't cover every supported mo
 
 1. **Name the classes that fill each role** — `rms_norm`, `gated_rms_norm` (a linear-attention block's `norm(x) * w * act(gate)`, served by `fla`), `glu_mlp`, `causal_lm`.
 
-    Then the variant parameters: `rms_norm_offset` / `rms_norm_casting_mode` for a Gemma-style `(1 + w)` norm or an fp32 weight multiply, `logit_scale_attr` for a head that scales its logits, `router_aux_loss_in_head` for a head that adds the router aux loss after the projection, `rope=True` only for a full-width `rotate_half` rotary.
+    Then the variant parameters: `rms_norm_offset` / `rms_norm_casting_mode` for a Gemma-style `(1 + w)` norm or an fp32 weight multiply, `rms_norm_kernel="native"` to serve an offset-free norm with torch's fused `F.rms_norm` instead of Liger's, `logit_scale_attr` for a head that scales its logits, `router_aux_loss_in_head` for a head that adds the router aux loss after the projection, `rope=True` only for a full-width `rotate_half` rotary.
 
     A `trust_remote_code` family sets `remote_classes` instead of `modeling_module`; its patch fires when transformers loads the modeling file.
 

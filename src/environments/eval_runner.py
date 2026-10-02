@@ -2,7 +2,7 @@
 OpenAI-compatible endpoint (vLLM or OpenRouter) and aggregate rewards.
 
 Offline counterpart to :mod:`~src.environments.ray_actors`: same env ``reset``/``step`` loop, episodes
-run concurrently via ``asyncio`` (``env.step`` offloaded to a worker thread because tool/submit
+run concurrently via ``asyncio`` (a sync env's ``step`` offloaded to a worker thread because tool/submit
 handlers block on sandboxed execution). Eval scripts build examples and call :func:`collect_results` +
 :func:`report`.
 
@@ -29,11 +29,15 @@ from openai import NOT_GIVEN, APIStatusError, APITimeoutError, AsyncOpenAI
 from src.configs.rollout_config import RolloutConfig
 from src.data.sources.paths import parse_dataset_source
 from src.environments.base import (
+    ANSWER_KEY,
     EPISODE_ERROR_KEY,
     EPISODE_INVALID_REASON_KEY,
+    RANDOM_REASONING_EFFORT,
     BaseEnvironment,
     Trajectory,
     solve_verdict,
+    stable_reasoning_effort,
+    task_prompt,
 )
 from src.environments.engine_wire import generation_control_fields
 from src.environments.episode import (
@@ -56,9 +60,9 @@ logger = logging.getLogger(__name__)
 # Per-generation HTTP timeout (seconds). Generous by default: eval runs many episodes concurrently
 # against one endpoint, and a long reasoning turn queued behind them takes minutes to come back.
 DEFAULT_REQUEST_TIMEOUT_S = 180.0
-# ``info`` keys a persisted trajectory leaves out: the row payload and the raw tool-call log, which the
-# messages already carry; ``_``-prefixed grading stamps (hidden tests, checker source) go with them.
-_SERIALIZED_INFO_DROP = frozenset({"tool_calls", "context"})
+# ``info`` keys a persisted trajectory leaves out: the row payload; ``_``-prefixed grading stamps
+# (hidden tests, checker source) go with it.
+_SERIALIZED_INFO_DROP = frozenset({"context"})
 # The sample-record key of an episode that lost a generation on the driver's side past every retry: it
 # carries no verdict. Stamped on the trajectory under the private key, which the serializer drops.
 GENERATION_ERROR_KEY = "generation_error"
@@ -172,7 +176,7 @@ def require_answers(env: BaseEnvironment, examples: list[dict[str, Any]], source
     """Refuse examples an answer-graded environment cannot grade, before any episode runs: the
     trainer's dataset gate (``requires_answer``) for the eval drivers, which would otherwise generate
     every episode in full and then fail to grade it. ``source`` names where the answer was read from."""
-    if env.requires_answer and any("answer" not in example["context"] for example in examples):
+    if env.requires_answer and any(ANSWER_KEY not in example["context"] for example in examples):
         raise ValueError(
             f"{type(env).__name__} grades each episode against an expected answer (requires_answer), but "
             f"{source} carries none."
@@ -240,13 +244,17 @@ async def run_episode(
 ) -> Trajectory | None:
     """Drive one episode: ``env.reset`` → (generate → ``env.step``)* until done; return the trajectory.
 
-    ``env.reset``/``env.step`` run in a worker thread because submit/tool handlers block on sandboxed
-    execution; offloading keeps the event loop free so episodes overlap. A turn runs under the training
-    rollout's retry policy (:func:`generate_turn`); a generation that still fails ends the episode
-    early, stamped :data:`EPISODE_ERROR_KEY`, and also :data:`_DRIVER_FAULT_KEY` unless the request
-    itself caused it (:func:`_is_request_fault`). ``rollout.model_name`` unset means the endpoint
-    serves exactly one model.
+    A sync env's ``env.reset``/``env.step`` run in a worker thread because submit/tool handlers block on
+    sandboxed execution, an async env's on the loop (:class:`EpisodeDispatcher`), so episodes overlap.
+    A turn runs under the training rollout's retry policy (:func:`generate_turn`); a generation that
+    still fails ends the episode early, stamped :data:`EPISODE_ERROR_KEY`, and also
+    :data:`_DRIVER_FAULT_KEY` unless the request itself caused it (:func:`_is_request_fault`).
+    ``rollout.model_name`` unset means the endpoint serves exactly one model.
     """
+    # A "random" level is drawn from the problem (as the trainer's eval does), so a rerun or another
+    # checkpoint scores each problem at the same level.
+    if env.reasoning_effort == RANDOM_REASONING_EFFORT and not (context or {}).get("reasoning_effort"):
+        context = {**(context or {}), "reasoning_effort": stable_reasoning_effort(prompt)}
     # Bound through the same helper as the training rollout, so the level and its implied budget match
     # what the policy was trained under. The resolved draw is stamped back into the reset context so
     # per-episode effort-conditioned setup (interaction budgets) sees the level being used.
@@ -260,9 +268,6 @@ async def run_episode(
     )
     if effort.level is not None:
         context = {**(context or {}), "reasoning_effort": effort.level}
-    # The per-episode contract, narrowed as the training actor narrows it, so the engine enforces the
-    # level's CoT budget here too rather than the trajectory only recording it.
-    episode_rollout = replace(rollout, max_tokens=effort.max_tokens)
     reasoning_spent = 0
 
     episode = EpisodeDispatcher(env)
@@ -281,8 +286,13 @@ async def run_episode(
         for _ in range(env.max_turns):
             if step.done:
                 break
-            # The engine cap this turn: the level's budget, or under the episode scope what it has left.
-            turn_rollout = replace(episode_rollout, max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent))
+            # The per-turn contract, narrowed as the training actor narrows it, so the engine enforces
+            # the level's CoT budget here too rather than the trajectory only recording it.
+            turn_rollout = replace(
+                rollout,
+                max_tokens=effort.turn_max_tokens(reasoning_spent),
+                max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent),
+            )
             try:
                 gen = await generate_turn(
                     partial(_request_turn, client, step.observation, tools, turn_rollout, effort),
@@ -352,6 +362,9 @@ async def collect_results(
     :func:`~src.environments.engine_wire.generation_control_fields`, so an eval samples the policy the
     way training does.
 
+    An example's prompt reaches the environment reduced by :func:`task_prompt`, as the trainer reduces it,
+    so a conversation hands it its last user turn; one with no user turn raises before any episode runs.
+
     Each result is ``{"group", "id", "samples": [{"reward", "success", "stats"}, ...]}``. A sample is a
     success on the environment's own solve verdict where it reports one (:func:`_solved`), else when
     reward ≥ ``success_threshold``. A sample whose generation failed on the driver's side past every
@@ -367,14 +380,15 @@ async def collect_results(
         max_thinking_tokens=rollout.max_thinking_tokens,
         turn_reserve=rollout.thinking_turn_reserve,
     )
+    tasks = [task_prompt(example["prompt"]) for example in examples]
     semaphore = asyncio.Semaphore(max_workers)
 
-    async def one(example) -> dict[str, Any]:
+    async def one(example, task) -> dict[str, Any]:
         async def sample():
             # Isolated: an escaping exception would cancel the sibling tasks in the gather.
             try:
                 async with semaphore:
-                    traj = await run_episode(env, example["prompt"], example["context"], client, rollout=rollout)
+                    traj = await run_episode(env, task, example["context"], client, rollout=rollout)
                 reward = traj.total_reward if traj and traj.done else 0.0
                 stats = (traj.info.get("_eval_stats") if traj else None) or {}
                 rec: dict[str, Any]
@@ -402,7 +416,7 @@ async def collect_results(
         samples = await asyncio.gather(*[sample() for _ in range(num_samples)])
         return {"group": example.get("group"), "id": example.get("id"), "samples": samples}
 
-    return await asyncio.gather(*[one(ex) for ex in examples])
+    return await asyncio.gather(*[one(example, task) for example, task in zip(examples, tasks, strict=True)])
 
 
 def _solved(env: BaseEnvironment, traj: Trajectory | None, reward: float, success_threshold: float) -> bool:
@@ -453,7 +467,7 @@ def report(results: list[dict[str, Any]], *, num_samples: int, title: str, group
     """Log overall mean-reward / success@k, per-episode trajectory telemetry, and an optional
     per-``group`` breakdown. The whole report is emitted as one ``logger.info`` record (no ``print``)."""
     k = num_samples
-    lines = [f"=== {title} ({len(results)} examples × {k} samples) ==="]
+    lines = [f"{title} ({len(results)} examples × {k} samples)"]
 
     overall = summarize(results, k)
     line = f"overall: n={overall['n']}  mean_reward={overall['mean_reward']:.3f}  success@1={overall['success@1']:.3f}"

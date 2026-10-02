@@ -120,6 +120,7 @@ depends on whether the mode transforms the model at construction — see
 | `router_balancing_biases.pt` | Yes | Yes | DeepSeek-V3 router balancing biases, restored on resume |
 | `reference_logps.pt` | Yes | Yes | DPO/KTO `precompute_ref_log_probs` columns per split, attached on resume in place of the sweep ([DPO — Resuming a precompute run](../training-methods/preference/dpo.md#resuming-a-precompute-run)) |
 | `rng_state_<rank>.pth` | Yes | No | Per-rank RNG state (`rng_state.pth` single-process) |
+| `prefetch_pending-<rank>-of-<world>.pt` | Yes | Yes | Async GRPO with prefetch only: the rounds a rank submitted but had not trained and the layout they were drawn under, submitted again first on a resume under that layout ([Multiple servers and prefetch](../training-methods/grpo/async-grpo/setup.md#multiple-servers-and-prefetch)) |
 | `resume_adapter/`, `resume_adapter.json` | Yes | Yes | `merge_expert_lora_on_save` and embedding LoRA only: the unmerged adapter the merged checkpoint resumes from, and the marker that says so ([Merge-on-save checkpoints](#merge-on-save-checkpoints)) |
 
 `optimizer.pt` is dropped under every
@@ -155,10 +156,10 @@ The exported `config.json` is serialized with run-scoped router mutations restor
 destroy the hub's aux coefficient for later stages and make plain-transformers consumers pay the
 router-logit plane on every forward.
 
-It is also written in the flat form the pinned rollout server parses. transformers 5.16 serializes a
-family's per-layer attention geometry only as `per_layer_config`, which the server's transformers
-(the 5.14 line, [Rollout Servers](../infrastructure/rollout-servers.md#config-schema-parity))
-refuses at parse.
+It is also written in the flat form the pinned vLLM server parses. transformers 5.16 serializes a
+family's per-layer attention geometry only as `per_layer_config`, which the vLLM server's transformers
+(the 5.14 line, [Config-schema parity](../infrastructure/rollout-servers.md#config-schema-parity)) refuses at
+parse (SGLang's 5.12.1 reads the flat form too).
 
 A family declaring `_LEGACY_PER_LAYER_CONFIG_KEYS` on its EP layer class (Gemma 4:
 `global_head_dim`, `num_global_key_value_heads` — the full-attention layers' geometry) has every
@@ -292,12 +293,13 @@ read directly.
 | vLLM 0.26.0 `FusedMoE` (`cohere2_moe`) | Cohere2 MoE | loaded directly |
 | vLLM 0.26.0 `step3p5` | Step-3.7 Flash | not needed — the EP-gathered save writes the hub `moe.*` tensors |
 | vLLM 0.26.0 per-expert-only | GLM-4 MoE Lite, Laguna, LFM-2, Bailing/Ling 2.0 | hard-fail or silent drop — un-fuse first |
-| vLLM 0.26.0 — no model class | Mistral4, Ling 3.0 (`bailing_hybrid`), Ring (`bailing_moe_linear`) | not servable at all ([Mistral4](../models/mistral4.md#serving), [Bailing](../models/bailing.md)) |
-| vLLM 0.26.0 — export layout not read | Inkling, DeepSeek-V4, GLM-5 Next (module-spelled exports, [below](#expert-parallelism-ep-eptp-epcp)), Zaya (no class) | not servable ([DeepSeek-V4](../models/deepseek-v4.md), [Zaya](../models/zaya.md)) |
+| vLLM 0.26.0 — no model class | Mistral4, Ling 3.0 (`bailing_hybrid`), GLM-5 Next, Ring — its `BailingMoeLinearV2ForCausalLM` matches no registered architecture ([Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves)) | not servable at all ([Mistral4](../models/mistral4.md#serving), [Bailing](../models/bailing.md)) |
+| vLLM 0.26.0 — export layout not read | Inkling, DeepSeek-V4 (module-spelled exports, [below](#expert-parallelism-ep-eptp-epcp)), Zaya (no class) | not servable ([DeepSeek-V4](../models/deepseek-v4.md), [Zaya](../models/zaya.md)) |
 
 SGLang 0.5.17 reads each family's hub layout through its own per-family loader, so the same un-fuse
-rule applies; it registers no class for Mistral4, Ling 3.0 or Ring either, and its DeepSeek-V4 and
-Zaya loaders read per-expert layouts the gathered export does not carry.
+rule applies; it registers no class for Mistral4, Ling 3.0 or GLM-5 Next, none matching Ring's
+architecture either, and its DeepSeek-V4 and Zaya loaders read per-expert layouts the gathered export
+does not carry.
 
 **MLA backend on Blackwell.** GLM-4 MoE Lite uses MLA; flashinfer's MLA kernel rejects its head
 config on SM100+ — serve with vLLM `--attention-backend CUTLASS_MLA` or SGLang
@@ -315,8 +317,9 @@ the router under ep1 sharding), resolved via `full_tensor()`; and manually TP-sh
 `model._tp_sharded_non_dtensor`.
 
 An export casts weights to the save dtype (BF16) except three keep-sets that hold their trained dtype:
-normalization params, the live router-balancing tensors, and the family's fp32 pins; a training
-checkpoint casts nothing ([What gets saved](#what-gets-saved)). Under EP+CP the
+normalization params, the live router-balancing tensors, and the family's fp32 pins (a pinned buffer
+such as GLM-5 Next's `e_score_correction_bias` included); a training checkpoint casts nothing
+([What gets saved](#what-gets-saved)). Under EP+CP the
 iteration runs on the unwrapped model with an explicit CP-prefix strip, so attention weights land
 under their hub names; experts are replicated per CP rank (EP ⊥ DP), so any rank holds the complete
 set.
@@ -393,8 +396,8 @@ python scripts/after_training/merge_ep_shards.py \
 ```
 
 The merge copies the resume sidecars (`scheduler.pt`, `router_balancing_biases.pt`,
-`reference_logps.pt`, `rng_state_*`) while excluding stale weight artifacts, so the merged directory
-resumes weights, scheduler, balancing biases and precomputed reference log-probs — but **not** the
+`reference_logps.pt`, `rng_state_*`, `prefetch_pending-*`) while excluding stale weight artifacts, so the merged directory
+resumes weights, scheduler, balancing biases, precomputed reference log-probs and pending prefetch rounds — but **not** the
 optimizer: the per-rank `optimizer_shard_XXXXX.pt` files are weight-suffixed and dropped, so a resume
 from the merged directory warm-restarts. A resume pointed at
 the unmerged directory raises the merge-first error directly.
@@ -609,7 +612,7 @@ WandB does **not** auto-continue the same run — export `WANDB_RUN_ID` (see [Mu
 | **FSDP2** (standard DP) | A at `use_grouped_gemm: false`, else B | Path A: `load_full_state_dict()` → `set_model_state_dict(broadcast_from_rank0)` into DTensor params. Path B: the weights are already in the model from construction and the loader skips the re-read | Per-rank FSDP2 shards | Exact resume, same world size |
 | **TP** | B | Weights load at construction and `_load_tp` skips the re-read. Where it does read (a best-model reload, or a model built from elsewhere), each rank streams the checkpoint's full tensors and `distribute_tensor`s them into its own DTensor placements; TP+DP instead raises for a model not constructed from the checkpoint | Per-rank shards | Exact resume, same world size |
 | **CP** | B | Skipped — weights via `load_distributed_model()` | Per-rank shards (matching fingerprint) | Checkpoint has HF keys, model has CP wrapper keys |
-| **EP / ETP / EP+CP / EP+TP** | B | Skipped in the loader — the trained weights load at construction because the model source points at the checkpoint | Per-rank shards (matching fingerprint) | Checkpoint has unfused HF keys the EP-fused 3D model cannot reload |
+| **EP / ETP / EP+CP / EP+TP** | B | Skipped in the loader — the trained weights load at construction because the model source points at the checkpoint | Per-rank shards (matching fingerprint) | Checkpoint holds the hub-spelled full expert tensors, not the renamed rank-local slices the EP model registers |
 | **PP / PP+EP** ([not yet available](../parallelism/pipeline-parallelism.md)) | stage-aware | Each rank reads only its stage's global-named tensors from the merged index and remaps them through `global_parameter_name`; a missing stage-retained tensor raises. On per-node output storage the locally-absent cross-stage tensors are skipped — the stage build drops them anyway | Per-rank shards, gated on the fingerprint **and** `pp_stage_partition` | Any topology drift **raises** (no warm-restart fallback). PP+EP expert weights load at construction |
 
 Path B modes transform the model at init (EP fuses experts into 3D tensors; CP wraps attention), so
@@ -659,9 +662,9 @@ Because the Path-B base is rebuilt fresh, two classes of trained state are resto
 > Under `bias_update` the balancing state lives in the family's own checkpoint slot (native buffer,
 > adopted `router.bias`/`e_score_correction_bias`/`expert_bias`, or a slot materialized on an LFM-2
 > `use_expert_bias: false` checkpoint). It rides `model.safetensors` at its **trained fp32 dtype**
-> and serves exactly as trained. `balancing_param_keys` exempts it from the bf16 save cast, and the
-> `e_score_correction_bias` families additionally pin the slot fp32 at load through upstream's
-> `_keep_in_fp32_modules_strict`.
+> and serves exactly as trained. `balancing_param_keys` exempts it from the bf16 save cast, and GLM-4
+> MoE Lite, GLM-5 Next and DeepSeek-V4 additionally pin their `e_score_correction_bias` fp32 at load
+> through upstream's `_keep_in_fp32_modules_strict`.
 >
 > Under `bias_update_transient` the bias is a plain per-layer attribute, deliberately off the
 > sharded state, and exports **nowhere**
@@ -801,16 +804,14 @@ A fingerprint mismatch falls back to warm restart with a warning naming the diff
 Shards absent on every rank warm-restart only when nothing proves state was written. If the
 directory still holds other ranks' `optimizer_shard_*.pt` or a fingerprint-matched
 `optimizer_meta.pt` (a non-shared filesystem whose restart permuted the rank→node placement), the
-resume raises instead. Restore the original placement, or delete every `optimizer_shard_*.pt` and
-`optimizer_meta.pt` to accept the warm restart.
+resume raises instead. Restore the original placement, or take the warm-restart opt-in below.
 
 Shards present on only a subset under a matching fingerprint are a torn checkpoint and raise.
 
 Shards whose `optimizer_meta.pt` carries **no fingerprint at all** are refused outright in every
 mode, with no warm-restart fallback. Nothing records the sharding that produced those raw local
-layouts, and the rank-count gate alone admits a permuted restore at the same world size. Delete
-every `optimizer_shard_*.pt` and `optimizer_meta.pt` to resume the weights, step and LR schedule
-with a fresh optimizer.
+layouts, and the rank-count gate alone admits a permuted restore at the same world size. The
+warm-restart opt-in below resumes the weights, step and LR schedule with a fresh optimizer.
 
 That verdict is consensused before any rank branches on it. On a non-shared filesystem
 `optimizer_meta.pt` is written once per node, so a heterogeneous meta set (one node holding a
@@ -862,14 +863,10 @@ and, under `save_total_limit: 1`, rotate the last good one away at exit code 0.
 
 ## Multi-node
 
-**Shared output FS (default):** all ranks see the same dir; only rank 0 saves;
-`detect_resume_checkpoint()` broadcasts the path from rank 0.
-
-**Non-shared output FS** (`DIST_OUTPUT_SHARED_FILESYSTEM=0`, or the `DIST_SHARED_FILESYSTEM=0`
-umbrella): the trainer auto-forces `save_on_each_node=true`, so each node's local rank 0 saves
-independently; all nodes must have equivalent checkpoint dirs at the same path. Directory creation is
-FS-aware: shared = global rank 0 creates; non-shared = each node's local rank 0 creates, then a
-barrier.
+The save rank follows the output filesystem ([above](#checkpoints-and-training-resume)). On a shared
+one `detect_resume_checkpoint()` broadcasts the path from rank 0. On a non-shared one the trainer
+auto-forces `save_on_each_node=true`, all nodes must hold equivalent checkpoint dirs at the same
+path, and each node's local rank 0 creates the directory before a barrier.
 
 **WandB run resumption:** the auto run ID is stamped per launch, so a resumed launch starts a new run;
 export `WANDB_RUN_ID` (and `WANDB_RESUME=allow`) to continue
@@ -904,7 +901,7 @@ checkpoint-specific.
   include `"tp"`, and all ranks must reach the same checkpoint dir.
 
     A 2-D `(dp, tp)` mesh resolves to its `tp` sub-mesh. The weights are gathered, so only the
-    optimizer shards pin `tp_size` to save time.
+    optimizer shards need it: pin `tp_size` to the saving run's value.
 
 - **OOM saving TP gathered:** each `full_tensor()` reconstructs one whole matrix on the save rank, so
   a single huge embedding can still exceed host RAM even though the write streams. Lower

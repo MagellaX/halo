@@ -108,23 +108,23 @@ docker run --gpus all --network=host --ipc=host \
 |---|---|---|
 | `rollout_backend` | `vllm` | engine: `vllm` or `sglang` (async GRPO only). SGLang's 0.5.17 loaders refuse a longer family list than vLLM's, quoted at trainer construction; its server needs `NCCL_CUMEM_ENABLE=1` (compose default) and must be the repo's `Dockerfile.sglang` image — `agent-docs/infrastructure/rollout-servers.md#which-families-each-engine-serves` |
 | `rollout_server_url` | `http://localhost:8000` | single-server URL (weight sync + generation) |
-| `rollout_server_configs` | `None` | multi-server: `[{"url": ..., "group_port": ...}]`; overrides `rollout_server_url`, enables prefetch overlap |
+| `rollout_server_configs` | `None` | multi-server: `[{"url": ..., "group_port": ...}]`; overrides `rollout_server_url`; two or more entries enable prefetch overlap |
 | `rollout_connection_timeout` | `120.0` | wait for `/health` |
 | `sync_weights_every_n_steps` | `1` | NCCL weight push cadence |
 | `num_rollout_workers` | `64` | Ray env actors per training rank (`ray_address: null`); with `ray_address` set, one pool of this size split across the ranks |
 | `max_concurrent_rollouts` | `None` | pipeline depth; default 4 × this rank's share of `num_rollout_workers` (the whole pool locally, `÷ world_size` on a shared Ray cluster) |
 | `ray_address` | `None` | shared Ray cluster; `None` = per-rank local |
 | `rollout_temperature` / `rollout_top_p` / `rollout_max_tokens` | `0.7` / `0.95` / `32768` | rollout sampling (max tokens per turn) |
-| `rollout_max_thinking_tokens` | `None` | per-turn CoT cap (vLLM `thinking_token_budget`); needs a server reasoning parser + `VLLM_USE_V2_MODEL_RUNNER=0`, refused under `sglang`. Under the episode scope, the most one turn may take of the episode's budget |
+| `rollout_max_thinking_tokens` | `None` | per-turn CoT cap (vLLM `thinking_token_budget`); needs a server reasoning parser + `VLLM_USE_V2_MODEL_RUNNER=0`, and the IS correction when the reasoning marker resolves; refused under `sglang`. Under the episode scope, the most one turn may take of the episode's budget |
 | `rollout_thinking_budget_scope` | `turn` | what a thinking budget covers: `turn` (each turn whole) or `episode` (the turns share it, each turn capped at what is left). `episode` is vLLM-only, needs `train_on_sampled_tokens`, and without `rollout_max_thinking_tokens` needs the env's `reasoning_effort` and every level's `thinking_tokens` |
 | `rollout_thinking_turn_reserve` | `512` | under the episode scope, the reasoning a turn keeps once the budget is spent; at most `rollout_max_thinking_tokens` and every level's `thinking_tokens` |
-| `rollout_reasoning_end_token` | `</think>` | the token that closes reasoning; under the episode scope a turn's spend is its sampled ids up to and including it |
+| `rollout_reasoning_end_token` | `</think>` | the server parser's reasoning end string, encoded as vLLM encodes it and holding at least one added token (Gemma 4 `<channel\|>`, gpt-oss `<\|start\|>assistant<\|channel\|>final<\|message\|>`); a forced run of its ids gets ratio 0 wherever a vLLM budget can bind, and under the episode scope (one token only) a turn's spend is its sampled ids up to and including it |
 | `rollout_chat_template_kwargs` | `{}` | chat-template variables sent on every rollout request **and** applied to the trainer's own renders (Qwen3.x `preserve_thinking`); `reasoning_effort` and `reasoning_budget` are refused here — they travel per episode — and so is `reasoning_budget_scope`, which follows `rollout_thinking_budget_scope` |
 | `max_train_row_tokens` | `None` | longest training row a rank takes; must exceed `rollout_max_tokens`. Over-cap per-turn rows are left out, whole-trajectory rows train at zero weight (`sampling/rows_over_cap_frac`) |
 | `eval_rollout_batch_size` | `None` | rows per rank in one eval rollout round (eval runs without prefetch); `None` = the eval batch |
 | `effort_length_penalty_k0` / `effort_length_floor_weight` | `None` / `0.0` | both off by default; the first prices an episode's reasoning tokens by its effort level (capped at `effort_length_penalty_c_max`), the second its shortfall against `effort_length_floor_budgets` × the thinking budget it ran under |
 | `episode_timeout` | `1200.0` | per-episode deadline in engine-serving time (a weight-sync pause is credited back), checked against the NCCL watchdog — raise `DIST_NCCL_TIMEOUT_MINUTES` with it |
-| `train_on_sampled_tokens` | `True` | train on the server's actual sampled ids (needs `--return-tokens-as-token-ids`) rather than a re-tokenized re-render |
+| `train_on_sampled_tokens` | `True` | train on the server's actual sampled ids (needs `--return-tokens-as-token-ids`) rather than a re-tokenized re-render; off, a run with a bindable vLLM thinking budget and a resolvable `rollout_reasoning_end_token` is refused |
 | `enable_prefetch` | `True` | overlap rollout with training (auto-disabled in single-server mode) |
 | `num_prefetch_batches` | `1` | prefetch result-queue bound; the pipeline is one round deep, so values above 1 only add headroom |
 | `model_name` / `request_timeout` / `max_retries` / `retry_base_wait` | — | per-request HTTP behavior; `request_timeout` counts engine-serving time like `episode_timeout` |
@@ -146,7 +146,8 @@ merged with `environment_kwargs`, to `resolve_environment(environment_type, conf
 fails before any server is touched. Each term prices one source's score in `[0, 1]` as
 `weight × score ^ exponent` — `environment` (the episode grade), `judge` (a generative judge over
 `requirements`), `reward_model` (a served BT / seq-cls model); the online arm adds `accuracy` and
-`format`. Partial credit is the `exponent` (`> 0`, above 1 convex); there is **no failure offset**,
+`format`. The `exponent` (`> 0`, above 1 convex) reshapes a fractional score (a judge's, a reward
+model's); a binary grade has nothing to reshape. There is **no failure offset**,
 since a constant cancels in the group baseline. Per-term reference:
 `agent-docs/training-methods/grpo/rewards.md`.
 
@@ -160,12 +161,14 @@ the trainer's `_init_weight_sync_client` → `_sync_weights_to_engine`:
 2. `init_communicator(device=cuda:N)` — GETs `/get_world_size`, computes
    `world_size = inference_ws + 1`, advertises `master_address` (arg →
    `VLLM_GROUP_HOST` env → loopback for a local server → default-route NIC)
-   and binds the TCPStore on that address alone (`HALO_WEIGHT_SYNC_BIND_ALL=1`
-   widens it to `0.0.0.0`,
+   and opens the rendezvous listener on that address alone, on `group_port` or a
+   kernel-assigned port when it is 0 (`HALO_WEIGHT_SYNC_BIND_ALL=1` widens it to
+   `0.0.0.0`,
    [group rendezvous](../../agent-docs/infrastructure/rollout-servers.md#group-rendezvous));
-   POSTs `/init_weight_transfer_engine` (server rank_offset=1) while
-   the trainer (rank 0) builds the `StatelessProcessGroup` + `PyNcclCommunicator`
-   concurrently. Done once, while vLLM is idle.
+   only then POSTs `/init_weight_transfer_engine` (server rank_offset=1) with the
+   listener's port, while the trainer (rank 0) hands the listener to the
+   `StatelessProcessGroup` store and builds the `PyNcclCommunicator` concurrently.
+   Done once, while vLLM is idle.
 3. Each sync: the gather calls `update_named_param()` per param, which stages it on the sync
    GPU and flushes a chunk whenever the next param would overflow `HALO_WEIGHT_SYNC_CHUNK_MB`
    (default 1024). The first flush opens the update (`/pause?mode=keep` → `/start_weight_update`);

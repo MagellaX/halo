@@ -33,6 +33,7 @@ from src.environments.episode import (
     TurnGeneration,
     bind_episode_effort,
     reasoning_tokens_of,
+    resolve_reasoning_end_ids,
     resolve_reasoning_end_token_id,
 )
 from src.environments.tools.definitions import NativeToolCall
@@ -94,8 +95,22 @@ def test_scratchpad_cap_reads_episode_budget():
     call_tool(env, traj, "python_repl")
     call_tool(env, traj, "python_repl")
     third = call_tool(env, traj, "python_repl")
-    assert "Test limit reached (2); the scratchpad is exhausted. Submit your solution with submit_solution." in third
+    assert (
+        "Test limit reached (2); the scratchpad is exhausted. Submit your solution with submit_solution "
+        "(2 graded submission(s) left)." in third
+    )
     assert traj.info[TOOL_CALL_COUNTS_KEY]["python_repl"] == 2
+
+
+def test_the_scratchpad_refusal_names_the_submissions_still_left():
+    """A model that keeps calling an exhausted scratchpad is told how many graded submissions remain, so the
+    refusal points at the one action that still counts."""
+    env = _make_env()
+    traj = reset_episode(env, {"reasoning_effort": "low", **SINGLE_TEST_ANSWER})
+    call_tool(env, traj, "submit_solution")
+    call_tool(env, traj, "python_repl")
+    call_tool(env, traj, "python_repl")
+    assert "(1 graded submission(s) left)." in call_tool(env, traj, "python_repl")
 
 
 def test_resubmission_penalty_prices_each_graded_submission_after_the_first():
@@ -217,44 +232,6 @@ def test_tool_descriptions_defer_when_profiles_bind_interaction():
     assert "You get up to 2 graded submissions" in plain.registry.get("submit_solution").description
 
 
-def test_tested_submission_bonus_pays_only_on_test_then_submit():
-    profiles = {"high": {"max_submissions": 1, "max_test_calls": 6, "tested_submission_reward": 0.1}}
-    env = _make_env(reasoning_effort_profiles=profiles)
-
-    def run_episode(test_first: bool) -> tuple[float, dict]:
-        traj = reset_episode(env, {"reasoning_effort": "high", **SINGLE_TEST_ANSWER})
-        if test_first:
-            call_tool(env, traj, "python_repl")
-        call_tool(env, traj, "submit_solution")
-        if not test_first:
-            call_tool(env, traj, "python_repl")
-        env._settle_grade(traj, None)
-        return traj.total_reward, traj.info[REWARD_COMPONENTS_KEY]
-
-    tested_reward, tested_parts = run_episode(test_first=True)
-    oneshot_reward, oneshot_parts = run_episode(test_first=False)
-    assert tested_parts["reward/tested_submission"] == 0.1
-    assert oneshot_parts["reward/tested_submission"] == 0.0  # a test AFTER the submission pays nothing
-    assert tested_reward - oneshot_reward == pytest.approx(0.1)
-    assert tested_reward == pytest.approx(sum(tested_parts.values()))  # composition residue stays 0
-
-
-def test_bonus_only_profile_still_binds_and_scales_by_effort():
-    profiles = {
-        "medium": {"tested_submission_reward": 0.05},
-        "high": {"tested_submission_reward": 0.1},
-    }
-    env = _make_env(reasoning_effort_profiles=profiles)
-    assert env._profiles_bind_interaction
-    med = reset_episode(env, {"reasoning_effort": "medium", **SINGLE_TEST_ANSWER})
-    low = reset_episode(env, {"reasoning_effort": "low", **SINGLE_TEST_ANSWER})
-    assert med.info["episode_tested_submission_reward"] == 0.05
-    assert (
-        med.info[EPISODE_TOOL_BUDGETS_KEY]["submit_solution"] == 2
-    )  # class caps stated when the profile sets no caps
-    assert "episode_tested_submission_reward" not in low.info  # no bonus at that level
-
-
 def test_effort_binding_caps_both_channels():
     # The budget must bound the WHOLE turn: an unbounded visible channel displaces the tool call.
     # Both budgets are stated here so the arithmetic below does not ride on the class defaults.
@@ -311,6 +288,23 @@ def test_turn_scope_caps_every_turn_alike_and_never_exhausts():
     assert turn.budget_exhausted(40000) is False
 
 
+def test_episode_scope_narrows_each_turns_total_with_its_reasoning_cap():
+    """A late turn's reasoning cap shrinks with the spend; its total must shrink with it (cap plus the
+    run's answer headroom, 30000 - 18000 here), or the answer channel inherits the reasoning it lost."""
+    high = _bind_scoped("high", "episode")
+    assert [high.turn_max_tokens(spent) for spent in (0, 17000, 29600)] == [30000, 13000 + 12000, 512 + 12000]
+    low = _bind_scoped("low", "episode")
+    assert low.turn_max_tokens(0) == low.max_tokens == 4096 + 12000
+    assert low.turn_max_tokens(3000) == 1096 + 12000
+    uncapped = _bind_scoped("high", "episode", max_thinking_tokens=None)
+    assert uncapped.turn_max_tokens(29000) == 30000, "no ceiling: the headroom is the whole max_tokens"
+
+
+def test_turn_scope_keeps_every_turns_total_at_the_bound_cap():
+    turn = _bind_scoped("high", "turn")
+    assert {turn.turn_max_tokens(spent) for spent in (0, 17000, 40000)} == {turn.max_tokens}
+
+
 def test_episode_scope_without_a_ceiling_hands_a_turn_the_whole_remainder():
     high = _bind_scoped("high", "episode", max_thinking_tokens=None)
     assert high.thinking_budget == 30000
@@ -348,24 +342,49 @@ def test_spend_of_counts_only_under_the_episode_scope():
 
 
 class _Tokenizer:
-    """The two attributes the resolver reads, over a fixed vocabulary."""
+    """The two attributes the resolver reads: an encoding per text and the ids of the added tokens."""
 
-    def __init__(self, vocab, unk_token_id=0):
-        self._vocab = vocab
-        self.unk_token_id = unk_token_id
+    def __init__(self, encodings, added):
+        self._encodings = encodings
+        self.added_tokens_decoder = dict.fromkeys(added)
 
-    def convert_tokens_to_ids(self, token):
-        return self._vocab.get(token, self.unk_token_id)
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens, "the engine encodes its reasoning end string without special tokens"
+        return list(self._encodings[text])
 
 
-def test_resolve_reasoning_end_token_id_requires_a_token_of_the_tokenizer():
-    """A marker the tokenizer does not know would count every turn's whole generation as reasoning and
-    starve the episode after its first turn, whether the tokenizer answers with unk or with None."""
-    assert resolve_reasoning_end_token_id(_Tokenizer({"</think>": _END}), "</think>") == _END
-    with pytest.raises(ValueError, match="not a token of this tokenizer"):
-        resolve_reasoning_end_token_id(_Tokenizer({"</think>": _END}), "<|end_reasoning|>")
-    with pytest.raises(ValueError, match="not a token of this tokenizer"):
-        resolve_reasoning_end_token_id(_Tokenizer({}, unk_token_id=None), "</think>")
+# ``</think>`` as a added token, a string that splits into plain text, and a close of several tokens
+# around added tokens (gpt-oss's final-channel opener).
+_VOCAB = _Tokenizer(
+    {
+        "</think>": [_END],
+        "<|end_reasoning|>": [11, 12, 13],
+        "": [],
+        "<|start|>assistant<|channel|>final<|message|>": [70, 71, 72, 73, 74],
+    },
+    added={_END, 70, 72, 74},
+)
+
+
+def test_resolve_reasoning_end_ids_encodes_the_marker_as_the_engine_forces_it():
+    """The ids vLLM appends at the budget are its parser's end string encoded without special tokens, one
+    id or several; a string of plain text is no close the model writes."""
+    assert resolve_reasoning_end_ids(_VOCAB, "</think>") == (_END,)
+    assert resolve_reasoning_end_ids(_VOCAB, "<|start|>assistant<|channel|>final<|message|>") == (70, 71, 72, 73, 74)
+    with pytest.raises(ValueError, match="not a reasoning marker of this tokenizer"):
+        resolve_reasoning_end_ids(_VOCAB, "<|end_reasoning|>")
+    with pytest.raises(ValueError, match="not a reasoning marker of this tokenizer"):
+        resolve_reasoning_end_ids(_VOCAB, "")
+
+
+def test_resolve_reasoning_end_token_id_requires_one_control_token():
+    """The episode scope counts a turn's reasoning up to one marker token: one the tokenizer does not write
+    would count every turn's whole generation as reasoning and starve the episode after its first turn."""
+    assert resolve_reasoning_end_token_id(_VOCAB, "</think>") == _END
+    with pytest.raises(ValueError, match="not a reasoning marker of this tokenizer"):
+        resolve_reasoning_end_token_id(_VOCAB, "<|end_reasoning|>")
+    with pytest.raises(ValueError, match="encodes to 5 tokens"):
+        resolve_reasoning_end_token_id(_VOCAB, "<|start|>assistant<|channel|>final<|message|>")
 
 
 def test_stamp_records_budget_exhaustion_only_under_the_episode_scope():
@@ -401,27 +420,6 @@ def test_invalid_profiles_raise():
         _make_env(reasoning_effort_profiles={"low": {"thinking_tokens": 0}})
     with pytest.raises(ValueError, match="must be >= 0"):
         _make_env(reasoning_effort_profiles={"low": {"max_test_calls": -1}})
-    with pytest.raises(ValueError, match="tested_submission_reward.*must be >= 0"):
-        _make_env(reasoning_effort_profiles={"low": {"tested_submission_reward": -0.1}})
-
-
-def test_recovery_cap_tightens_per_level_and_never_exceeds_the_env_cap():
-    env = _make_env(
-        max_length_cutoff_recoveries=3,
-        reasoning_effort_profiles={
-            "low": {"max_submissions": 2, "max_test_calls": 2, "max_length_cutoff_recoveries": 1}
-        },
-    )
-    low = reset_episode(env, {"reasoning_effort": "low", **SINGLE_TEST_ANSWER})
-    assert low.info["episode_max_length_cutoff_recoveries"] == 1
-    high = reset_episode(env, {"reasoning_effort": "high", **SINGLE_TEST_ANSWER})
-    assert "episode_max_length_cutoff_recoveries" not in high.info, "a level without the key runs under the env cap"
-    with pytest.raises(
-        ValueError, match=r"max_length_cutoff_recoveries \(4\) exceeds the env's max_length_cutoff_recoveries \(3\)"
-    ):
-        _make_env(
-            max_length_cutoff_recoveries=3, reasoning_effort_profiles={"low": {"max_length_cutoff_recoveries": 4}}
-        )
 
 
 if __name__ == "__main__":

@@ -1,15 +1,23 @@
-"""OpenAI-compatible tool definitions and registry (vLLM tool-calling format)."""
+"""OpenAI-compatible tool definitions and registry (the tool-calling format both rollout engines take)."""
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.environments.base import Message
 from src.environments.sandbox.base import SandboxAgentFault, SandboxInfraError
+
+# What reading model-authored arguments as JSON or a Python literal raises on malformed text, past a
+# syntax error: an unhashable dict key or set member (``{[1]: 2}``) is a TypeError, deep nesting a
+# RecursionError or MemoryError, and an integer past Python's 4300-digit conversion limit a ValueError
+# that ``json.loads`` raises outside ``JSONDecodeError``.
+MALFORMED_LITERAL_ERRORS = (SyntaxError, ValueError, TypeError, MemoryError, RecursionError)
 
 
 class ToolBudgetExhausted(Exception):
@@ -22,8 +30,9 @@ class ToolBudgetExhausted(Exception):
 
 
 class ToolArgumentError(TypeError):
-    """A call whose model-authored arguments the handler cannot bind: a required parameter missing
-    (``submit_solution`` with no ``code``) or a name it has no keyword for.
+    """A call whose model-authored arguments the tool refuses: a required parameter missing
+    (``submit_solution`` with no ``code``), a name its schema does not declare, a value outside its enum,
+    or a name its handler has no keyword for.
 
     Raised before the handler runs, so the model reads ``Error: <tool>: missing a required argument:
     'code'`` instead of a Python signature. Expected control flow like :class:`ToolBudgetExhausted`:
@@ -31,17 +40,24 @@ class ToolArgumentError(TypeError):
     """
 
 
+def parse_python_expression(source: str) -> ast.expr:
+    """``source`` parsed as one Python expression, without the ``SyntaxWarning`` an invalid escape in a
+    model-written string (``"\\d"``) prints on every parse."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.parse(source.lstrip(" \t"), mode="eval").body
+
+
 def _parse_tool_arguments(raw: str) -> dict[str, Any]:
     """Parse a tool-call ``arguments`` string; ``ast.literal_eval`` repairs Python-dict literals (single
     quotes, trailing commas, ``True``/``None``). Unrecoverable / non-dict input falls back to ``{}``."""
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+    with contextlib.suppress(*MALFORMED_LITERAL_ERRORS):
         try:
-            parsed = ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            return {}
-    return parsed if isinstance(parsed, dict) else {}
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = ast.literal_eval(parse_python_expression(raw))
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 @dataclass
@@ -57,7 +73,7 @@ class ToolParameter:
 
 @dataclass
 class NativeTool:
-    """Tool definition in OpenAI function-calling format (understood natively by vLLM)."""
+    """Tool definition in OpenAI function-calling format (understood natively by the rollout engines)."""
 
     name: str
     description: str
@@ -98,54 +114,45 @@ class NativeTool:
             },
         }
 
-    def bind_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Keep only the arguments this tool declares in :attr:`parameters`.
-
-        The argument dict is model-authored, and the handlers are ``functools.partial`` objects
-        carrying pre-bound safety keywords (the sandbox ``timeout``) that a call-time keyword of the
-        same name silently overrides — a model could raise its own execution timeout. Filtering
-        against the declared schema (the same set advertised in :meth:`to_openai_schema`) keeps a
-        hallucinated or adversarial extra out of the handler.
-
-        A tool that declares no parameters has no schema to filter against — an MCP server may
-        advertise a tool without ``properties`` — so its arguments pass through untouched rather than
-        being silently dropped.
-        """
-        if not self.parameters:
-            return arguments
-        declared = {parameter.name for parameter in self.parameters}
-        return {name: value for name, value in arguments.items() if name in declared}
-
     def _bind_for_call(self, handler: Callable[..., Any], arguments: dict[str, Any]) -> dict[str, Any]:
-        """The schema-filtered arguments, checked against ``handler``'s signature before the call.
+        """The call's arguments checked against the declared schema and ``handler``'s signature.
 
-        Binding up front turns the ``TypeError`` the call itself would raise into
-        :class:`ToolArgumentError`; a handler without an introspectable signature is called unchecked.
+        The schema is what :meth:`to_openai_schema` showed the model, so a name outside it is refused,
+        naming the declared ones: dropped unread, a garbled name loses its value, and a keyword shadowing
+        a handler's pre-bound safety one (the sandbox ``timeout``) would lift that cap. A tool declaring no
+        parameters (an MCP tool without ``properties``) takes its arguments as given. Binding up front
+        turns the call's own ``TypeError`` into :class:`ToolArgumentError`; a handler without an
+        introspectable signature is called unchecked.
         """
-        bound = self.bind_arguments(arguments)
+        declared = [parameter.name for parameter in self.parameters]
+        unknown = [name for name in arguments if name not in declared] if declared else []
+        if unknown:
+            raise ToolArgumentError(
+                f"{self.name}: unknown argument {', '.join(map(repr, unknown))}; its arguments are {', '.join(declared)}"
+            )
         for parameter in self.parameters:
             # The schema is the contract the model was shown: a required parameter left out, or an enum
             # value outside it, is a malformed call refused before the handler (and before the episode's
             # budget), even when the handler would supply a default of its own.
-            if parameter.required and parameter.name not in bound:
+            if parameter.required and parameter.name not in arguments:
                 raise ToolArgumentError(f"{self.name}: missing a required argument: {parameter.name!r}")
-            if parameter.enum and parameter.name in bound and bound[parameter.name] not in parameter.enum:
+            if parameter.enum and parameter.name in arguments and arguments[parameter.name] not in parameter.enum:
                 raise ToolArgumentError(
                     f"{self.name}: {parameter.name} must be one of {', '.join(parameter.enum)}, "
-                    f"got {bound[parameter.name]!r}"
+                    f"got {arguments[parameter.name]!r}"
                 )
         try:
             signature = inspect.signature(handler)
         except (TypeError, ValueError):
-            return bound
+            return arguments
         try:
-            signature.bind(**bound)
+            signature.bind(**arguments)
         except TypeError as e:
             raise ToolArgumentError(f"{self.name}: {e}") from None
-        return bound
+        return arguments
 
     def bind(self, arguments: dict[str, Any], *, for_async: bool = False) -> dict[str, Any]:
-        """Admit a call's model-authored arguments: the schema-filtered set the handler can bind, or
+        """Admit a call's model-authored arguments: the schema-checked set the handler can bind, or
         :class:`ToolArgumentError`. The protocols call it before spending the episode's budget on the
         call, so a call the handler could never run is refused without being counted. ``for_async``
         binds against the handler :meth:`execute_async` will run, which may differ from the sync one; a sync
@@ -155,10 +162,14 @@ class NativeTool:
             raise NotImplementedError(f"Tool '{self.name}' has no handler")
         return self._bind_for_call(handler, arguments)
 
-    def budget_exhausted_message(self, cap: int) -> str:
-        """The observation for a call refused over the episode's cap of ``cap`` calls on this tool."""
+    def budget_exhausted_message(self, cap: int, left: Mapping[str, int]) -> str:
+        """The observation for a call refused over the episode's cap of ``cap`` calls on this tool.
+
+        ``left`` maps each capped tool to the calls it has left, which a ``budget_message`` names as
+        ``{left_<tool>}``, so a refusal can point at the budget that still holds.
+        """
         template = self.budget_message or "{name} limit reached ({cap}); this call was not executed."
-        return template.format(name=self.name, cap=cap)
+        return template.format(name=self.name, cap=cap, **{f"left_{tool}": calls for tool, calls in left.items()})
 
     @staticmethod
     def _as_text(result: Any) -> str:
@@ -215,7 +226,7 @@ class NativeToolRegistry:
         return f"Error: Unknown tool '{name}'. Available tools: {', '.join(sorted(self.names()))}"
 
     def to_openai_tools(self) -> list[dict[str, Any]]:
-        """OpenAI function-calling schemas, passed to vLLM via the ``tools`` parameter."""
+        """OpenAI function-calling schemas, passed to the rollout engine via the ``tools`` parameter."""
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
     def merge(self, other: "NativeToolRegistry") -> "NativeToolRegistry":

@@ -32,8 +32,9 @@ Examples:
         --base_url https://openrouter.ai/api/v1 --api_key "$OPENROUTER_API_KEY" --model qwen/qwen3-235b-a22b
 
 `exam_qa` grades multiple choice by letter: the row needs a `choices` column (the option strings,
-passed through with `--context_fields choices`) and an `answer` that is a letter A-J or a 0-based
-index into `choices` (a raw `cais/mmlu` ships the index); any other answer raises at episode start.
+passed through with `--context_fields choices`) and an `answer` that is a letter A-J or a 0-based int
+index into `choices` (a raw `cais/mmlu` ships the index); any other answer, a digit string included,
+raises at episode start.
 Grading notes: `agent-docs/training-methods/grpo/environments/benchmarks.md`.
 """
 
@@ -54,6 +55,7 @@ from scripts.environments._common import (
 )
 from src.args.environmental_grpo_args import DEFAULT_ANSWER_FIELD
 from src.configs.rollout_config import DEFAULT_ROLLOUT_MAX_TOKENS, DEFAULT_ROLLOUT_TEMPERATURE
+from src.environments.base import ANSWER_KEY
 from src.environments.eval_runner import (
     collect_results,
     load_hf_split,
@@ -158,7 +160,7 @@ def build_examples(args: argparse.Namespace) -> list[dict[str, Any]]:
             continue
         context = {}
         if args.answer_field in row:
-            context["answer"] = row[args.answer_field]
+            context[ANSWER_KEY] = row[args.answer_field]
         for field in args.context_fields:
             if field in row:
                 context[field] = row[field]

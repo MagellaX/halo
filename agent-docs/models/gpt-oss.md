@@ -109,7 +109,7 @@ With harmony disabled, five settings are load-bearing.
 
     Only the **first** call is extracted: without `<|call|>` as an eos the model keeps writing `to=functions.*` text and hallucinates its own tool result. A header with no brace-balanced JSON after it is dropped rather than rescued, so the turn scores as a no-tool turn and the policy is pushed toward valid JSON. Non-tool RLVR needs no tool parser.
 
-- **Reasoning budget.** `--reasoning-parser-plugin /opt/gpt_oss_reasoning_parser.py --reasoning-parser openai_gptoss` re-registers the harmony-only stock parser for the harmony-disabled path. It separates the CoT from the answer, and is what lets a request carry `thinking_token_budget` at all (without it every such request 400s).
+- **Reasoning budget.** `--reasoning-parser-plugin /opt/gpt_oss_reasoning_parser.py --reasoning-parser openai_gptoss` re-registers the harmony-only stock parser for the harmony-disabled path. It separates the CoT from the answer, and is what lets a request carry `thinking_token_budget` at all (without it every such request 400s). At the budget it forces the final-channel opener `<|start|>assistant<|channel|>final<|message|>`, which the vLLM recipes name as `rollout_reasoning_end_token` so the loss drops those forced tokens ([Objective](../training-methods/grpo/async-grpo/objective.md#importance-sampling-correction)).
 
     vLLM arms the budget on the `reasoning_start_token_ids` it tokenizes from the parser's `reasoning_start_str`, and ends it by forcing `reasoning_end_str`'s ids. The budget bounds every token generated before the `final` channel, whichever channel opened them (vLLM's counter trails the marker by one, so the cut lands at `budget + 1`).
 
@@ -143,6 +143,6 @@ The DeepSeek-V3 **aux-loss-free bias update** is opt-in on the EP path (`moe_bal
 
 vLLM and SGLang load `router.bias` and route with it (top-k on bias-inclusive logits, combine = softmax over the selected values). `_route_with_bias` computes exactly that arithmetic, so trainer and served copy pick the same experts with the same weights.
 
-`router_aux_loss_coef` is forced to 0 for the run to avoid double-balancing (restored in the exported config). The bias lives in logit space, where the default γ is a gentle nudge — the softmax-probability scaling argument other families need does not apply.
+`router_aux_loss_coef` is forced to 0 for the run to avoid double-balancing (restored in the exported config). The bias lives in logit space, so the default γ is small for it; size `router_balancing_rate` per [RouterBiasBalancingCallback](../training-methods/callbacks.md#routerbiasbalancingcallback).
 
 **Not for on-policy RL.** Online and env GRPO must use `moe_balancing: none` — adoption re-registers `router.bias` as a buffer and the weight sync ships parameters only, so a synced engine routes on the pretrained bias (`build_perf_callbacks` downgrades it automatically). Bias-update needs the EP wrappers (`ep_size > 1`, or the default `use_grouped_gemm`); without them it raises at setup.

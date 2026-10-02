@@ -32,7 +32,7 @@ Toolkit-covered families (upstream has none). ✅ = patched, — = left unfused,
 | Mistral 4 | `mistral4` (a `mistral3` wrapper resolves through its text tower: `mistral4` here, `mistral` upstream) | ✅ | ✅ | — interleaved YARN; the llama-4 log scale follows it | ✅ | ✅ text-only checkpoints; [forced off under the wrapper](#fused-loss-under-a-multimodal-wrapper) |
 | Zaya | `zaya` | ✅ | — EP wrapper owns the experts | — partial rotary | ✅ | ✅ **default** |
 | DeepSeek-V4 | `deepseek_v4` | — no parity test covers the swap; the loaders cast the fp32-pinned weights to the run dtype, where the eager norm matches the kernel's output dtype | — clamped SwiGLU | — interleaved partial | ✅ | ✅ **default** |
-| GLM-4.7-Flash | `glm4_moe_lite` | ✅ | ✅ | — dual interleave/plain MLA | ✅ | ✅ **default** |
+| GLM-4.7-Flash | `glm4_moe_lite` | ✅ torch's fused `F.rms_norm` in the llama casting mode (`rms_norm_kernel="native"`) | ✅ | — dual interleave/plain MLA | ✅ | ✅ **default** |
 | Laguna | `laguna` | ✅ | ✅ | — half-width on full-attention layers, full on sliding | ✅ | ✅ |
 | GLM-5.3-Flash | `glm5_next`, `glm5_next_text` | ✅ the two plain norms **+ the GDN gated norm** (fla) | — clamped at `swiglu_limit` | — NoPE text tower | ✅ | — no `*ForCausalLM`; the `*ForConditionalGeneration` head adds the router aux loss after the projection |
 | Inkling | `inkling_text`, `inkling_mm_model` | ✅ | — trained `global_scale` on the MLP output | — no rotary (learned relative bias) | ✅ | — head divides by `logits_mup_width_multiplier` and truncates to `unpadded_vocab_size` |
@@ -124,7 +124,7 @@ over (`upstream_off`) a role upstream gets wrong for the family.
 | Qwen3.5 / 3.6 dense | `qwen3_5`, `qwen3_5_text` | RMSNorm, `Qwen3_5MLP`, FLCE | GDN gated norm → `fla` |
 | Qwen3.5 / 3.6 MoE | `qwen3_5_moe`, `qwen3_5_moe_text` | RMSNorm, FLCE | GDN gated norm → `fla`; **takes over `swiglu`**: shared-expert `Qwen3_5MoeMLP`, withholding upstream's [routed-expert swap](#routed-experts) |
 | Qwen3-Next | `qwen3_next` | RMSNorm, FLCE | GDN gated norm → `fla`; **takes over `swiglu`**: dense + shared-expert `Qwen3NextMLP`, withholding upstream's [routed-expert swap](#routed-experts) |
-| GptOss | `gpt_oss` | RoPE, FLCE | **takes over RMSNorm**: `GptOssRMSNorm` multiplies its weight in fp32 before the cast back (Gemma's casting mode); upstream applies the llama-cast `LigerRMSNorm`, a bf16-ULP deviation on every norm |
+| GptOss | `gpt_oss` | RoPE, FLCE | **takes over RMSNorm** with torch's fused `F.rms_norm` (`rms_norm_kernel="native"`): `GptOssRMSNorm` multiplies its weight in fp32 before the cast back (Gemma's casting mode); upstream applies the llama-cast `LigerRMSNorm`, a bf16-ULP deviation on every norm |
 | Gemma 4 | `gemma4_text` (the `gemma4` wrapper resolves here) | FLCE | **takes over RMSNorm** with torch's fused `F.rms_norm` (`rms_norm_kernel="native"`: fp32 normalize and weight multiply, one cast; covers the weightless `with_scale=False` norms too). At [2048, 2816] bf16 on one B300 it runs fwd+bwd in 51 µs against LigerRMSNorm's gemma mode at 203 µs, and launches in 75 µs against 218 µs, with the same error against fp64. **Takes over GeGLU**: `Gemma4TextMLP` is the dense MLP every decoder layer keeps beside its experts, so the EP wrapper never replaces it; the toolkit's fused GLU probes its activation and survives EP, where upstream's swap is forced off |
 
 `delegates_to_upstream` makes that a build-time contract: the upstream applier is looked up in liger-kernel's
@@ -200,7 +200,8 @@ One row-strided kernel pair (`src/kernels/fused_glu.py`) serves every combine, t
 gradient.
 
 Each wrapped layer logs the executed path at construction (`grouped_mm=True, glu_combine=fused_silu_mul`, or
-`glu_combine=eager`); `tests/gpu/kernels/test_fused_glu.py` checks BF16 and FP32 forward/backward numerics.
+`glu_combine=eager`, as every layer reads under `HALO_FUSED_GLU=0`); `tests/gpu/kernels/test_fused_glu.py`
+checks BF16 and FP32 forward/backward numerics.
 
 ## Configuration
 
@@ -217,7 +218,7 @@ resolved applier's signature does not accept is dropped, with a warning naming i
 
 | Kernel | Default | Notes |
 |---|---|---|
-| `rope` | On | Fused rotary embedding. Auto-off whenever the resolved applier's own `rope` parameter defaults to `False` — the family's rotary (partial, mrope, YARN) has no Liger kernel. Read off the signature, not a model_type list, so a family added upstream later is covered. An explicit `rope: true` bypasses the auto-off and is refused with `NotImplementedError` rather than patching nothing (upstream's own appliers may only warn; the toolkit refuses on their behalf) |
+| `rope` | On | Fused rotary embedding. Auto-off whenever the resolved applier's own `rope` parameter defaults to `False` — the family's rotary (partial, mrope, YARN) has no Liger kernel. Read off the signature, not a model_type list, so a family added upstream later is covered. An explicit `rope: true` bypasses the auto-off: a toolkit-spec family whose rotary Liger does not compute refuses it with `NotImplementedError` (`src/kernels/liger/builder.py`), while an upstream-only applier receives the flag as-is |
 | `rms_norm` | On | Fused RMS normalization. Also covers a family's gated (GDN) norm where its spec declares one — one knob, both norm kernels |
 | `swiglu` | On | Auto-off where the applier's own default is `False` (GptOss, whose upstream applier has no SwiGLU patch block; Qwen3-VL), and where an **upstream** applier's expert-FFN swap is replaced by an EP wrapper, which runs Halo's own fused GLU combine instead. A toolkit spec patches the dense and shared-expert MLPs, which survive EP — see below. Forced off, even when requested, wherever upstream's swap would reach [routed experts Halo does not wrap](#routed-experts) |
 | `geglu` | On | Gemma 4. Served by the toolkit's spec on the always-on dense `Gemma4TextMLP`, which survives the EP wrapper, so it is **not** forced off under EP |
@@ -328,8 +329,8 @@ roles eager.
 Code loading via `AutoModelForCausalLM.from_pretrained()` instead — the GPU benchmarks — runs
 `apply_liger_kernel` on the config it passes to `from_pretrained`, then `finalize_liger_after_direct_load`.
 
-Under FSDP2, TRL's fused Liger preference/GRPO loss (`liger_loss_fn`, `liger_grpo_loss`, or `liger_loss` in
-later TRL releases) is auto-disabled: it does `input @ weight.t()` against `model.lm_head.weight` outside FSDP2's
+Under FSDP2, TRL's fused Liger preference/GRPO loss (`liger_loss_fn`, `liger_grpo_loss`) is
+auto-disabled: it does `input @ weight.t()` against `model.lm_head.weight` outside FSDP2's
 forward hooks, where the weight is a sharded DTensor. A trainer with TRL's `use_liger_kernel` on and none of
 those attributes set raises at construction rather than leave an unknown loss running. Model-level kernels
 stay active.

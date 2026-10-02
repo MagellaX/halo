@@ -124,7 +124,9 @@ post-backward sweep ([Multi-Node](multi-node.md#deferred-cross-replica-sync)).
 `8 B/param` = 2 weights + 2 grads + 4 optimizer state; `AdamWBF16` (`src/optimizers/adamw_bf16.py`)
 allocates `exp_avg` and `exp_avg_sq` with `zeros_like(p)`, so both are bf16 and there is no master
 copy and no error-feedback buffer. `fp32_grad_reduce` upcasts only inside the reduce — no storage.
-Stock AdamW would cost 12 B/param and no cell below survives.
+The stock AdamW is refused under EP unless `fp32_non_ep_params` is set ([why](../optimization/bf16-optimizer.md#usage)),
+and fp32 expert masters (`fp32_experts`) would take the expert term to 16 B/param, where no cell below
+survives.
 
 The activation term is one bf16 layer input per layer (`2·L·H·b·S`) plus the recomputed layer's
 expert intermediates (`6·k·I_moe·b·S` — gate_up, SiLU product, down input at top-`k` = 10). The
@@ -213,9 +215,10 @@ the experts is the single-node escape: LoRA on EP experts, or `unfreeze_layers_p
 from 8 to 2 bytes/param. That is arithmetic, not a validated cell.
 
 **`Steady 32k` is not reachable on the `global` rows.** Cross-node EP dispatches
-`per_device_train_batch_size × max_length` tokens per rank in one MoE forward, and the dispatcher
-rejects anything above `HALO_DEEPEP_GIN_MAX_TOKENS_PER_RANK` (8192) at buffer sizing; above it a
-proxy-GIN dispatch wedges in transit instead of erroring.
+`per_device_train_batch_size × max_length` tokens per rank in one MoE forward.
+`ParallelismConfig.validate_against_model_config` refuses a declared budget above
+`HALO_DEEPEP_GIN_MAX_TOKENS_PER_RANK` (8192) before any weight is read, and the dispatcher re-checks at
+buffer sizing; above it a proxy-GIN dispatch wedges in transit instead of erroring.
 
 So every `ep_scope=global` row is capped at 8192 tokens/rank whatever its memory column says. The
 `node`-scope rows are unaffected: intra-node dispatch is validated to 65k tokens/rank.
@@ -340,11 +343,9 @@ export DIST_STORE_TIMEOUT_HOURS=8      # default 4; a single-rank 794 GB downloa
 export NVLINK_DOMAIN_SIZE=64
 ```
 
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` composes with the `ElasticBuffer` on single-node
-runs. Set it when variable-shape packing at `per_device_train_batch_size > 1` fragments the
-allocator; no shipped config sets it. Measured on B300 it cuts peak reserved memory by 13–14% at unchanged
-throughput on dense packed SFT (Qwen3-8B, 41.3 → 35.4 GB), DPO (61.6 → 52.7 GB) and SMPO (41.1 →
-35.8 GB); under EP8 it trims 1–6 GB and costs ~1.5% throughput.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` composes with the `ElasticBuffer` and answers
+allocator fragmentation under variable-shape packing ([DeepEP → Memory allocation
+failures](../infrastructure/deepep.md#runtime-errors)).
 
 ### YAML knobs
 

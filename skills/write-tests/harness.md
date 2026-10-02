@@ -8,7 +8,7 @@ below matches the real harness — do not invent fields.
 ```python
 def gpu_test_main(
     *,
-    min_world_size: int = 1,         # fewer GPUs than this = BAD LAUNCH → exit 2
+    min_world_size: int = 1,         # fewer GPUs than this = BAD LAUNCH → status="error" result line + exit 2 (the launcher reports it as FAIL)
     exact_world_size: int | None = None,  # if set, world_size must equal it exactly
     prefix: str = "halo_test",       # temp-dir prefix for this test's isolated output/cache dirs
     partial_state: bool = True,      # build accelerate.PartialState() (needed by Trainer tests; off for pure-kernel)
@@ -20,7 +20,7 @@ It wraps a `def run(ctx) -> dict` body and owns the full lifecycle so the body i
 
 1. `init_distributed()` → `(rank, world_size, local_rank)`, optional `PartialState()`.
 2. **Validate the launch before allocating** — wrong world size emits an `error` result and
-   `sys.exit(2)`.
+   `sys.exit(2)` (the launcher reports the `status="error"` line as a FAIL naming the launch).
 3. `setup_cache_dirs(prefix, rank)` → per-rank isolated `output_dir` / `cache_dir`.
 4. Run the body inside `try`; in `finally`, **guaranteed teardown order**:
    `ctx._run_finalizers()` (LIFO) → `cleanup_memory()` → `cleanup_dirs(...)`, then — **only on the
@@ -72,10 +72,14 @@ Build checks from these rather than re-deriving them per file:
 | `parallel_shape_checks(model, parallelism_config)` | `tests/common/parallel_shape.py` | one model-side probe per axis the config enables: EP wrappers, the expert bank split EP-way, ETP sharding, TP-sharded params, Ulysses attention layers |
 | `ep_layers(model)` | `tests/common/ep_reference.py` | every EP/ETP-wrapped MoE layer |
 | `group_max_abs_diff(tensor, group)` | `tests/common/distributed.py` | the replica-identity probe: the largest elementwise difference across a group, NaN-propagating (collective) |
+| `pin_deterministic_ep_dispatch()` | `tests/common/distributed.py` | every DeepEP `ElasticBuffer` of the process built in deterministic mode, for an EP body that replays a run exactly; the default dispatch claims receive slots with atomics, so expert weight gradients round differently run to run |
 | `model_save_checks` / `resume_checkpoint_checks` / `resume_continuity_checks` | `tests/common/checkpoint_io.py` | the files a `save_model` or a mid-training checkpoint must hold, and what a resume restored at its first step |
 | `run_sft_suite(ctx, SFTSuite(...), {key: SFTMode(...)}, default_mode=)` | `tests/common/sft_modes.py` | the whole SFT smoke body: one `--mode` per manifest row, load → train → the checks above |
 | `train_recording_first_step` / `score_first_step` / `first_step_checks` / `first_step_gradient_checks` | `tests/common/first_step.py` | a parallel run's first optimizer step (microbatch losses, logged loss, sharded gradients, c10d autograd fallbacks) scored against a reference trainer on the same microbatches, for an objective a parallel axis could miscount |
 | `skip_unless_local_checkpoint(path, env_var)` | `tests/common/harness.py` | the `SKIP:` exit for a suite whose local checkpoint is absent, called under `__main__` before `run()` |
+| `max_or_nan(values, *, default=)` | `tests/common/utils.py` | the largest value, NaN when any is NaN; the builtin `max` drops a NaN anywhere but first, so a bound on it would pass |
+| `run_gloo_ranks(worker, nprocs, *args, pg_timeout=, env=)` | `tests/common/gloo.py` | `nprocs` spawned ranks sharing one gloo group, for a CPU test that needs a real process group; a rank that raises, dies or hangs fails the call |
+| `tiny_family_model` / `build_tiny_family_checkpoint` / `shared_tiny_family_checkpoint` | `tests/common/tiny_models.py` | one seeded random-init tiny model per EP MoE family, and a synthetic checkpoint of it the production loaders read (`shared_…` builds it once on rank 0 into a rank-shared scratch dir) |
 
 ## Minimal copy-pasteable skeleton
 
@@ -221,21 +225,21 @@ node, shells out:
 python -m torch.distributed.run --nproc_per_node=<nproc> --master_port=<free> <script> <args>
 ```
 
-with the spec `timeout` (the whole process **group** is killed on expiry — NCCL/FA hangs are
+with the spec `timeout` (on expiry the agent and every worker are killed — NCCL/FA hangs are
 live) and `MASTER_PORT` / `HALO_TEST_LAUNCH_ID` / `TMPDIR` in the env. `TORCHELASTIC_ERROR_FILE` is
 deliberately left unset: one shared path makes the last writer win, and the agent's collateral
 SIGTERMs would overwrite the real cause. It then classifies:
 
 - **PASS** — exit 0 with `status="pass"` in the parsed result line.
-- **FAIL** — a `__HALO_TEST_RESULT__` line with `status="fail"` **or** `status="error"` (a body
-  that raised is a FAIL, not an ERROR), and the case where rank 0 said pass but the exit was
-  non-zero — some other rank failed.
+- **FAIL** — a `__HALO_TEST_RESULT__` line with `status="fail"` or `"error"` (a check False, a body
+  that raised, no checks returned, a bad launch), or a non-zero exit whose line says `pass` (a
+  non-zero rank failed).
 - **ERROR** — non-zero exit with **no** result line → infra / hang / import crash. Plus TIMEOUT.
 - **SKIP** — fewer GPUs than `nproc` available; an OOM on the 8-GPU `full` tier (an OOM on
   a 2-GPU `core` smoke is a real ERROR — that config must fit); an unreachable
   `vllm_server`/`sglang_server` engine, unless `HALO_TEST_REQUIRE_SERVER` names it (then a
-  `UsageError`); or an exit-0 run that printed a `SKIP:` line. **Zero** visible GPUs is a
-  `UsageError`, never a skip.
+  `UsageError`); or an exit-0 run that printed a `SKIP:` line (`skip_unless_local_checkpoint`).
+  **Zero** visible GPUs is a `UsageError`, never a skip.
 
 All of this runs inside the Docker image; selection is by marker, e.g. `pytest -m "gpu and
-core"` (PR) or `pytest -m gpu` (nightly).
+core"` (`make test-gpu-core`, pre-merge) or `pytest -m gpu` (`make test-gpu-full`).

@@ -33,7 +33,7 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from src.checkpoint.config_export import save_model_config
 from src.checkpoint.model_card import is_staged_card, tag_exported_model_card
 from src.models.moe_balancing import balancing_param_keys
-from src.models.structure import fp32_pinned_param_names, norm_param_keys, strip_peft_adapter_segment
+from src.models.structure import fp32_pinned_state_keys, norm_param_keys, strip_peft_adapter_segment
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,8 @@ ROUTER_BALANCING_BIASES_FILE = "router_balancing_biases.pt"
 # The DPO/KTO ``precompute_ref_log_probs`` columns, per dataset split, with the row count and token
 # digest a resume verifies them against.
 REFERENCE_LOGPS_FILE = "reference_logps.pt"
+# The environmental GRPO prefetch's submitted-but-untrained rounds, one file per rank.
+PREFETCH_PENDING_PREFIX = "prefetch_pending"
 
 # PEFT adapter artifact filenames. ADAPTER_WEIGHT_NAMES is in load-preference order; PeftAdapterSaver
 # falls back to .bin, so detection must accept both.
@@ -90,13 +92,9 @@ ADAPTER_WEIGHT_NAMES = (ADAPTER_SAFETENSORS_FILE, ADAPTER_BIN_FILE)
 # sink policy). A sidecar rather than adapter_config.json, so stock PEFT loads the adapter unchanged.
 TRAINING_PROVENANCE_FILE = "training_provenance.json"
 PROVENANCE_GPT_OSS_SINKS = "gpt_oss_attention_sinks"
-# A merged checkpoint's resume state, beside the merged weights that serve: a
-# ``merge_expert_lora_on_save`` run's unmerged adapter, written as the non-merged save writes it, or
-# an embedding run's unfolded injected-LoRA tensors. A subdirectory, because an
-# ``adapter_config.json`` at the root makes ``from_pretrained`` load that adapter on top of the
-# merged weights, which already hold its delta. The root marker follows once the adapter is complete
-# and classifies the checkpoint as resume-from-base-plus-adapter: its presence is the verdict; the
-# body only names the directory for whoever reads the checkpoint.
+# A merged checkpoint's unmerged adapter, the state it resumes from, in a subdirectory: a root
+# ``adapter_config.json`` makes ``from_pretrained`` load it on top of weights already holding its delta.
+# The root marker follows once the adapter is complete, and its presence alone is the resume verdict.
 RESUME_ADAPTER_DIR = "resume_adapter"
 RESUME_ADAPTER_MARKER_FILE = "resume_adapter.json"
 # Resume state like the sidecars below, but not weight-suffixed: the aux copy carries them by
@@ -111,8 +109,9 @@ _FOREIGN_EXPORT_SUFFIXES = (".pth", ".gguf", ".h5", ".msgpack", ".onnx", ".onnx_
 # Exempt from that skip: dropping these restarts the LR schedule, zeroes the router biases, or leaves
 # a precompute resume with no untrained reference to restore.
 _RESUME_SIDECAR_FILES = (SCHEDULER_STATE_FILE, ROUTER_BALANCING_BIASES_FILE, REFERENCE_LOGPS_FILE)
-# Same exemption by prefix: losing ``rng_state_<rank>.pth`` re-draws every shuffle and dropout mask.
-_RESUME_SIDECAR_PREFIXES = ("rng_state",)
+# Same exemption by prefix: losing ``rng_state_<rank>.pth`` re-draws every shuffle and dropout mask,
+# and losing a rank's pending prefetch round skips the batch it holds.
+_RESUME_SIDECAR_PREFIXES = ("rng_state", PREFETCH_PENDING_PREFIX)
 # Vendor dumps of the same weights in a raw format (gpt-oss ships ``original/`` and ``metal/``):
 # hundreds of GB the aux copy must not duplicate. Exact names rather than prefixes, since
 # ``original_adapter_config/`` is aux data the copy must keep.
@@ -133,6 +132,15 @@ def ep_shard_filename(rank: int, world_size: int) -> str:
     ``model.safetensors`` at a single part, which every reader takes for a whole model.
     """
     return SAFETENSORS_SHARD_PATTERN.format(suffix=f"-{rank:05d}-of-{world_size:05d}")
+
+
+def prefetch_pending_filename(rank: int, world_size: int) -> str:
+    """Filename of one rank's pending prefetch rounds.
+
+    The world size is in the name because each rank draws its own prompts: a resume at another width
+    finds no file of its own spelling rather than another layout's prompts.
+    """
+    return f"{PREFETCH_PENDING_PREFIX}-{rank:05d}-of-{world_size:05d}.pt"
 
 
 def is_ep_shard(name: str) -> bool:
@@ -179,20 +187,24 @@ def save_dtype_caster(model: torch.nn.Module, *, keep_live_dtype: bool = False):
 
     Floating tensors go to the save dtype except three tree-derived keep-sets that hold their trained
     dtype: the normalization params, the live router-balancing tensors (hub-respelled) and the
-    family's fp32 pins. That way a direct EP/TP save of an fp32-master run matches its merged-shards
-    save, and the export quantizes neither the balancing state nor a family's declared fp32 modules.
+    family's fp32 pins, buffers included. That way a direct EP/TP save of an fp32-master run matches
+    its merged-shards save, and the export quantizes neither the balancing state nor a family's
+    declared fp32 modules.
 
     ``keep_live_dtype`` (a training checkpoint) casts nothing: every tensor is written at the dtype the
-    gather produced, which is the live one, so a resume reads fp32 masters (``fp32_router``,
-    ``fp32_experts``, ``fp32_non_ep_params``) back unrounded. Decided on the tensor, not its name, since
-    a gathered expert's hub key need not name any live parameter.
+    gather produced, which is the live one, so fp32 masters (``fp32_router``, ``fp32_experts``,
+    ``fp32_non_ep_params``) reach disk unrounded. The Path-A ``set_model_state_dict`` load, the PP
+    stage load and every adapter restore read them back exactly; a model built from the checkpoint at
+    construction (Path B) loads at the run dtype before the fp32 upcast, so its masters resume rounded.
+    Decided on the tensor, not its name, since a gathered expert's hub key need not name any live
+    parameter.
 
     Keys also match with their PEFT adapter segment stripped: the EP gather feeds this pre-remap
     keys, where a ``modules_to_save`` router spells its bias ``router.modules_to_save.default.bias``.
     """
     if keep_live_dtype:
         return _as_live
-    keep = norm_param_keys(model) | balancing_param_keys(model) | fp32_pinned_param_names(model)
+    keep = norm_param_keys(model) | balancing_param_keys(model) | fp32_pinned_state_keys(model)
 
     def cast(name: str, t: torch.Tensor) -> torch.Tensor:
         return t if name in keep or strip_peft_adapter_segment(name) in keep else cast_to_save_dtype(t)
@@ -446,7 +458,7 @@ def copy_checkpoint_aux_files(
 
     Skips every top-level weight file and safetensors index, which the caller writes fresh, but
     preserves the resume sidecars (``scheduler.pt``, ``router_balancing_biases.pt``,
-    ``reference_logps.pt``, ``rng_state_*``) a resume-from-merged run restores;
+    ``reference_logps.pt``, ``rng_state_*``, ``prefetch_pending-*``) a resume-from-merged run restores;
     ``include_resume_sidecars=False`` drops them, for an artifact that describes no single run (an
     N-way merge).
 

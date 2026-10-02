@@ -15,7 +15,7 @@ composes its seven sibling sub-mixins:
 | `GradientSyncMixin` | The per-mode FSDP2 wrap, the QLoRA / deferred-EP / TP-replicated grad sweeps, the EP/DTensor-aware global-norm clips |
 | `ParallelismValidationMixin` | Mode and LoRA/EP/TP compatibility checks |
 | `PipelineTrainerMixin` | PP hooks, inert unless `pp_size > 1` |
-| `TokenMetricsMixin` | The loss-token counter behind `num_unmasked_output_tokens_seen`: an on-device per-step accumulator, gathered once per log |
+| `TokenMetricsMixin` | The loss-token counter behind `num_unmasked_output_tokens_seen` (an on-device per-step accumulator, gathered once per log) and the per-document attention-work accumulator the MFU attention term reads |
 
 Each is a class because it reads live trainer state; the methods a test or a caller reaches as
 `DistributedTrainerMixin.<name>` resolve through the MRO unchanged. `CheckpointingMixin`'s zero-arg
@@ -28,9 +28,10 @@ distillation, and SDPG for buffered per-step metric logging. Under PP the store 
 the last stage ([Pipeline Parallelism](../parallelism/pipeline-parallelism.md), not yet available in
 this release).
 
-Offline GRPO and the embedding trainer keep their own `log` instead: offline reads the train/eval
-bucket off `model.training` rather than the mixin's `"loss" in logs`, and the embedding trainer's
-eval metrics go into `output.metrics` for best-model tracking.
+Offline GRPO, the embedding trainer, and online and async GRPO keep their own `log` instead:
+offline reads the train/eval bucket off `model.training` rather than the mixin's `"loss" in logs`,
+the embedding trainer's eval metrics go into `output.metrics` for best-model tracking, and the two
+on-policy trainers decouple the completions table from the metric drain.
 
 `GradientSyncMixin` dispatches by method, not by mode string: `_setup_ep_gradient_sync`,
 `_setup_cp_gradient_sync` and `_setup_ep_tp_gradient_sync` are called directly from `mixins/base.py`'s
@@ -156,7 +157,7 @@ before the base trainer sees them: `parallelism_config` (a `ParallelismConfig`; 
 raises `ValueError`), the save flag `save_sharded_ep` (default `False`), `moe_balancing`,
 `dataset_presharded`, and `bf16_optimizer`. It also reconciles
 `save_on_each_node`, the Liger config and the GC `use_reentrant` kwarg with the requested mode and the model
-(every MoE runs reentrant outside PP).
+(every MoE, EP or CP run goes reentrant outside PP).
 
 A trainer that forwards `**kwargs` calls it as above. One whose `__init__` names those parameters
 passes them through `**explicit` instead (SMPO, Classification, offline GRPO, teacher distillation);
@@ -385,9 +386,10 @@ but under CP they cover only the local chunk.
   [Async GRPO](../training-methods/grpo/async-grpo/README.md).
 
 The `src/trainers/grpo/` package keeps the three trainers (`environmental.py`, `online.py`,
-`offline.py`) at the top level, with support code in `objective/` (pure loss-side functions),
-`mixins/`, and `rollout/`. `environmental.py` keeps the objective itself: batch assembly,
-advantages, the IS trust region and the rank-uniform fences.
+`offline.py`) and two shared leaves (`early_stop.py`; `world_metrics.py`, the step metrics folded
+from every rank's counts in one collective) at the top level, with support code in `objective/`
+(pure loss-side functions), `mixins/`, and `rollout/`. `environmental.py` keeps the objective
+itself: batch assembly, advantages, the IS trust region and the rank-uniform fences.
 
 `rollout/` holds function modules (`weight_sync.py`, `weight_sync_clients.py`, `trajectory_spans.py`,
 `routing_replay.py`, `completions_logging.py`) plus the three mixins the async GRPO trainer composes:
@@ -398,7 +400,8 @@ advantages, the IS trust region and the rank-uniform fences.
 ### Online GRPO vLLM weight sync
 
 `DistributedGRPOTrainer._setup_weight_sync` replaces TRL's
-`VLLMGeneration.sync_weights` with `_distributed_sync_weights` whenever vLLM generation is set up.
+`VLLMGeneration.sync_weights` with `_distributed_sync_weights` at construction, and raises when TRL
+built no `vllm_generation` (server-mode vLLM is required).
 It uses the vendored `VLLMWeightSyncClient` (`src/distributed/nccl/`) instead of TRL's
 `VLLMClient`, which would import the vLLM package.
 
@@ -448,9 +451,12 @@ Around it the mixin keeps the non-weight parts of a checkpoint: `_save_checkpoin
 `save_total_limit` rotation until the new checkpoint is complete),
 `_persist_lr_scheduler_for_resume`, and `_persist_router_balancing_biases` /
 `_restore_router_balancing_biases` for the `router_balancing_biases.pt` sidecar.
-`_persist_trainer_sidecars` is a trainer's own hook, called on every rank before rotation. The
-DPO/KTO precompute mixin overrides it to write `reference_logps.pt`; those trainers list the mixin
-ahead of `DistributedTrainerMixin` in their bases, so the empty default does not shadow it.
+`_persist_trainer_sidecars` is a trainer's own hook, called on every rank before rotation, and
+`_restore_trainer_sidecars` its read-back, called on every rank of a resume (never a best-model
+load). The DPO/KTO precompute mixin overrides the write for `reference_logps.pt`, which it reads back
+before TRL's `__init__` instead; the async GRPO rollout mixin overrides both for its pending prefetch
+rounds. Each trainer lists the overriding mixin ahead of `DistributedTrainerMixin` in its bases, so
+the empty defaults do not shadow it.
 
 `load_best_model_at_end` is refused at construction for every shape whose end-of-run reload is
 guaranteed to be refused: `cp_size > 1`, a MoE carrying EP or grouped-GEMM wrappers (`ep_size: 1`

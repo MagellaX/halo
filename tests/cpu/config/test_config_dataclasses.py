@@ -7,10 +7,12 @@ Run: python tests/cpu/config/test_config_dataclasses.py
 """
 
 import contextlib
+import logging
 import os
 
 import pytest
 
+import src.configs.async_training_config as async_training_config
 from src.configs.async_training_config import POSITIVE_ROLLOUT_FIELDS, AsyncTrainingConfig
 from src.configs.environment_config import EnvironmentConfig
 from src.configs.smpo_config import SmoothMarginPOConfig
@@ -361,7 +363,7 @@ def test_env_config_max_turns_guard_survives_cli_override():
 
 
 def test_env_config_custom_env_type_passthrough():
-    """environment_type is stored verbatim (registry resolves it later, no validation here)."""
+    """environment_type is not validated here; the registry resolves it later."""
 
     cfg = EnvironmentConfig(environment_type="code_contests", environment_kwargs={"timeout_per_test": 10})
     assert cfg.environment_type == "code_contests"
@@ -369,6 +371,20 @@ def test_env_config_custom_env_type_passthrough():
     out = cfg.to_env_config()
     assert "environment_type" not in out
     assert out["timeout_per_test"] == 10
+
+
+def test_env_config_spells_environment_type_as_the_registry_keys_it(tmp_path):
+    """The registry lowercases the name it resolves, so a mixed-case YAML trains; the name is lowercased
+    once at parse, on the YAML and the CLI-override path alike, so no consumer comparing it refuses it."""
+    assert EnvironmentConfig(environment_type="Code_Contests").environment_type == "code_contests"
+    config = tmp_path / "env.yaml"
+    config.write_text("environment_type: react_math\n")
+    (cfg,) = H4ArgumentParser((EnvironmentConfig,)).parse_yaml_and_args(
+        str(config), ["--environment_type=Native_Math"]
+    )
+    assert cfg.environment_type == "native_math"
+    with pytest.raises(ValueError, match="^environment_type must be a registry name, got None$"):
+        EnvironmentConfig(environment_type=None)
 
 
 # AsyncTrainingConfig tests
@@ -482,6 +498,16 @@ def test_async_config_episode_timeout_equal_watchdog_does_not_raise():
         cfg = AsyncTrainingConfig(episode_timeout=1800.0)  # == default 1800s watchdog
         rc = cfg.get_rollout_config()  # no raise
         assert rc.episode_timeout == 1800.0
+
+
+@pytest.mark.parametrize("main_process", [True, False])
+def test_async_config_watchdog_warnings_are_said_once_not_once_per_rank(monkeypatch, caplog, main_process):
+    """Every rank builds its rollout config, and both near-watchdog warnings describe the config alone."""
+    monkeypatch.setattr(async_training_config, "is_global_main_process", lambda: main_process)
+    with _nccl_watchdog_minutes(None), caplog.at_level(logging.WARNING, logger=async_training_config.logger.name):
+        AsyncTrainingConfig(episode_timeout=1800.0, request_timeout=1800.0).get_rollout_config()
+    for warning in ("episode_timeout (1800s) is within", "Rollout retry budget"):
+        assert (warning in caplog.text) is main_process, warning
 
 
 def test_positive_rollout_knob_sweep_covers_the_production_tuple():

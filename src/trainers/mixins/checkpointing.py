@@ -114,8 +114,14 @@ class CheckpointingMixin:
     ) -> None:
         """Parallelism-aware weight resume; delegates to the checkpoint loader."""
         self._checkpoint_loader().load_model(resume_from_checkpoint, model, for_best_model=for_best_model)
-        # Balancing biases live outside the model checkpoint; without this a resumed run re-imbalances from zero.
-        self._restore_router_balancing_biases(resume_from_checkpoint)
+        self._restore_state_beside_weights(resume_from_checkpoint, for_best_model=for_best_model)
+
+    def _restore_state_beside_weights(self, checkpoint: str, *, for_best_model: bool) -> None:
+        """What a weight restore reads beside the model checkpoint: the router-balancing biases (without them
+        a resumed run re-imbalances from zero) and, except for a best-model load, the trainer sidecars."""
+        self._restore_router_balancing_biases(checkpoint)
+        if not for_best_model:
+            self._restore_trainer_sidecars(checkpoint)
 
     def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
         """FSDP2 optimizer-shard and LR-scheduler resume; delegates to the checkpoint loader.
@@ -256,8 +262,17 @@ class CheckpointingMixin:
 
         Called on every rank of every checkpoint save, after the base save's collectives and before
         rotation, so a checkpoint is never rotated in ahead of its sidecars. An override fences its
-        save-rank write with :func:`barrier_on_exit`, and its trainer lists it ahead of
-        :class:`DistributedTrainerMixin` in its bases so this default does not shadow it.
+        write (:func:`barrier_on_exit` for a save-rank one, :class:`DeferredRankFailure` for one every
+        rank makes), and its trainer lists it ahead of :class:`DistributedTrainerMixin` in its bases so
+        this default does not shadow it. A sidecar read back once training resumes overrides
+        :meth:`_restore_trainer_sidecars` too.
+        """
+
+    def _restore_trainer_sidecars(self, checkpoint: str) -> None:
+        """Read back what :meth:`_persist_trainer_sidecars` wrote; nothing by default.
+
+        Called on every rank when a run resumes from ``checkpoint``, after its weights, and never for a
+        best-model load, which continues no training. An override reads through :func:`consensus_read`.
         """
 
     def _persist_lr_scheduler_for_resume(self, trial) -> None:

@@ -7,7 +7,7 @@ multiple-choice or open-ended exams (MMLU-Pro, GPQA, MMLU, ARC). Both live in
 tool-call parser on the server ([Rollout Configuration](../async-grpo/rollouts.md#tool-calls)).
 
 `qa_search` is a factory preset over `NativeToolUseEnvironment` — search tools, a research-assistant
-prompt, `require_tool_use=True` — not its own class. `ExamQAEnvironment` is closed-book by default.
+prompt, a required `answer` column — not its own class. `ExamQAEnvironment` is closed-book by default.
 `examples/grpo/environmental/qwen3_5/vllm/qwen3.6-35b-a3b-exam-qa-full-ep4.yaml` is a shipped recipe.
 
 ## Configuration
@@ -23,10 +23,9 @@ environment_kwargs:
 | Knob | Default | Effect |
 |---|---|---|
 | `search_backend` | auto | `serper`, `brave`, `tavily`, `duckduckgo`; auto-selects by which API key is set, keyless DuckDuckGo last. Validated at construction |
-| `include_python_tools` | `false` | `qa_search` only: adds the sandboxed `python` tool for numeric QA |
+| `include_python_tools` | `false` | `qa_search` only: adds the in-process restricted `python` REPL for numeric QA |
 | `open_book` | `false` | `exam_qa` only: registers the search tool. Setting `search_backend` closed-book raises |
 | `system_prompt` | class prompt | Replaces the built-in instructions |
-| `require_tool_use` | `true` on `qa_search` | Flags an episode that called no tool; the charge is `no_tool_use_penalty` |
 
 A fifth backend, `mock`, returns fabricated snippets and is refused unless
 `HALO_ALLOW_MOCK_SEARCH=1`: its results pay `tool_success_reward` like a real search, so a training
@@ -35,7 +34,7 @@ run reaching it would teach the policy that invented evidence works.
 ## Tools
 
 - `web_search` — query plus optional `max_results` (5); returns titles, snippets and URLs. On `qa_search` always, on `exam_qa` only under `open_book`.
-- `python` — sandboxed REPL, `qa_search` under `include_python_tools`.
+- `python` — the in-process restricted REPL, `qa_search` under `include_python_tools`.
 
 ## Reward
 
@@ -67,9 +66,10 @@ A row with `choices` switches `exam_qa` to letter grading: the response's choice
 extracted from "A", "(A)", "A.", "The answer is A" and compared to the expected letter, and the
 choices are appended to the prompt.
 
-`answer` may be that letter or a 0-based index into `choices` (MMLU and ARC ship an int). Anything
-else, an out-of-range index included, raises at episode start rather than grading every completion
-0 at zero group variance.
+`answer` may be that letter or a 0-based int index into `choices` (MMLU ships the index). A digit
+string raises: ARC's `answerKey` is sometimes a 1-based label (`"1"`–`"5"`), so convert it to a
+letter when preparing the data. Anything else, an out-of-range index included, raises at episode
+start rather than grading every completion 0 at zero group variance.
 
 ## Dataset
 

@@ -21,7 +21,7 @@ Guidance for Claude Code and other AI agents working in this repository. These r
   Provide your own repo-root `.env` (`WANDB_API_KEY`/`HF_TOKEN` as needed, plus any `AWS_*` for S3; start from `.env.example`); it is **not auto-loaded** — pass it with `--env-file`. `HF_HOME`/`HF_DATASETS_CACHE` (HF caches), `TMPDIR` (temp), and `HALO_DATA_ROOT` (toolkit scratch — S3 dataset cache → `$HALO_DATA_ROOT/s3_datasets`, profiler artifacts → `$HALO_DATA_ROOT/profiling`) redirect writes off the small root FS. They are a **convention pointing at a large mounted volume**, not code defaults (the HF caches fall back to `~/.cache/...`, `TMPDIR` to `/tmp`, `HALO_DATA_ROOT` to `~/.cache/halo`), and `/mnt` is **not guaranteed large** (on some hosts `/mnt` shares the small root device) — confirm with `findmnt`/`df -h` and point them at the real large volume. Pre-cached S3 datasets (`md5("<bucket>/<key>")`) then load without live AWS. See `agent-docs/infrastructure/docker.md`.
 - **Launcher:** `torchrun` for all multi-GPU — EP/CP/TP/ETP **and** plain FSDP2 data-parallel (`torchrun --nproc_per_node=N scripts/training/<script>.py <config>` lands on FSDP2 ZeRO-2); `python` for single-GPU/LoRA. `accelerate launch` + the `launcher-configs/accelerate/*.yaml` configs remain a supported option for plain FSDP data-parallel, but torchrun is the default. The `halo` CLI (`src/cli.py`) picks the launcher — `halo launch <method> <config>`, `halo run <tool>`.
 - **Preflight every run — disk, RAM, GPU.** Send large outputs, caches (`HF_DATASETS_CACHE`), and logs to a **verified** large mounted volume; the root FS is small and on some hosts shares a device with `/mnt`. **Check the target before any multi-GB write** (`df -h` / `findmnt` / `readlink -f` — a path's name does not prove its capacity). Before launching also confirm free host RAM and GPU health/free memory (`nvidia-smi`; `scripts/profiling/nvlink_health.py` for NVLink) — never launch onto a full disk, an OOM-prone host, or a degraded or already-occupied GPU. Scratch/temp markdown → `/tmp`.
-- **Env vars.** `src/env.py` is the single home for reading toolkit knobs (`HALO_`/`DIST_`/`VLLM_`/`SGLANG_`/`NVLINK_`) — one convention via `env_flag`/`env_int`/`env_float`/`env_str`, plus `HALO_DATA_ROOT` + `data_path()` for scratch. Route a new toolkit var through it, never a raw `os.environ.get`. Launcher (`LOCAL_RANK`/`SLURM_*`/`RANK`), `ACCELERATE_*`, and HF/OS vars are read raw at their owner by design. Full catalog with defaults (incl. `NVLINK_DOMAIN_SIZE`, the NVL72 locality unit): `agent-docs/reference/configuration-reference.md` (Environment variables).
+- **Env vars.** `src/env.py` is the single home for reading toolkit knobs (`HALO_`/`DIST_`/`VLLM_`/`SGLANG_`/`NVLINK_`) — one convention via `env_flag`/`env_int`/`env_float`/`env_str`, plus `HALO_DATA_ROOT` + `data_path()` for scratch. Route a new toolkit var through it, never a raw `os.environ.get`. Launcher (`LOCAL_RANK`/`SLURM_*`/`RANK`) and HF/OS vars are read raw at their owner by design; the `ACCELERATE_*` launch markers go through `is_accelerate_launch`/`is_accelerate_fsdp_launch` in `src/env.py`. Full catalog with defaults (incl. `NVLINK_DOMAIN_SIZE`, the NVL72 locality unit): `agent-docs/reference/configuration-reference.md` (Environment variables).
 
 ### Code style
 - **Clean and professional — no slop.** No inline / function-local imports — the *only* exception is a genuinely optional or arch-specific dependency that may be absent at runtime (`flash_attn`, `deep_ep`, `kernels`), marked `# noqa: PLC0415`. A **circular import is never that exception** — fix it structurally (move the shared symbol to a leaf module, or stop a package `__init__` from eagerly importing a heavy subpackage), never with a function-local import or a lazy-import wrapper. No duplicated logic, no hardcoded paths or magic values (read them from config/env — `src/env.py` is the home for env flags), no sprawling or misplaced files, no papering over a root cause with a local patch. Reuse existing code, and put each thing where it belongs.
@@ -106,15 +106,16 @@ src/
 │   │                    #   StoredMetrics are mixed in individually) + pp_gates, loss_masks, grad_clip functions)
 │   ├── sft.py preference/ (DPO,SMPO,KTO)  reward/ (bradley_terry, classification)
 │   ├── embedding/       # SBERT trainer + sentence_transformers_compat.py (ST patches, preloaded-model shim)
-│   ├── grpo/            # online, offline, environmental + objective/ mixins/ subpackages and rollout/
-│   │                    #   (weight_sync, weight_sync_clients, async_rollouts, routing_replay,
-│   │                    #   trajectory_tokenize, trajectory_spans, rollout_metrics, completions_logging)
+│   ├── grpo/            # online, offline, environmental, early_stop + world_metrics (shared) + objective/ mixins/
+│   │                    #   subpackages and rollout/ (weight_sync, weight_sync_clients, async_rollouts,
+│   │                    #   routing_replay, trajectory_tokenize, trajectory_spans, rollout_metrics, completions_logging)
 │   └── distillation/    # teacher_distillation, self_distillation, sdpg (online); losses.py = the shared
 │                        #   objectives + SDPG schedule, teacher_losses.py = the eight off-policy losses
 ├── optimizers/          # AdamWBF16 (SR), Muon, FlashAdamW (each module owns its build_*; registry.py names the `optim:`-selectable
 │                        #   muon/flash_adamw, AdamWBF16 is a create_optimizer branch)
 ├── kernels/             # grouped_gemm (precision dispatch) over the grouped_mm_autograd primitive,
-│                        #   fused_glu, histogram, liger/, lowp/(quantization, linear, deepgemm,
+│                        #   fused_glu, moe_permute (atomic-free token permute + un-permute), histogram, liger/,
+│                        #   lowp/(quantization, linear, deepgemm,
 │                        #   mixed_precision — the opt-in fp8/fp4 stack)
 ├── models/              # sharding-agnostic model side: structure.py (module-tree introspection),
 │                        #   moe_balancing.py (mode resolve + router/EP-family registries the layer classes
@@ -129,6 +130,8 @@ src/
 │                        #     `cu_seq_lens` — for the conv / linear-attention mixers of packed and
 │                        #     padding-free rows),
 │                        #   patches/(attention — backend select off hardware.py's arch predicates —
+│                        #     flex_sliding_attention (`sdpa_flex_sliding`: FlexAttention on SDPA sliding-window
+│                        #     layers, matmul attention on wide-head global layers within a score budget),
 │                        #     gpt_oss_sinks, zaya, kernel_dispatch, remote_code_compat +
 │                        #     remote_code_hooks = the one wrap of transformers' remote-class funnel, buffer_fixes),
 │                        #   loading/(model_preparation = Auto* class + family patches + the shared post-load
@@ -155,7 +158,7 @@ src/
 │   │                    #   expert_parallel/balancing_strategy.py owns the router-balancing export contract
 │   └── nccl/            # vendored weight-sync clients (clients/: vLLM, SGLang), their NCCL transport and the
 │                        #   rendezvous listener both bind (transport/); registry.py resolves the rollout backend
-├── checkpoint/          # sharding-agnostic checkpoint layer (no src.distributed / torch.distributed):
+├── checkpoint/          # sharding-agnostic checkpoint layer (no direct src.distributed / torch.distributed import):
 │                        #   format.py (on-disk spellings, save-dtype casts, the layout cascade),
 │                        #   config_export.py (what an exported config.json must contain), adapters.py (saved-PEFT
 │                        #   layout, shape gates, merge-into-base), tool_io.py (tool-side directory I/O),
@@ -239,7 +242,7 @@ CP is declare-to-enable per trainer (`_supports_cp`, default off) — the CP col
 - SFT: `{"prompt": [{"role","content"}, ...]}` (field via `conversation_field`)
 - Preference (DPO/SMPO): `{"prompt", "chosen", "rejected"}` (all `list[dict]`)
 - Offline GRPO: `{"prompt", "completions": [[...]], "rewards": [...]}`
-- Async GRPO with environments: `{"prompt"}` plus `"answer"` where the environment grades against one (`requires_answer`: code contests, `exam_qa`, `qa_search`, `react_*`, `swe` without a `test_function`)
+- Async GRPO with environments: `{"prompt"}` plus `"answer"` where the environment grades against one (`requires_answer`: code contests, `exam_qa`, `qa_search`, `react_*`, `swe` without a `test_function` unless judge-only)
 
 Sources: `s3://`, HF Hub, or local (`src/data/sources/`). Offline tokenize/pack/shard via `scripts/before_training/prepare_dataset.py`; `ShardedDatasetLoader` for per-rank shards; `fs_aware_main_first()` adapts to shared vs local FS (`DIST_SHARED_FILESYSTEM`, default `1` = shared NFS/Lustre; set `0` for per-node local storage). Filesystem coordination: `agent-docs/data/filesystem-handling.md`.
 

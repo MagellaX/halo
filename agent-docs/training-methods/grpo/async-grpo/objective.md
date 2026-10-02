@@ -1,6 +1,6 @@
 # Objective and Stability
 
-The loss is TRL's GRPO objective ([Online GRPO](../online-grpo.md#grpo-objective-for-verifiable-rewards)) at TRL's default `loss_type: dapo`, clipped by `epsilon` (`0.2`) and `epsilon_high` (`0.28` in the [shipped recipes](setup.md#shipped-recipes), inert at `num_iterations: 1`). Rollouts are off-policy by at least one weight sync, so an importance ratio corrects them, and the trust region is masks on that ratio, not a KL term.
+The loss is TRL's GRPO objective ([Online GRPO](../online-grpo.md#grpo-objective-for-verifiable-rewards)) at TRL's default `loss_type: dapo`, clipped by `epsilon` (`0.2`; no recipe sets `epsilon_high`, which falls back to `epsilon`); the clip is inert at `num_iterations: 1`. Rollouts differ from the trainer's policy by the engine↔trainer numerics gap, and by up to one sync interval under prefetch or `sync_weights_every_n_steps > 1`, so an importance ratio corrects them, and the trust region is masks on that ratio, not a KL term.
 
 ## Importance sampling correction
 
@@ -9,22 +9,23 @@ The trainer recomputes the sampled tokens' log-probs and multiplies the per-toke
 Consequences:
 
 - `vllm_importance_sampling_mode` and `vllm_importance_sampling_clip_min` are ignored, with a warning when set: truncation is token-level, from above only.
-- Set `rollout_top_p: 1.0` under the geometric band (default `0.95`): a nucleus cut shifts every uncertain position, which the band reads as drift. A server that renormalizes log-probs over the nucleus raises at startup.
+- Set `rollout_top_p: 1.0` under the geometric band or OPSM (`isr_opsm_delta`) (default `0.95`): a nucleus cut shifts every uncertain position, which the band reads as drift. A server that renormalizes log-probs over the nucleus raises at startup.
 
-Watch `sampling/logratio_mean` first: the unclamped mean log-ratio in nats, near 0 when healthy. A growing negative drift is the broken-weight-sync signature ([Weight synchronization](setup.md#weight-synchronization)).
+Watch `sampling/logratio_mean` first: the unclamped mean log-ratio in nats, near 0 when healthy. A growing negative drift is the broken-weight-sync signature ([Weight synchronization](setup.md#weight-synchronization)); a KL-free run drifting widens it too, ahead of a climbing `entropy` and with `advantage/net_token_mass` staying negative, which `balance_token_mass` and the [early stop](monitoring.md#early-stop) address.
+
+A reasoning close the engine forced at the thinking budget gets ratio 0 like any masked token, keeping the DAPO normalizer: it was not the policy's choice, and trained with the episode's advantage it moves the model's own probability of ending its reasoning. The close is `rollout_reasoning_end_token` encoded as vLLM encodes its parser's end string (one token for Qwen3.x `</think>` and Gemma 4 `<channel|>`, the five-token final-channel opener `<|start|>assistant<|channel|>final<|message|>` for gpt-oss), and a forced one is a run of those ids every one at sampling log-prob exactly 0. `sampling/forced_close_frac` is their share of the completion tokens. The ratio reaches the loss only through this correction, so a run whose vLLM thinking budget can bind (a level's `thinking_tokens` or `rollout_max_thinking_tokens`) and whose tokenizer resolves the marker refuses to start without it. Under the `turn` scope a marker the tokenizer does not write (an encoding with none of its added tokens, as `</think>` on Gemma 4 or gpt-oss) keeps the forced closes in the loss, with a warning.
 
 ## Trust region masks
 
-The `isr_*` stages mask rather than reweight: a masked token loses its policy-gradient term but keeps its KL anchor. All default off, all raise without the IS correction, and they compose. The three trajectory stages pool a trajectory's turn rows; the token band is per token.
+The `isr_*` stages mask rather than reweight: a masked token loses its policy-gradient term but keeps its KL anchor. All default off, all raise without the IS correction, and they compose. Each stage pools a trajectory's turn rows.
 
 | Knobs | Stage | Metric |
 |---|---|---|
-| `isr_band_min` / `isr_band_max` | Mask a token whose raw ratio leaves the band. Start `[0.5, 2]`. | `sampling/is_token_band_masked_frac` |
 | `isr_geo_band_min` / `isr_geo_band_max` | Mask a trajectory whose `exp(mean log-ratio)` leaves it. | `sampling/is_geo_band_masked_frac` |
 | `isr_veto_min` | Mask a trajectory if any corrected token's raw ratio drops below it. | `sampling/is_veto_masked_frac` |
 | `isr_opsm_delta` | Mask negative-advantage trajectories drifting past N nats. | `sampling/is_opsm_masked_frac` |
 
-Paired bands need both bounds, `0 < min < 1 < max`. The code-contests recipes run the geometric band at `[0.95, 1.05]` with `isr_veto_min: 1.0e-4` and `isr_opsm_delta: 0.05`, and leave the token band off.
+The geometric band needs both bounds, `0 < min < 1 < max`. The code-contests recipes run it at `[0.95, 1.05]` with `isr_veto_min: 1.0e-4` and `isr_opsm_delta: 0.05`.
 
 **Size the geometric band above the numerical floor.** Trainer and engine are different bf16 stacks: their mean log-ratio is negative at identical weights, steeper the flatter the distribution — ~0.002 nats/token at sampling entropy 0.4, ~0.04 at 1.0. A band inside it masks every step; sustained masking at low entropy is a disagreement to fix, not a band to widen.
 
@@ -36,14 +37,7 @@ TRL's `off_policy_mask_threshold` is refused: it reads a batch key this trainer 
 
 ## Advantages
 
-`advantage_mode` sets the baseline and the negative-side treatment:
-
-- `mean` (default) — plain group-mean baseline.
-- `qae` — per-group `advantage_quantile` baseline (default `0.4`), so only rare successes train.
-- `asymmetric` — mean baseline, then `advantage_pos_scale` / `advantage_neg_scale` (`1.0` / `0.4`).
-- `neg_mask_hard` — zero negatives in groups where no member's objective reward reached `advantage_hard_group_threshold` (`0.5`).
-
-The code-contests recipes run `asymmetric` with `advantage_neg_scale: 0.7`. `scale_rewards` picks the divisor:
+A trajectory's advantage is its total reward minus the mean over its group's valid members. `scale_rewards` picks the divisor:
 
 | Value | Effect |
 |---|---|
@@ -55,7 +49,13 @@ The code-contests recipes run `asymmetric` with `advantage_neg_scale: 0.7`. `sca
 
 A non-finite reward or advantage fails the step on every rank: under `batch` scaling a single one makes the shared std, and so every advantage of the step, non-finite.
 
-`drop_degenerate_groups` defaults **on** here (off for online GRPO): all-alike groups carry no gradient but still inflate the DAPO normalizer (`sampling/degenerate_group_frac`). `mask_truncated_completions` is enforced here, not in TRL's generation path; the recipes leave it off.
+`drop_degenerate_groups` defaults **on** here (off for online GRPO) and judges a group on the reward each environment settled: its grade, its shaping and every external score, without the trainer's effort-length terms. Those price every episode differently, so on the trained total no group would ever tie. A group whose members all settled the same reward has no contrast to learn from beyond the length terms, yet its tokens still inflate the DAPO normalizer (`sampling/degenerate_group_frac`). `mask_truncated_completions` is enforced here, not in TRL's generation path; the recipes leave it off.
+
+`balance_token_mass` (default off, on in the code-contests recipes) cancels each generation round's net push on the tokens the policy sampled. Under the token-sum loss a trajectory pulls with its advantage times its trained tokens, each weighted by its truncated IS ratio. A group's advantages sum to zero but their token-weighted sum does not: where failures run longer than solves the round lowers the probability of the sampled tokens and entropy climbs, and where solves run longer it sharpens the policy. Without a KL anchor the sign of that share sets the direction entropy drifts, and a fixed scale on the negatives only moves the drift to the other side. The balance sums the positive and the negative mass over every rank and shrinks the heavier sign by their ratio, never up, so every row keeps its sign and its order within the sign. The scale falls continuously to 0 as the lighter side empties, so a round with mass on one sign only (its positives all IS-masked, say) trains nothing on its advantages, and a balanced round pulls at `1 - |net|` of its unbalanced strength, half at `net = -0.5`. `advantage/net_token_mass` is the share before balancing, `(P - N) / (P + N)`, logged with the knob off too, and `advantage/token_mass_scale` the applied factor; a mass that is not finite raises on every rank, knob on or off. `advantage/negative_only_mass` is the share of the trained mass on [untrainable turns](#untrainable-turns), which train on a negative advantage only, after the balance when it is on: the balance nets the whole round to zero, so this share is the net push it leaves on every other row, raising the tokens they sampled. It needs `loss_type` `cispo`, `dapo` or `dr_grpo`, where every loss token of a step shares one normalizer, and `top_entropy_quantile: 1.0`, and raises otherwise: under `grpo` a completion pulls with its advantage alone, whatever its length, and the entropy mask drops tokens after the balance has weighed them. Online GRPO takes the same knob, and refuses it beside TRL's `off_policy_mask_threshold`, which drops negative sequences inside the loss.
+
+## Untrainable turns
+
+A turn the engine cut off, one the model ended on nothing, and one whose every call named a nonexistent tool ([Rollouts](rollouts.md#training-on-sampled-tokens)) train only on a negative advantage (strictly below 0), as per-turn rows of their sampled ids; on the single re-tokenized row they train on nothing. Rewarded, the runaway reasoning, the empty stop or the invented call would be reinforced whenever the episode recovers; left out entirely, a failing episode's signal lands on its other turns alone and the over-long reasoning behind a cut grows unchecked. The row's `tool_mask` is cleared before the DAPO normalizer is taken, in train and eval alike, so a dropped row counts in neither the loss nor the normalizer; a forced reasoning close inside a kept row still gets ratio 0. `sampling/untrainable_rows_frac` is the share of rows tagged, `sampling/untrainable_rows_trained_frac` the share of those that reached the loss.
 
 ## KL and template protection
 
@@ -78,7 +78,7 @@ TRL's `RepeatSampler` delivers each prompt `num_generations` consecutive times, 
 
 ![Batch construction at the stage-1 code-contests shape: the sampler gives each of a rank's 3 prompts 8 consecutive rows, one rank's round is 24 rows (per_device_train_batch_size 1 × steps_per_generation 24), and six data-parallel ranks make one optimizer step of 144 rows = 18 prompts × 8; a row is one episode, a group is one prompt's rows and never straddles ranks](../../../assets/diagrams/batch_prompt_expansion.png)
 
-A rollout with no learning signal — a raised episode, an `episode_timeout` cancellation, an invalid one — enters as a zero-masked row, out of its group's baseline (`sampling/invalid_episode_frac`). A step where no episode survived warns once, then **halts the run on the second**.
+A rollout with no learning signal — a raised episode, an `episode_timeout` cancellation, an invalid one — enters as a zero-masked row, out of its group's baseline (`sampling/invalid_episode_frac`). A step where no episode survived warns once, then **halts the run on the second consecutive one**.
 
 Rows carry two masks. `completion_mask` is attention-valid — every real completion token, tool results and generation-prompt headers included, since they conditioned the sampling — while `tool_mask` is the loss mask, `1` only on assistant spans. The loss and the DAPO normalizer use their intersection. The batch is never packed.
 
@@ -92,4 +92,4 @@ Rows carry two masks. `completion_mask` is attention-valid — every real comple
 
 ## Learning rate
 
-Async GRPO refines an already tuned policy, so the rate sits near the SFT floor: `2e-7` on the code-contests full fine-tunes (`3e-7` on the Qwen3.6 curriculum stages), `3e-6` on their LoRA siblings, `1e-6` on the lighter single-answer tasks, `5e-6` on the template. All use a cosine schedule over the run's useful length, not the dataset's ([SFT](../../sft.md#learning-rate-and-global-batch-size)).
+Async GRPO refines an already tuned policy, so the rate sits near the SFT floor: `2e-7` on the code-contests full fine-tunes (`3e-7` on the Qwen3.6 curriculum stages), `3e-6` on their LoRA siblings, `1e-6` on the lighter single-answer tasks, `5e-6` on the template. All but the curriculum's stage-2 and stage-3 recipes (`constant_with_warmup`) use a cosine schedule over the run's useful length, not the dataset's ([SFT](../../sft.md#learning-rate-and-global-batch-size)).

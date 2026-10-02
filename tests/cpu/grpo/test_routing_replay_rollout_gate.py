@@ -4,11 +4,12 @@
 
 The gate exists because training under R3 without the engine's selection is silently wrong, which
 includes a batch whose every routed row matches no engine coverage convention. What it must NOT do is
-fail a step that trains nothing: every assistant turn the engine cut off at its token
-cap is excluded from the training rows (``_tokenize_trajectory_turns``), so a policy emitting nothing
-but runaway completions produces a batch of fully masked rows carrying no routing — the zero-gradient
-step every other mode takes as a no-op. Both halves are driven end to end here: the real per-turn
-tokenizer builds the rows, the real gate judges them.
+fail a step that trains nothing: an assistant turn with no sampled ids yields no row
+(``_tokenize_trajectory_turns``), so a batch of such turns is fully masked rows carrying no routing —
+the zero-gradient step every other mode takes as a no-op. A turn the engine cut off is not that case:
+it becomes a negative-only row that may train, so it carries its routing and counts as trainable at
+the gate. Both halves are driven end to end here: the real per-turn tokenizer builds the rows, the
+real gate judges them.
 
     python tests/cpu/grpo/test_routing_replay_rollout_gate.py
 """
@@ -43,7 +44,11 @@ def _routing_payload(tokens: int) -> str:
 
 
 def _rollout(
-    *, truncated: bool, routing: bool, routing_tokens: int = len(ENGINE_PROMPT) + len(SAMPLED)
+    *,
+    truncated: bool,
+    routing: bool,
+    captured: bool = True,
+    routing_tokens: int = len(ENGINE_PROMPT) + len(SAMPLED),
 ) -> RolloutResult:
     """One episode with a single assistant turn carrying the engine's ids (and optionally its routing,
     ``routing_tokens`` rows long: the default is the full prompt + completion convention)."""
@@ -52,7 +57,7 @@ def _rollout(
     traj.add_message(
         Message.assistant(
             "answer",
-            token_ids=list(SAMPLED),
+            token_ids=list(SAMPLED) if captured else None,
             prompt_token_ids=list(ENGINE_PROMPT),
             routing_mask=_routing_payload(routing_tokens) if routing else None,
             routing_prompt_tokens=len(ENGINE_PROMPT) if routing else None,
@@ -65,7 +70,7 @@ def _rollout(
 def _host():
     """A trainer stand-in exposing the REAL per-turn tokenizer, gate and uniform raise.
 
-    Single-process, so ``_raise_batch_error_uniformly`` skips its all-reduce and raises the recorded
+    Single-process, so ``_raise_batch_error_uniformly`` skips its gather and raises the recorded
     error directly — the gate's verdict is the assertion, not a mocked one.
     """
     host = types.SimpleNamespace(
@@ -80,7 +85,7 @@ def _host():
         _carry_reasoning=False,
         _max_train_row_tokens=None,
         _rows_over_cap=0,
-        _warned_capture_missing=False,
+        _warned_once=set(),
         _tokenizer=types.SimpleNamespace(model_max_length=4096),
         pad_token_id=0,
         eos_token_id=1,
@@ -90,6 +95,7 @@ def _host():
     for name in ("_tokenize_trajectory_turns", "_masked_trajectory_tensors", "_context_limit"):
         setattr(host, name, types.MethodType(getattr(Trainer, name), host))
     host._assemble_rollout_routing = types.MethodType(Trainer._assemble_rollout_routing, host)
+    host._record_batch_error = types.MethodType(Trainer._record_batch_error, host)
     host._raise_batch_error_uniformly = types.MethodType(Trainer._raise_batch_error_uniformly, host)
     return host
 
@@ -109,20 +115,40 @@ def _gate(host, rows):
     )
 
 
-def test_engine_cut_turns_leave_a_masked_row_with_no_routing():
-    """The mechanism: an excluded turn takes its routing with it, however well the engine captured it."""
+def test_an_engine_cut_turn_keeps_its_routing_on_a_negative_only_row():
+    """The mechanism: a cut turn's row is built like a trainable one, routing included, and tagged."""
     host = _host()
     rows = host._tokenize_trajectory_turns(_rollout(truncated=True, routing=True))
-    assert len(rows) == 1
-    assert rows[0].completion_mask.tolist() == [0], "an all-excluded trajectory must yield a masked row"
-    assert rows[0].turn_routing is None
+    assert len(rows) == 1 and rows[0].negative_only
+    assert rows[0].completion_mask.tolist() == [1] * len(SAMPLED)
+    assert rows[0].turn_routing is not None
     assert host._batch_build_error is None
 
 
-def test_gate_skips_a_batch_that_trains_nothing():
-    """No routing plus no trainable token is an empty step, not a capture failure."""
+def test_gate_assembles_the_engine_mask_for_a_negative_only_row():
+    """A tagged row trains under a negative advantage, so it replays the engine's selection like any row."""
     host = _host()
-    rows = [row for _ in range(2) for row in host._tokenize_trajectory_turns(_rollout(truncated=True, routing=True))]
+    masks = _gate(host, host._tokenize_trajectory_turns(_rollout(truncated=True, routing=True)))
+    assert masks is not None and int(masks.min()) == 0
+    assert flushed_metrics(host)["routing/rollout_full_frac"] == [1.0]
+
+
+def test_gate_raises_when_a_negative_only_row_carries_no_routing():
+    host = _host()
+    rows = host._tokenize_trajectory_turns(_rollout(truncated=True, routing=False))
+    with pytest.raises(ValueError, match="no rollout in this batch returned routed_experts"):
+        _gate(host, rows)
+
+
+def test_gate_skips_a_batch_that_trains_nothing():
+    """No routing plus no trainable token is an empty step, not a capture failure: cut turns the engine
+    returned no ids for yield no row at all."""
+    host = _host()
+    rows = [
+        row
+        for _ in range(2)
+        for row in host._tokenize_trajectory_turns(_rollout(truncated=True, routing=False, captured=False))
+    ]
     assert not any(r.completion_mask.any() for r in rows)
     assert _gate(host, rows) is None
 
@@ -140,7 +166,7 @@ def test_gate_raises_on_a_mixed_batch_that_still_trains_something():
     """Masked rows do not excuse a capture-less trainable one: that row would train with no selection
     to replay, which is the state the gate exists to refuse."""
     host = _host()
-    rows = host._tokenize_trajectory_turns(_rollout(truncated=True, routing=True))
+    rows = host._tokenize_trajectory_turns(_rollout(truncated=True, routing=False, captured=False))
     rows += host._tokenize_trajectory_turns(_rollout(truncated=False, routing=False))
     with pytest.raises(ValueError, match="routed_experts"):
         _gate(host, rows)

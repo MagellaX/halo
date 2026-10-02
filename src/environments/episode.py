@@ -17,11 +17,13 @@ import backoff
 
 from src.configs.rollout_config import (
     DEFAULT_THINKING_TURN_RESERVE,
+    REASONING_END_TOKEN_EXAMPLES,
     THINKING_SCOPE_EPISODE,
     THINKING_SCOPE_TURN,
     RolloutConfig,
 )
 from src.environments.base import (
+    CUT_IN_TOOL_CALL_KEY,
     THINKING_BUDGET_EXHAUSTED_KEY,
     VALID_REASONING_EFFORTS,
     AsyncBaseEnvironment,
@@ -30,7 +32,7 @@ from src.environments.base import (
     Trajectory,
     resolve_reasoning_effort,
 )
-from src.inference.response import ENGINE_CUT_FINISH_REASONS, FINISH_REASON_ABORT
+from src.inference.response import ENGINE_CUT_FINISH_REASONS, FINISH_REASON_ABORT, FINISH_REASON_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,8 @@ class EpisodeEffort:
     refuses one above a level's budget."""
     turn_ceiling: int | None = None
     """The run's per-turn reasoning ceiling (``rollout_max_thinking_tokens``), read under the episode scope."""
+    answer_headroom: int | None = None
+    """The tokens a turn may generate past its reasoning cap, read under the episode scope."""
 
     def turn_thinking_cap(self, reasoning_spent: int) -> int | None:
         """The engine's reasoning cap for the turn about to be generated.
@@ -70,6 +74,17 @@ class EpisodeEffort:
             return self.thinking_budget
         remaining = max(self.thinking_budget - reasoning_spent, self.turn_reserve)
         return remaining if self.turn_ceiling is None else min(remaining, self.turn_ceiling)
+
+    def turn_max_tokens(self, reasoning_spent: int) -> int:
+        """The engine's total token cap for the turn about to be generated.
+
+        Per-turn scope: :attr:`max_tokens`, every turn. Episode scope: the turn's reasoning cap
+        (:meth:`turn_thinking_cap`) plus the answer headroom, never above :attr:`max_tokens`, so a late
+        turn's total narrows with its reasoning."""
+        cap = self.turn_thinking_cap(reasoning_spent)
+        if self.scope == THINKING_SCOPE_TURN or cap is None or self.answer_headroom is None:
+            return self.max_tokens
+        return min(self.max_tokens, cap + self.answer_headroom)
 
     def spend_of(self, gen: "TurnGeneration", reasoning_end_token_id: int | None) -> int:
         """The reasoning a generated turn charges against the episode's budget: nothing under the
@@ -140,6 +155,7 @@ def bind_episode_effort(
     """
     level = resolve_episode_effort(context, env)
     budget = env.thinking_budget_for_effort(level) if level is not None else None
+    headroom = max_tokens if max_thinking_tokens is None else max(0, max_tokens - max_thinking_tokens)
     if budget is None:
         if scope == THINKING_SCOPE_EPISODE and max_thinking_tokens is None:
             raise ValueError(
@@ -154,15 +170,11 @@ def bind_episode_effort(
             scope=scope,
             turn_reserve=turn_reserve,
             turn_ceiling=max_thinking_tokens,
+            answer_headroom=headroom,
         )
     if scope == THINKING_SCOPE_TURN and max_thinking_tokens is not None:
         budget = min(budget, max_thinking_tokens)
-    if max_thinking_tokens is not None:
-        first_turn_cap = min(budget, max_thinking_tokens)
-        headroom = max(0, max_tokens - max_thinking_tokens)
-    else:
-        first_turn_cap = budget
-        headroom = max_tokens
+    first_turn_cap = budget if max_thinking_tokens is None else min(budget, max_thinking_tokens)
     return EpisodeEffort(
         level=level,
         thinking_budget=budget,
@@ -170,6 +182,7 @@ def bind_episode_effort(
         scope=scope,
         turn_reserve=turn_reserve,
         turn_ceiling=max_thinking_tokens,
+        answer_headroom=headroom,
     )
 
 
@@ -208,18 +221,34 @@ def validate_thinking_budget_scope(
         )
 
 
-def resolve_reasoning_end_token_id(tokenizer, token: str) -> int:
-    """The id of ``token`` under the tokenizer, required to resolve: a marker the tokenizer does not
-    know would count every turn's whole generation as reasoning and starve the episode of its budget
-    after the first turn."""
-    tid = tokenizer.convert_tokens_to_ids(token)
-    if tid is None or tid == getattr(tokenizer, "unk_token_id", None):
+def resolve_reasoning_end_ids(tokenizer, marker: str) -> tuple[int, ...]:
+    """``marker``'s ids as the engine forces them: encoded without special tokens, the way vLLM encodes its
+    reasoning parser's end string (one id for ``</think>`` or Gemma 4's ``<channel|>``, five for gpt-oss's
+    final-channel opener). A reasoning close sits on the tokenizer's added tokens, so an encoding holding none
+    of them is a marker this model does not write (``</think>`` where the vocabulary lacks it splits into
+    plain text) and raises."""
+    ids = tuple(tokenizer.encode(marker, add_special_tokens=False))
+    if not set(ids) & set(tokenizer.added_tokens_decoder):
         raise ValueError(
-            f"rollout_reasoning_end_token {token!r} is not a token of this tokenizer; the episode thinking scope "
-            "counts a turn's reasoning as the sampled ids up to and including that token, so name the model's "
-            "own marker"
+            f"rollout_reasoning_end_token {marker!r} is not a reasoning marker of this tokenizer: it encodes to "
+            f"{list(ids)}, none of them one of its added tokens. Name the end string the server's reasoning "
+            f"parser forces ({REASONING_END_TOKEN_EXAMPLES})."
         )
-    return tid
+    return ids
+
+
+def resolve_reasoning_end_token_id(tokenizer, token: str) -> int:
+    """The one id the episode thinking scope counts a turn's reasoning up to (:func:`reasoning_tokens_of`),
+    required to resolve: a marker the tokenizer does not know would count every turn's whole generation as
+    reasoning and starve the episode of its budget after the first turn."""
+    ids = resolve_reasoning_end_ids(tokenizer, token)
+    if len(ids) != 1:
+        raise ValueError(
+            f"rollout_reasoning_end_token {token!r} encodes to {len(ids)} tokens; the episode thinking scope "
+            "counts a turn's reasoning as the sampled ids up to and including one marker token, so run this "
+            "model under rollout_thinking_budget_scope: turn."
+        )
+    return ids[0]
 
 
 def effort_length_penalty(
@@ -422,9 +451,14 @@ def step_context_from_generation(context: dict[str, Any] | None, gen: TurnGenera
     step_ctx = dict(context) if context else {}
     step_ctx["finish_reason"] = gen.finish_reason
     # A cut turn is a fragment whatever the parser salvaged from it: the call it holds was never
-    # finished, and executing it books a malformed call and trains the fragment as a normal row.
-    if gen.tool_calls and gen.finish_reason not in ENGINE_CUT_FINISH_REASONS:
-        step_ctx["tool_calls"] = gen.tool_calls
+    # finished, and executing it books a malformed call and trains the fragment as a normal row. A turn
+    # that hit its token cap inside a call is told so, the one case the generic cut nudge misreads; an
+    # abort names no cause the recovery could pass on.
+    if gen.tool_calls:
+        if gen.finish_reason not in ENGINE_CUT_FINISH_REASONS:
+            step_ctx["tool_calls"] = gen.tool_calls
+        elif gen.finish_reason == FINISH_REASON_LENGTH:
+            step_ctx[CUT_IN_TOOL_CALL_KEY] = True
     if gen.reasoning:
         step_ctx["reasoning"] = gen.reasoning
     # ``is None``, not truthiness: an empty capture is a zero-token turn the engine did return ids

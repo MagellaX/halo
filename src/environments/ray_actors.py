@@ -290,15 +290,19 @@ class EnvironmentActor:
                 scope=config.thinking_budget_scope,
                 turn_reserve=config.thinking_turn_reserve,
             )
-            ep_config = replace(config, max_tokens=effort.max_tokens)
             reasoning_spent = 0
 
             for _ in range(env.max_turns):
                 if step.done:
                     break
 
-                # The engine cap this turn: the level's budget, or under the episode scope what it has left.
-                turn_config = replace(ep_config, max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent))
+                # The engine caps this turn: the level's budget, or under the episode scope what it has
+                # left, with the turn's total bounded alongside it.
+                turn_config = replace(
+                    config,
+                    max_tokens=effort.turn_max_tokens(reasoning_spent),
+                    max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent),
+                )
                 gen = await self._generate_turn(
                     client,
                     server_url,
@@ -564,10 +568,10 @@ class RolloutManager:
             return
         backend = self.rollout_config.backend
         logger.warning(
-            "Multi-node async GRPO but a %s URL is loopback (%s). Ray actors may "
-            "be scheduled on nodes where no %s server listens on localhost, causing "
-            "connection-refused rollouts silently returned as zero-reward. Use "
-            "resolvable host IPs/DNS in rollout_server_url / rollout_server_configs.",
+            "Multi-node async GRPO but a %s URL is loopback (%s). Ray actors may be scheduled on nodes where "
+            "no %s server listens on localhost; their connection-refused rollouts become error rows masked out "
+            "of the loss and the group baseline, shrinking the effective batch. Use resolvable host IPs/DNS in "
+            "rollout_server_url / rollout_server_configs.",
             backend,
             urls,
             backend,

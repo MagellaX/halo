@@ -15,12 +15,15 @@ import asyncio
 import dataclasses
 import logging
 import time
+import warnings
 
+import numpy as np
 import pytest
 
 from src.configs.environment_config import EnvironmentConfig
 from src.environments.base import (
     EPISODE_INVALID_KEY,
+    EPISODE_INVALID_REASON_KEY,
     OBJECTIVE_REWARD_KEY,
     REWARD_COMPONENTS_KEY,
     AsyncBaseEnvironment,
@@ -466,6 +469,21 @@ Action: calculate(expression="2 + 2")"""
     assert not step.has_final_answer
 
 
+def test_parse_react_output_reads_a_triple_quoted_code_argument_whole():
+    """Read by pattern alone, the value would stop at its first matching quote and the code's own ``x = 5``
+    line would become an argument of its own: an empty program would run, or the call would be refused for
+    an argument named ``x``."""
+    text = "Thought: compute\nAction: python(code='''import math\nx = 5\nprint(math.sqrt(x), \"done\")''')"
+    step = parse_react_output(text)
+    assert step.action == "python"
+    assert step.action_args == {"code": 'import math\nx = 5\nprint(math.sqrt(x), "done")'}
+
+
+def test_parse_react_output_keeps_the_pattern_for_text_that_is_no_python_call():
+    step = parse_react_output('Thought: t\nAction: search(query="a b", filters={"exact": true}, limit=3)')
+    assert step.action_args == {"query": "a b", "filters": {"exact": True}, "limit": 3}
+
+
 def test_parse_react_output_final_answer():
     """Test parsing ReAct output with final answer."""
 
@@ -511,6 +529,51 @@ def test_parse_react_output_malformed_json_degrades_instead_of_raising():
         step = parse_react_output(f"Thought: t\nAction: {action}")
         assert step.action is None or isinstance(step.action, str), action
         assert step.action_args is None or isinstance(step.action_args, dict), action
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "run(code={[1]: 2})",
+        "run(code={[1]})",
+        "run(code=" + "[" * 100_000 + "1])",
+        '{"name": "run", "arguments": ' + "[" * 100_000 + "]" * 100_000 + "}",
+        '{"name": "run", "arguments": {"code": ' + "1" * 5000 + "}}",
+        "run(code=[" + "1" * 5000 + "])",
+        "run: code=[" + "1" * 5000 + "]",
+    ],
+    ids=[
+        "unhashable-key",
+        "unhashable-set-member",
+        "deep-pattern-value",
+        "deep-json-action",
+        "huge-int-json-action",
+        "huge-int-call-value",
+        "huge-int-colon-value",
+    ],
+)
+def test_a_react_action_no_literal_can_build_degrades_instead_of_voiding_the_episode(action):
+    """An unhashable dict key or set member raises TypeError out of the literal reader, deep nesting a
+    RecursionError out of the JSON one, and an integer past Python's 4300-digit conversion limit a plain
+    ValueError out of ``json.loads``; uncaught, any of them escapes ``env.step`` and the policy voids its
+    own episode. Each degrades like any other malformed action, and the episode goes on."""
+    registry = NativeToolRegistry().register(
+        NativeTool(name="run", description="run", parameters=[], handler=lambda **kwargs: "ran")
+    )
+    env = ReActEnvironment(tool_registry=registry, max_turns=3)
+    ids, _ = env.reset(["task"], [{"answer": "4"}])
+    (step,) = env.step(ids, [f"Thought: t\nAction: {action}"], [{}])
+    assert not step.done
+
+
+def test_parse_react_output_reads_an_escape_python_rejects_without_a_syntax_warning():
+    """A regex's ``\\d`` in a code argument is read as Python reads it, silently: a ``SyntaxWarning`` per
+    parse would print once per action of every episode."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        step = parse_react_output("Thought: t\nAction: python(code=\"import re; re.findall('\\d', 'a1')\")")
+    assert step.action_args == {"code": "import re; re.findall('\\d', 'a1')"}
+    assert not [w for w in caught if issubclass(w.category, SyntaxWarning)]
 
 
 def test_parse_react_output_numeric_args():
@@ -1024,9 +1087,9 @@ def test_multi_tool_parallel_calls():
     assert traj.info["total_tool_calls"] == 3
     assert traj.info["successful_tool_calls"] == 3
 
-    tool_results = traj.info["tool_results"]
-    assert len(tool_results) == 3
-    assert all(r["success"] for r in tool_results)
+    tool_messages = [m for m in traj.messages if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_messages] == ["call_a", "call_b", "call_c"]
+    assert not any(m.content.startswith("Error") for m in tool_messages)
 
 
 def test_tool_error_handling():
@@ -1061,10 +1124,9 @@ def test_tool_error_handling():
     assert traj.info["total_tool_calls"] == 1
     assert traj.info["successful_tool_calls"] == 0
 
-    tool_results = traj.info["tool_results"]
-    assert len(tool_results) == 1
-    assert tool_results[0]["success"] is False
-    assert "Error" in tool_results[0]["content"]
+    tool_messages = [m for m in traj.messages if m.role == "tool"]
+    assert len(tool_messages) == 1
+    assert "Error" in tool_messages[0].content
 
 
 def test_unknown_tool_handling():
@@ -1084,11 +1146,11 @@ def test_unknown_tool_handling():
     env.step(episode_ids, ["Using unknown tool..."], [{"tool_calls": tool_calls}])
 
     traj = env.get_trajectories(episode_ids)[0]
-    tool_results = traj.info["tool_results"]
+    tool_messages = [m for m in traj.messages if m.role == "tool"]
 
-    assert len(tool_results) == 1
-    assert tool_results[0]["success"] is False
-    assert "Unknown tool" in tool_results[0]["content"] or "not found" in tool_results[0]["content"].lower()
+    assert len(tool_messages) == 1
+    assert traj.info["successful_tool_calls"] == 0
+    assert "Unknown tool" in tool_messages[0].content
 
 
 def test_react_search_environment():
@@ -1352,6 +1414,24 @@ def test_web_search_raises_on_backend_failure_no_mock_fabrication():
         ws._BACKENDS["serper"] = original
 
 
+def test_a_failing_search_backend_is_logged_once_by_the_protocol(monkeypatch, caplog):
+    """The backend fault reaches the log through the protocol that ran the tool, traceback included;
+    a second warning from the search module would log the same failure twice per call."""
+
+    def _boom(**kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setitem(ws._BACKENDS, "serper", dataclasses.replace(ws._BACKENDS["serper"], sync=_boom))
+    env = NativeToolUseEnvironment(tool_registry=create_native_search_tools(backend="serper"), max_turns=3)
+    ids, _ = env.reset(["task"])
+    call = {"id": "c1", "function": {"name": "web_search", "arguments": '{"query": "q"}'}}
+    with caplog.at_level(logging.DEBUG, logger="src.environments"):
+        env.step(ids, ["searching"], [{"finish_reason": "tool_calls", "tool_calls": [call]}])
+    warnings_logged = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings_logged) == 1 and warnings_logged[0].exc_info is not None
+    assert "network down" in env.get_trajectories(ids)[0].messages[-1].content
+
+
 def test_web_search_format_results():
     """Test result formatting."""
 
@@ -1574,6 +1654,8 @@ def test_native_tool_use_null_answer_is_invalid_not_a_free_success():
     assert traj.info["completed"] is True
     assert traj.total_reward == 0.0  # graded 0, never the completion payout
     assert traj.episode_invalid is True  # and dropped from the group baseline
+    # Named where the all-invalid step halt and the eval runner read the cause.
+    assert "null" in traj.info[EPISODE_INVALID_REASON_KEY]
 
     env.cleanup(episode_ids)
 
@@ -1592,6 +1674,7 @@ def test_react_null_answer_is_invalid_not_a_free_success():
     assert traj.info["completed"] is True
     assert traj.total_reward == 0.0  # graded 0, never the completion payout
     assert traj.info[EPISODE_INVALID_KEY] is True
+    assert "null" in traj.info[EPISODE_INVALID_REASON_KEY]
 
     env.cleanup(episode_ids)
 
@@ -1633,24 +1716,20 @@ def test_qa_search_environment_correct_answer(allow_mock_search):
         [{"answer": "1889"}],
     )
 
-    # Final answer without tools. ``require_tool_use`` only FLAGS the zero-tool-call finish; the price
-    # is the episode-level no_tool_use_penalty (default 0), so a correct answer scores exactly 1.0 —
-    # charging the per-call tool_error_penalty here too would double-bill the same condition.
+    # Final answer without tools: the zero-tool-call price is the episode-level no_tool_use_penalty
+    # (default 0), so a correct answer scores exactly 1.0 — charging the per-call tool_error_penalty
+    # here too would double-bill the same condition.
     env.step(episode_ids, ["1889"])
     traj = env.get_trajectories(episode_ids)[0]
     assert traj.done
-    assert traj.info["no_tool_use"] is True
     assert abs(traj.total_reward - 1.0) < 1e-9, traj.total_reward
 
     env.cleanup(episode_ids)
 
 
 def test_no_tool_use_is_charged_once_by_the_dedicated_knob(allow_mock_search):
-    """The zero-tool-call giveup costs exactly ``no_tool_use_penalty``, once, under ``reward/tool_shaping``.
-
-    ``require_tool_use`` and ``_tool_use_shaping`` both fire on that condition; the terminal step must
-    not add a second (per-call) charge on top of the episode-level one.
-    """
+    """The zero-tool-call giveup costs exactly ``no_tool_use_penalty``, once, under ``reward/tool_shaping``:
+    the terminal step must not add a second (per-call) charge on top of the episode-level one."""
 
     env = create_qa_search_environment(max_turns=5, search_backend="mock", no_tool_use_penalty=0.3)
     episode_ids, _ = env.reset(["Q?"], [{"answer": "A"}])
@@ -1788,7 +1867,7 @@ def test_exam_qa_multiple_choice_wrong():
 
 
 def test_exam_qa_index_answer_is_graded_as_its_choice_letter():
-    """MMLU/ARC ship ``answer`` as a 0-based index into ``choices``.
+    """MMLU ships ``answer`` as a 0-based index into ``choices``.
 
     ``multiple_choice_match`` scores anything that is not a single letter as wrong, so an unconverted
     index grades EVERY completion 0: a GRPO group with zero variance, no gradient, and nothing in the
@@ -1802,13 +1881,24 @@ def test_exam_qa_index_answer_is_graded_as_its_choice_letter():
     env.step(episode_ids, ["The answer is B"])
     assert env.get_trajectories(episode_ids)[0].total_reward == 1.0
 
-    # A digit string is the same shape; and the conversion must still grade a wrong letter as wrong.
-    other_ids, _ = env.reset(["Which is the largest planet?"], [{"answer": "2", "choices": choices}])
+    # A numpy integer is the same index; and the conversion must still grade a wrong letter as wrong.
+    other_ids, _ = env.reset(["Which is the largest planet?"], [{"answer": np.int64(2), "choices": choices}])
     assert env.get_trajectories(other_ids)[0].info["expected_answer"] == "C"
     env.step(other_ids, ["The answer is B"])
     assert env.get_trajectories(other_ids)[0].total_reward == 0.0
 
     env.cleanup(episode_ids + other_ids)
+
+
+@pytest.mark.parametrize("answer", ["1", "2", "4"])
+def test_exam_qa_digit_string_answer_is_refused_not_read_as_an_index(answer):
+    """ARC's ``answerKey`` labels some rows ``"1"``-``"4"``, 1-based: read 0-based, ``"2"`` would grade
+    choice C where the row means B, and ``"4"`` would address no choice at all. Either reading misgrades a
+    convention, so a digit string raises at episode start instead of grading the wrong choice."""
+    env = ExamQAEnvironment(max_turns=3)
+    choices = ["Mars", "Jupiter", "Saturn", "Neptune"]
+    with pytest.raises(ValueError, match="is a digit string"):
+        env.reset(["Which is the largest planet?"], [{"answer": answer, "choices": choices}])
 
 
 def test_exam_qa_letter_answers_pass_through_and_bad_shapes_fail_loud():
@@ -2009,6 +2099,7 @@ def test_native_call_missing_a_required_argument_is_a_refusal_not_a_fault(caplog
     """A model that calls ``submit_solution`` with no ``code`` is charged the tool error and told which
     argument it dropped, without the traceback the log reserves for a tool that actually broke."""
     env = CodeContestsEnvironment(language="python", sandbox_backend="local", tool_error_penalty=0.05)
+    caplog.clear()  # the local sandbox's once-per-process isolation warning fires at construction
     trajectory = Trajectory()
     trajectory.info.update(total_tool_calls=0, successful_tool_calls=0)
     call = NativeToolCall(id="1", name="submit_solution", arguments={})

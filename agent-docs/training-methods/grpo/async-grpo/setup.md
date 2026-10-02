@@ -68,6 +68,8 @@ The sync is rolling — N−1 servers stay live — only for a raw model in a si
 
 Prefetch runs **one round deep**: a round pops what the previous one submitted, then submits its own, so `num_prefetch_batches` (default `1`) adds queue headroom only. It, `num_rollout_workers` and an explicit `max_concurrent_rollouts` are all refused below `1`; turn prefetch off with `enable_prefetch: false`.
 
+A checkpoint carries each rank's submitted-but-untrained round (`prefetch_pending-<rank>-of-<world>.pt`, with the group size, round size and DP slice it was drawn under), and a resume submits it again before its first round. A save on a generation boundary therefore resumes onto the batches an uninterrupted run trains, and by default every save is on one, since `steps_per_generation` equals the accumulation steps. A save between generation boundaries (a round that feeds several optimizer steps, with `save_steps` landing inside it) resumes into the middle of that round and trains the round twice. A checkpoint with no file for this world size, or one drawn under another layout, resumes with a cold round, which skips that batch and trains the next one twice. A file present on some ranks and missing on others (a non-shared filesystem resumed under another rank-to-node placement, or a torn copy) raises: resume with the saving placement, or delete the `prefetch_pending-*` files to open with a cold round.
+
 `async/prefetch_hit_rate` says which phase bounds the step, not whether the servers are healthy. On a short single-turn environment it should climb toward 1; below ~0.8, add servers or raise `max_concurrent_rollouts` / `num_rollout_workers`. A multi-turn round outlasts the update, so it sits near 0 by construction.
 
 ![One rollout server, the compose default: trainer ranks on GPUs 0–6, the engine on GPU 7 joining the NCCL group whose store the trainer binds on :51216, actors generating over POST /v1/chat/completions; the push pauses the engine (POST /pause?mode=keep), prefetch is off, and step time is sync + round + update](../../../assets/diagrams/environmental_grpo_single_server.png)
@@ -76,7 +78,7 @@ Prefetch runs **one round deep**: a round pops what the previous one submitted, 
 
 ## Multi-node
 
-Training, engines and Ray actors can sit on separate nodes. Point `ray_address` at the cluster head ([Ray Cluster](../../../infrastructure/ray.md#multi-node)) and give each inference node its own `rollout_server_configs` entry, `group_port` and, where the trainer's routable address differs per server, `group_host`. Use resolvable host names: a loopback URL reaches actor nodes with no engine, and those episodes come back as silent zero-reward rows.
+Training, engines and Ray actors can sit on separate nodes. Point `ray_address` at the cluster head ([Ray Cluster](../../../infrastructure/ray.md#multi-node)) and give each inference node its own `rollout_server_configs` entry, `group_port` and, where the trainer's routable address differs per server, `group_host`. Use resolvable host names: a loopback URL reaches actor nodes with no engine, and those episodes error into masked rows outside their group's baseline, shrinking the batch; a round where none survives trips the all-invalid halt ([Batch construction](objective.md#batch-construction)).
 
 `num_rollout_workers` actors are created per training rank, soft-pinned to that rank's node; on a shared cluster the budget divides by world size ([pool sizing](../../../infrastructure/ray.md#pool-sizing)).
 
@@ -88,8 +90,8 @@ The trainer's NCCL address must be routable from the serving nodes: set the proc
 
 ## Shipped recipes
 
-`examples/grpo/environmental/<family>/<backend>/` — `gemma4`, `gptoss` and `qwen3_5`, each with `vllm/` and `sglang/`. In a filename, `-lora-` / `-full-` is the adapter and `-ep1` / `-ep4` the expert distribution (undistributed experts, or a 4-rank DeepEP group). Each header carries its own launch line and server flags.
+`examples/grpo/environmental/<family>/<backend>/` — `gemma4`, `gptoss` and `qwen3_5`, each with `vllm/` and `sglang/`. In a filename, `-lora-` / `-full-` is the adapter and `-ep1` / `-ep4` the expert distribution (undistributed experts, or a 4-rank DeepEP group). Each header carries its own launch line and server flags. One template sits at the root: `environmental-grpo-template.yaml` (`react_math`).
 
 Start from `gptoss/vllm/gptoss-20b-code-contests-lora-ep1.yaml` for a tool-heavy graded environment, or `qwen3_5/vllm/qwen3.6-35b-a3b-react-math-full-ep4.yaml` for a light two-tool one. The `sglang/` directories ship ep1 files only.
 
-Every recipe runs `beta: 0`. The code-contests ones drive a two-server pool at `episode_timeout: 2700`, so launch them with `DIST_NCCL_TIMEOUT_MINUTES=60` ([timeout bounds](performance.md#sizing-a-run)). The rest are single-server, prefetch off.
+Every family recipe runs `beta: 0`; the root template runs `0.01`. The code-contests ones drive a two-server pool at `episode_timeout: 2700`, so launch them with `DIST_NCCL_TIMEOUT_MINUTES=60` ([timeout bounds](performance.md#sizing-a-run)). The rest are single-server, prefetch off.

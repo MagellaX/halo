@@ -1,9 +1,10 @@
 """Question-answering task environments with rule-based rewards (no neural reward model)."""
 
+import numbers
 import re
 from typing import Any
 
-from src.environments.base import EpisodeGrade, Trajectory
+from src.environments.base import ANSWER_KEY, EpisodeGrade, Trajectory
 from src.environments.envs.protocols.native import NativeToolUseEnvironment
 from src.environments.tools.definitions import NativeToolRegistry
 from src.environments.tools.factories import create_native_python_tools, create_native_search_tools
@@ -68,18 +69,17 @@ def create_qa_search_environment(
 ) -> NativeToolUseEnvironment:
     """Create a factual-QA-with-search environment (SimpleQA/GAIA/TriviaQA/PopQA).
 
-    Sets ``require_tool_use``; final answer validated against ``context["answer"]`` by the parent reward.
+    The final answer is validated against ``context["answer"]`` by the parent reward.
     """
     registry = create_native_search_tools(backend=search_backend)
     if include_python_tools:
         registry.merge(create_native_python_tools())
 
-    # setdefault, not a keyword argument: the registry forwards the whole env_config, so an explicit
-    # ``require_tool_use`` in environment_kwargs must override this rather than raise a
-    # duplicate-keyword TypeError. The answer is required because the parent grades against it only
-    # when a row carries one, and otherwise grades merely completing 1. ``None`` counts as unset, so
-    # a YAML ``requires_answer: null`` still gets this preset's answer.
-    kwargs.setdefault("require_tool_use", True)
+    # Defaulted into kwargs, not passed as a keyword: the registry forwards the whole env_config, so
+    # a keyword here makes an explicit ``requires_answer`` in environment_kwargs a duplicate-keyword
+    # TypeError instead of an override. The answer is required because the parent grades against it
+    # only when a row carries one, and otherwise grades merely completing 1.
+    # ``None`` counts as unset, so a YAML ``requires_answer: null`` still gets this preset's answer.
     if kwargs.get("requires_answer") is None:
         kwargs["requires_answer"] = True
     return NativeToolUseEnvironment(
@@ -146,24 +146,32 @@ class ExamQAEnvironment(NativeToolUseEnvironment):
     @staticmethod
     def _expected_choice_letter(expected: Any, choices: Any) -> str:
         """Normalize a multiple-choice row's expected answer to a letter :func:`multiple_choice_match`
-        scores: a letter passes through, a 0-based index into ``choices`` becomes its letter.
+        scores: a letter passes through, a 0-based integer index into ``choices`` becomes its letter.
 
-        MMLU/ARC ship ``answer`` as an int (occasionally a digit string), and the matcher rejects
-        anything that is not a single letter, so an unconverted row grades 0 on every completion and
-        leaves its GRPO group with zero variance. Any other shape raises here, at episode start.
+        MMLU ships ``answer`` as an int, and the matcher rejects anything that is not a single letter, so
+        an unconverted row grades 0 on every completion and leaves its GRPO group with zero variance. A
+        digit string is refused, not read as an index: ARC's ``answerKey`` labels some rows ``"1"``-``"5"``,
+        1-based, so no one reading of it is safe. Any other shape raises here, at episode start.
         """
         # bool is an int subclass, so True would otherwise index choice "B".
         if not isinstance(expected, bool):
             text = str(expected).strip()
             if len(text) == 1 and text.upper() in MULTIPLE_CHOICE_LETTERS:
                 return text.upper()
-            if isinstance(expected, int) or text.isdigit():
-                index = int(text)
+            if isinstance(expected, numbers.Integral):
+                index = int(expected)
                 if 0 <= index < min(len(choices), len(MULTIPLE_CHOICE_LETTERS)):
                     return MULTIPLE_CHOICE_LETTERS[index]
                 raise ValueError(
                     f"multiple-choice answer index {index} does not address any of the {len(choices)} "
                     f"choices gradable as {MULTIPLE_CHOICE_LETTERS[0]}-{MULTIPLE_CHOICE_LETTERS[-1]}."
+                )
+            if text.isdigit():
+                raise ValueError(
+                    f"multiple-choice answer {expected!r} is a digit string: as a 0-based index and as a 1-based "
+                    "label (ARC's answerKey) it names different choices, so convert it to a choice letter "
+                    f"({MULTIPLE_CHOICE_LETTERS[0]}-{MULTIPLE_CHOICE_LETTERS[-1]}) or an int index in dataset "
+                    "preparation."
                 )
         raise ValueError(
             f"multiple-choice answer {expected!r} is neither a choice letter "
@@ -180,7 +188,7 @@ class ExamQAEnvironment(NativeToolUseEnvironment):
         traj = super()._reset_single(prompt, context)
         context = context or {}
 
-        traj.info["expected_answer"] = context.get("answer")
+        traj.info["expected_answer"] = context.get(ANSWER_KEY)
         traj.info["choices"] = context.get("choices")
         traj.info["is_multiple_choice"] = context.get("choices") is not None
 

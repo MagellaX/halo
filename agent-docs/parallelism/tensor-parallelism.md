@@ -26,7 +26,7 @@ mesh, so one `full_tensor()` walk reconstructs either. The exception is the para
 
 **Native HF TP** (dense models with `base_model_tp_plan`, via `tp_plan="auto"` — shards attention,
 MLP, and the vocab dim of a [tied embedding/head pair](#tied-embeddings-under-hf-native-tp)): Llama,
-Mistral, any dense HF model declaring the plan.
+Mistral, Qwen3, Qwen3.5/3.6 dense, any dense HF model declaring the plan.
 
 **Selective TP** (attention only, `apply_tp_to_attention_only()`; MoE handled by EP,
 embedding/lm_head replicated):
@@ -34,20 +34,21 @@ embedding/lm_head replicated):
 | Model | Notes | Page |
 |---|---|---|
 | GPT-OSS | Attention sinks sharded as non-DTensor, all-gathered at save | [gpt-oss.md](../models/gpt-oss.md) |
-| Qwen3 dense / Qwen3 MoE | ColwiseParallel(Q/K/V) + RowwiseParallel(O) | [qwen3.md](../models/qwen3.md) |
-| Qwen3.5 / Qwen3.6 dense / MoE | Double-width `q_proj` shards uniformly | [qwen3_5.md](../models/qwen3_5.md) |
+| Qwen3 MoE | ColwiseParallel(Q/K/V) + RowwiseParallel(O) | [qwen3.md](../models/qwen3.md) |
+| Qwen3.5 / Qwen3.6 MoE | Double-width `q_proj` shards uniformly | [qwen3_5.md](../models/qwen3_5.md) |
 | GLM-4 MoE Lite | MLA — of the colwise projections only `q_b_proj` / `kv_b_proj` shard (`o_proj` is still rowwise) | [glm4.md](../models/glm4.md) |
 | LFM-2 MoE | Standard GQA pattern | [lfm2.md](../models/lfm2.md) |
 | Mistral4 | MLA — same as GLM-4 | [mistral4.md](../models/mistral4.md) |
-| Qwen3-VL (text tower) | `Qwen3VLTextAttention`; the vision tower stays replicated | [qwen3.md](../models/qwen3.md#qwen3-vl) |
 | Cohere2 MoE | Standard GQA pattern; the tied lm_head stays replicated | [cohere2-moe.md](../models/cohere2-moe.md) |
 
 Every MoE under **pure** TP routes to `_load_tp_moe_model` rather than `tp_plan="auto"`, because
 HF's auto plan wrongly shards MoE expert biases. Supported attention classes:
 `src/distributed/tensor_parallel/module_types.py`.
 
-**Not supported:** every family absent from the table above. None of their attention classes is in
-the registry, so a `tp_size > 1` run shards zero layers and raises rather than silently leaving
+**Not supported:** every family absent from the table above, and Qwen3-VL: a dense checkpoint loads
+through HF-native `tp_plan="auto"` and the architecture ships no `base_model_tp_plan`, so the load
+raises, while the MoE variant's `Qwen3VLMoeTextAttention` is in no registry
+([qwen3.md](../models/qwen3.md#qwen3-vl)). For the others no attention class is in the registry, so a `tp_size > 1` run shards zero layers and raises rather than silently leaving
 every weight replicated. Zaya trips the earlier head-divisibility gate at `tp_size > 2`
 (`num_key_value_heads` is 2). Use EP for their experts.
 
@@ -270,6 +271,8 @@ single-domain multi-group EP with `ep_size > 2` (`ep4+tp2` on 8) and multi-domai
 | native EP expert LoRA | rejected — the grouped expert adapters ride the EP-distributed expert weights, which both TP gates skip by param identity, so no adapter shape under EP+TP is gradient- or save/merge-covered. Train expert LoRA under EP without TP | same |
 | QLoRA / `load_in_4bit` | rejected — the TP loaders materialize plain de-quantized weights | `model_loading.py` |
 | `fsdp_reshard_after_forward` | rejected at `data_parallel_size > 1` — a plain all-gather on TP-sharded DTensor params has no registered sharding strategy | `_validate_fsdp_settings` |
+| `fsdp_reshard_after_backward: false` | rejected — the TP setup shards through its own `fully_shard` calls | same |
+| `fsdp_defer_grad_sync` | rejected at `data_parallel_size == 1` — no FSDP2 wrap, so no reduce to defer | same |
 | `fsdp_shard_ep1_experts: false` | rejected — the TP path shards `ep1` experts unconditionally | same |
 | `use_hsdp` | rejected — TP builds its own `(dp, tp)` mesh | `_validate_hsdp` |
 | `init_from_scratch` | rejected — no sharded random init | `model_loading.py` |

@@ -187,9 +187,9 @@ MANIFEST: dict[str, TestSpec] = {
     "kernels/test_chunked_logprob_precision.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
     "kernels/test_deepgemm.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
     "kernels/test_fa4_trainable_sink_rescale.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
+    "kernels/test_flex_sliding_attention.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=900),
     "kernels/test_fused_glu.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
     "kernels/test_moe_permute.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu", "moe"), timeout=600),
-    "kernels/test_flex_sliding_attention.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=900),
     "kernels/test_family_kernel_stack_numerics.py": TestSpec(
         nproc=1,
         markers=("gpu", "full", "1gpu", "moe", *_family_markers(_TINY_MOE_FAMILIES)),
@@ -249,7 +249,7 @@ MANIFEST: dict[str, TestSpec] = {
         timeout=1200,
     ),
     "parallelism/combined/test_ep_sharded_save_tp_sinks.py": TestSpec(
-        nproc=2, markers=("gpu", "core", "2gpu", "ep", "tp", "gptoss"), timeout=600
+        nproc=2, markers=("gpu", "core", "2gpu", "ep", "tp", "moe", "gptoss"), timeout=600
     ),
     "parallelism/combined/test_ep_etp_combo_correctness.py": TestSpec(
         nproc=4, markers=("gpu", "full", "4gpu", "ep", "etp", "moe", "gptoss"), timeout=1000
@@ -961,7 +961,7 @@ MANIFEST: dict[str, TestSpec] = {
     ),
     "trainers/lora/test_lora_tp_save_load.py": TestSpec(
         nproc=2,
-        markers=("gpu", "full", "2gpu", "lora", "tp", "ep", "qwen3", "gptoss"),
+        markers=("gpu", "full", "2gpu", "lora", "tp", "ep", "moe", "qwen3", "gptoss"),
         timeout=1000,
     ),
     "trainers/lora/test_sft_oss20b_ep_lora.py": TestSpec(
@@ -1073,13 +1073,13 @@ MANIFEST: dict[str, TestSpec] = {
         nproc=2, markers=("gpu", "core", "2gpu", "cp", "qwen3"), timeout=600
     ),
     "trainers/preference/test_smpo_ep.py": TestSpec(
-        nproc=2, markers=("gpu", "full", "2gpu", "ep", "gptoss"), timeout=1000
+        nproc=2, markers=("gpu", "full", "2gpu", "ep", "moe", "gptoss"), timeout=1000
     ),
     "trainers/preference/test_smpo_ep_experts.py": TestSpec(
         nproc=2, markers=("gpu", "full", "2gpu", "lora", "ep", "moe", "gptoss"), timeout=1200
     ),
     "trainers/preference/test_smpo_ep_cp.py": TestSpec(
-        nproc=2, markers=("gpu", "full", "2gpu", "ep", "cp", "gptoss"), timeout=1000
+        nproc=2, markers=("gpu", "full", "2gpu", "ep", "cp", "moe", "gptoss"), timeout=1000
     ),
     "trainers/preference/test_smpo_fsdp.py": TestSpec(nproc=2, markers=("gpu", "core", "2gpu", "qwen3"), timeout=600),
     "trainers/preference/test_smpo_padding_free.py": TestSpec(
@@ -1192,7 +1192,7 @@ MANIFEST: dict[str, TestSpec] = {
         nproc=2, markers=("gpu", "full", "2gpu", "ep", "moe", "gemma4"), timeout=1500
     ),
     "trainers/sft/test_sft_gemma4_vlm.py": TestSpec(
-        nproc=2, markers=("gpu", "full", "2gpu", "ep", "vlm", "gemma4"), timeout=1500
+        nproc=2, markers=("gpu", "full", "2gpu", "ep", "vlm", "moe", "gemma4"), timeout=1500
     ),
     "trainers/sft/test_sft_deepseek_v4_moe.py": TestSpec(
         nproc=2, markers=("gpu", "core", "2gpu", "ep", "moe", "deepseek_v4"), timeout=1200

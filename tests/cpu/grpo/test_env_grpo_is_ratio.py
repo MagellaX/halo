@@ -8,7 +8,7 @@ silently removing the correction on any step containing one bad episode.
 import pytest
 import torch
 
-from src.trainers.grpo.objective.logratio import compute_is_ratio
+from src.trainers.grpo.objective.logratio import compute_is_ratio, zero_engine_forced_closes
 
 CLIP_MAX = 3.0
 
@@ -76,6 +76,62 @@ def test_ratio_is_truncated_at_clip_max():
     """A huge positive log-ratio is clamped so a negative-advantage term can't blow up."""
     ratio, _, _ = _run([[0.0]], [[-20.0]], [[1]], [True])
     assert ratio.item() == pytest.approx(CLIP_MAX)
+
+
+_END = 7
+
+
+def test_only_forced_reasoning_closes_lose_their_policy_gradient():
+    """A reasoning close the engine forced at the thinking budget (the end token at probability 1) gets ratio 0:
+    trained with the episode's advantage it moves the model's own close probability. A naturally certain token
+    of any other id, an unforced close, and a row without sampling logprobs all keep their ratio."""
+    sampling = torch.tensor([[-0.3, 0.0, 0.0, -0.4], [0.0, 0.0, 0.0, 0.0]])
+    ids = torch.tensor([[5, _END, 9, _END], [_END, 5, 5, 5]])
+    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]])
+    ratio, forced = zero_engine_forced_closes(
+        torch.ones(2, 4), sampling, mask, torch.tensor([True, False]), ids, (_END,)
+    )
+    assert forced.tolist() == [[False, True, False, False], [False, False, False, False]]
+    assert ratio.tolist() == [[1.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]
+
+
+_OPENER = (70, 71, 72, 73, 74)
+
+
+def test_a_forced_multi_token_close_loses_its_policy_gradient_as_one_run():
+    """gpt-oss's budget appends a five-token opener, every token at probability 1. The whole run gets ratio 0;
+    the same ids with one token the model chose (a natural close), a run cut short, and a lone certain id of
+    the run keep their ratio."""
+    certain, chosen = 0.0, -0.2
+    sampling = torch.tensor(
+        [
+            [-0.5, certain, certain, certain, certain, certain, -0.4, -0.3],
+            [-0.5, certain, certain, chosen, certain, certain, -0.4, -0.3],
+            [-0.5, -0.1, certain, certain, certain, -0.2, -0.3, -0.1],
+            [-0.5, -0.1, -0.3, -0.2, certain, certain, certain, certain],
+        ]
+    )
+    ids = torch.tensor(
+        [[1, *_OPENER, 2, 3], [1, *_OPENER, 2, 3], [1, 9, 72, 73, 74, 2, 3, 4], [1, 9, 8, 7, *_OPENER[:4]]]
+    )
+    mask = torch.ones_like(ids)
+    ratio, forced = zero_engine_forced_closes(
+        torch.ones(4, 8), sampling, mask, torch.ones(4, dtype=torch.bool), ids, _OPENER
+    )
+    assert forced.int().tolist() == [[0, 1, 1, 1, 1, 1, 0, 0], [0] * 8, [0] * 8, [0] * 8]
+    assert ratio[0].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    assert ratio[1:].eq(1.0).all()
+
+
+def test_a_completion_narrower_than_the_close_has_none_to_zero():
+    """A batch whose completions are all shorter than the five-token opener cannot hold a forced close: it
+    keeps every ratio, where sliding the opener's window over it would raise."""
+    ids = torch.tensor([list(_OPENER[:3]), [9, 8, 7]])
+    ratio, forced = zero_engine_forced_closes(
+        torch.full((2, 3), 0.7), torch.zeros(2, 3), torch.ones(2, 3), torch.ones(2, dtype=torch.bool), ids, _OPENER
+    )
+    assert not forced.any() and forced.shape == (2, 3)
+    assert ratio.eq(0.7).all()
 
 
 if __name__ == "__main__":

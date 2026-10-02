@@ -87,7 +87,11 @@ describes a validator or contract, never a launchable topology
 - `ep_group_size` must divide its scope and not exceed it: `nvlink_domain_size` for
   `node`; for `global`, `stage_world_size` (`world_size // pp_size`), which it must
   also tile as equal contiguous per-domain blocks.
-- EP+TP: `ep_size` must be a multiple of `tp_size`, so each EP group spans whole TP groups.
+- EP+TP: `ep_size` must be a multiple of `tp_size`, so each EP group spans whole TP groups. On one
+  NVLink domain that means `ep_size=2` (`ep2+tp2` on 8 = four 2-rank EP groups) or an EP group that
+  fills the domain (`ep8+tp2` on 8); `ep4+tp2` on 8 is the racy topology and is rejected. Above one
+  domain multi-group EP+TP is rejected — use one global EP group (`ep_size == world_size`,
+  `ep_scope: global`).
 - `world_size % gpus_per_node == 0` and `world_size % nvlink_domain_size == 0`.
 
 ## REJECT THESE (verdict = do not run)
@@ -132,7 +136,10 @@ describes a validator or contract, never a launchable topology
 - **`fsdp_shard_ep1_experts=False` with TP or CP**, and **`fsdp_reshard_after_forward=True`
   wherever an expert-distribution group exists** — the gate is `is_ep_mode`
   (`ep_group_size > 1`), so pure ETP (`ep_size=1`, `expert_tp_size>1`) is rejected alongside EP —
-  **or with TP at `dp_size>1`**. `_validate_fsdp_settings` raises.
+  **or with TP at `dp_size>1`**; **`fsdp_defer_grad_sync=True` with TP at `dp_size==1`** (no FSDP2
+  wrap to defer) **or with `fsdp_reshard_after_forward=True`** (the held unsharded gradient is the
+  state ZeRO-3 shards — defer under ZeRO-2). `_validate_fsdp_settings` raises; QLoRA refuses
+  every FSDP shaping knob at trainer construction.
 - **Expert LoRA with ETP** (`expert_tp_size > 1` + `expert_lora`) — `_validate_expert_tp` raises:
   the replicated adapter half would take a partial, never-synced gradient.
 - **LoRA/PEFT with TP** (`tp_size > 1`) — adapters are plain tensors outside the TP graph, so the

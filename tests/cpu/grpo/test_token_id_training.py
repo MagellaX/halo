@@ -261,7 +261,7 @@ def _turns_stub():
     """A stub exposing only _tokenize_trajectory_turns + its render dep, no tokenizer needed for the
     old-logps rows (fallback path is not exercised)."""
     stub = types.SimpleNamespace(
-        _warned_capture_missing=False,
+        _warned_once=set(),
         _rollout_routing_replay=False,
         _rollout_template_kwargs={},
         _carry_reasoning=False,
@@ -287,7 +287,7 @@ def test_old_logps_aligned_1to1_with_sampled_ids():
     rows = _turns_stub()._tokenize_trajectory_turns(RolloutResult(prompt="q", trajectory=traj))
 
     assert len(rows) == 2
-    for (_, comp, mask, old, _routing), ids, lps in zip(
+    for (_, comp, mask, old, _routing, _negative_only), ids, lps in zip(
         rows, [[10, 11, 12], [20, 21]], [[-0.1, -0.2, -0.3], [-0.4, -0.5]], strict=True
     ):
         assert comp.tolist() == ids
@@ -315,6 +315,7 @@ def test_turns_path_records_context_overflow():
     stub = _turns_stub()
     stub._context_limit = lambda: 4  # render=3 prompt tokens + 5 completion ids = 8 > 4
     stub._batch_build_error = None
+    stub._record_batch_error = types.MethodType(Trainer._record_batch_error, stub)
     stub._rollout_template_kwargs = {}
     stub._carry_reasoning = False
     stub._max_train_row_tokens = None
@@ -331,7 +332,7 @@ def test_turns_path_records_context_overflow():
 def _render_stub(render):
     """A stub with the REAL whole-trajectory tokenizer and per-turn splitter wired over ``render``."""
     stub = types.SimpleNamespace(
-        _warned_capture_missing=False,
+        _warned_once=set(),
         _rollout_routing_replay=False,
         _rollout_backend="vllm",
         _batch_build_error=None,
@@ -345,6 +346,7 @@ def _render_stub(render):
     )
     stub._render_messages_to_ids = render
     stub._context_limit = lambda: 10**9
+    stub._record_batch_error = types.MethodType(Trainer._record_batch_error, stub)
     stub._masked_trajectory_tensors = types.MethodType(Trainer._masked_trajectory_tensors, stub)
     stub._invalidate_untrainable_episode = types.MethodType(Trainer._invalidate_untrainable_episode, stub)
     stub._tokenize_trajectory = types.MethodType(Trainer._tokenize_trajectory, stub)
@@ -395,6 +397,25 @@ def test_per_turn_prefix_render_failure_drops_the_episode_not_the_run():
     assert stub._batch_build_error is None
     assert traj.episode_invalid
     assert len(rows) == 1 and int(rows[0][2].sum()) == 0
+
+
+def test_an_untrainable_turns_prefix_render_failure_drops_only_that_turn():
+    """An untrainable turn's row only ever adds a penalty, so a prefix the template rejects for it costs
+    that row alone: the episode stays valid and its finished turn still trains."""
+
+    def render(*_a, **_k):
+        raise ValueError("template rejects this prefix")
+
+    stub = _render_stub(render)
+    traj = Trajectory()
+    traj.add_message(Message.user("q"))
+    traj.add_message(Message.assistant("cut", token_ids=[10, 11], truncated=True))
+    traj.add_message(Message.user("continue"))
+    traj.add_message(Message.assistant("a2", token_ids=[20, 21], prompt_token_ids=[1, 2, 3]))
+    rows = stub._tokenize_trajectory_turns(RolloutResult(prompt="q", trajectory=traj))
+
+    assert not traj.episode_invalid and stub._batch_build_error is None
+    assert [(r.completion_ids.tolist(), r.negative_only) for r in rows] == [([20, 21], False)]
 
 
 def test_prefix_render_failure_masks_the_episode_even_when_the_whole_render_would_succeed():

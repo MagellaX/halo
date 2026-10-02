@@ -33,7 +33,7 @@ import pytest
 import torch
 from accelerate import PartialState
 
-from src.environments.base import VALID_REASONING_EFFORTS
+from src.environments.base import VALID_REASONING_EFFORTS, stable_reasoning_effort
 from src.environments.episode import resolve_episode_effort
 from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer, _BreakerOptimizerSkipCallback
 
@@ -81,8 +81,9 @@ def test_breaker_inert_below_threshold():
 
 
 def test_breaker_partial_token_masking_is_not_a_masked_trajectory():
-    # A trajectory with ANY surviving corrected token is not fully masked (token-band masks tokens,
-    # not trajectories) — it must not count toward the breaker fraction.
+    # A trajectory with ANY surviving corrected token is not fully masked (a per-token zero such as
+    # ``zero_engine_forced_closes`` masks tokens, not trajectories) — it must not count toward the
+    # breaker fraction.
     breaker, host = _breaker_host(0.5)
     ratio, corr, ids, _adv = _masked_batch([False, False])
     ratio[0, :3] = 0.0  # 3 of 4 tokens masked, 1 survives
@@ -132,11 +133,12 @@ def _breaker_branch(fn: ast.FunctionDef) -> ast.If:
     raise AssertionError("_build_training_tensors no longer branches on _update_breaker_tripped")
 
 
-def _calls(stmt: ast.stmt, attr: str) -> list[ast.Call]:
+def _calls(stmt: ast.stmt, name: str) -> list[ast.Call]:
+    """The calls of ``name`` in ``stmt``, as a method (``x.name(...)``) or a bare function (``name(...)``)."""
     return [
         node
         for node in ast.walk(stmt)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attr
+        if isinstance(node, ast.Call) and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == name
     ]
 
 
@@ -236,6 +238,37 @@ def test_pre_optimizer_step_callback_reaches_the_trainer():
     assert host.calls == 1
 
 
+def test_the_optimizer_skip_callback_is_attached_only_behind_the_breaker_knob():
+    """One attach, inside the ``skip_update_masked_frac`` branch: without the knob no breaker trips,
+    so the hook would only run on every optimizer step for nothing. Constructing the trainer takes a
+    model and a rollout server, so the wiring is read off ``__init__``."""
+    init = _method_ast("__init__")
+    attaches = [
+        call
+        for call in _calls(init, "add_callback")
+        if call.args and ast.unparse(call.args[0]) == "_BreakerOptimizerSkipCallback(self)"
+    ]
+    assert len(attaches) == 1, f"expected one attach of the skip callback, found {len(attaches)}"
+    guards = [
+        node
+        for node in ast.walk(init)
+        if isinstance(node, ast.If) and any(attaches[0] in ast.walk(stmt) for stmt in node.body)
+    ]
+    assert [ast.unparse(guard.test) for guard in guards] == ["self._skip_update_masked_frac is not None"]
+    assert any(
+        ast.unparse(node) == "self._skip_update_masked_frac = self.async_config.skip_update_masked_frac"
+        for node in ast.walk(init)
+        if isinstance(node, ast.Assign)
+    ), "the guard no longer reads the configured knob"
+    module = ast.parse(inspect.getsource(inspect.getmodule(DistributedAsyncEnvironmentalGRPOTrainer)))
+    constructions = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_BreakerOptimizerSkipCallback"
+    ]
+    assert len(constructions) == 1, "the skip callback is constructed outside the guarded attach"
+
+
 def test_a_tripped_breaker_zeroes_both_advantage_tensors():
     """The verdict alone trains nothing away: a tripped step must zero the per-ROW advantages (the
     policy gradient) AND the per-TRAJECTORY ones (what the durable record reports). Dropping either
@@ -279,6 +312,77 @@ def test_the_step_diagnostics_read_the_advantages_after_the_breaker():
     assert min(recorded_at) > breaker_at, "the step diagnostics read the advantages before the breaker"
 
 
+def test_the_empty_step_halt_reads_the_world_gathered_mask_in_train_mode():
+    """The halt raises on a world verdict: fed this rank's own mask it would raise on one rank and leave the
+    peers in the next collective; dropped, an all-invalid step trains a zero gradient behind a plausible log."""
+    fn = _build_training_tensors_ast()
+    gathered_at = next(
+        i
+        for i, stmt in enumerate(fn.body)
+        if isinstance(stmt, ast.Assign) and ast.unparse(stmt) == "gathered_valid = gather(valid_mask)"
+    )
+    halts = [i for i, stmt in enumerate(fn.body) if _calls(stmt, "_check_step_has_valid_episodes")]
+    assert len(halts) == 1 and halts[0] > gathered_at
+    block = fn.body[halts[0]]
+    assert isinstance(block, ast.If) and ast.unparse(block.test) == "mode == 'train'"
+    (call,) = _calls(block, "_check_step_has_valid_episodes")
+    assert [ast.unparse(arg) for arg in call.args] == ["rollout_results", "gathered_valid"]
+
+
+def test_the_balance_weighs_what_the_loss_trains_and_reaches_both_advantage_sets():
+    """The token mass must be the loss's: counted on the IS ratio after its correction and on the mask after
+    the drops narrowed it, before the breaker can zero the step, and in train mode only. Its scales must
+    land on the per-row advantages the loss reads and on the per-trajectory ones the record reports."""
+    fn = _build_training_tensors_ast()
+    corrected_at = next(i for i, stmt in enumerate(fn.body) if _calls(stmt, "_apply_is_correction"))
+    narrowed_at = next(i for i, stmt in enumerate(fn.body) if _calls(stmt, "_narrow_masks_and_normalizer"))
+    breaker_at = next(i for i, stmt in enumerate(fn.body) if _breaker_branch(fn) in ast.walk(stmt))
+    balanced_at = [i for i, stmt in enumerate(fn.body) if _calls(stmt, "record_token_mass")]
+
+    assert len(balanced_at) == 1, "_build_training_tensors weighs the token mass once"
+    assert corrected_at < narrowed_at < balanced_at[0] < breaker_at
+    block = fn.body[balanced_at[0]]
+    assert isinstance(block, ast.If) and ast.unparse(block.test) == "mode == 'train'"
+    (call,) = _calls(block, "record_token_mass")
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "local_advantages",
+        "loss_mask",
+        "importance_sampling_ratio",
+        "self.accelerator.gather",
+        "self._metrics[mode]",
+        "self._balance_token_mass",
+    ]
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+    assert keywords.get("negative_only") == "negative_only", "the negative-only rows' share goes unlogged"
+    (rebinding,) = [
+        node for node in ast.walk(block) if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Tuple)
+    ]
+    assert ast.unparse(rebinding.targets[0]) == "(local_advantages, traj_advantages)"
+    assert ast.unparse(rebinding.value) == "(balance.apply(local_advantages), balance.apply(traj_advantages))"
+
+
+def test_the_engine_forced_closes_are_zeroed_on_the_corrected_ratio():
+    """Without the call every reasoning close the engine forced trains with its episode's advantage, teaching
+    the model to stop closing its reasoning; ahead of the correction, the correction's ratio would replace
+    the zeros."""
+    fn = _build_training_tensors_ast()
+    (gate,) = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "use_is_correction and self._forced_close_ids is not None"
+    ]
+    (siblings,) = [
+        node.body for node in ast.walk(fn) if isinstance(node, ast.stmt) and gate in getattr(node, "body", [])
+    ]
+    corrected_at = next(i for i, stmt in enumerate(siblings) if _calls(stmt, "_apply_is_correction"))
+    assert corrected_at < siblings.index(gate)
+    assert ast.unparse(gate.body[0]) == (
+        "importance_sampling_ratio, forced = zero_engine_forced_closes(importance_sampling_ratio, sampling_logps, "
+        "completion_mask, has_sampling, completion_ids, self._forced_close_ids)"
+    )
+
+
 # The phase helpers ``_build_training_tensors`` is partitioned into, in call order.
 _PHASE_HELPERS = (
     "_build_rollout_rewards",
@@ -317,8 +421,8 @@ def test_world_metrics_flush_once_after_every_recording_site_with_no_return_betw
 
 def test_phase_helpers_never_early_return():
     """Each phase helper returns exactly once, as its final statement. Three of them issue collectives
-    (the uniform raise, the recompute forward's EP dispatch, the empty-step all_reduce and normalizer
-    gather), so a data-dependent early-out would let one rank skip a collective its peers enter."""
+    (the uniform raise, the recompute forward's EP dispatch, the normalizer gather), so a
+    data-dependent early-out would let one rank skip a collective its peers enter."""
     for name in _PHASE_HELPERS:
         fn = _method_ast(name)
         returns = [node for node in ast.walk(fn) if isinstance(node, ast.Return)]
@@ -334,13 +438,19 @@ def _effort_host(num_generations: int, training: bool = True, num_generations_ev
         model=types.SimpleNamespace(training=training),
         _batch_build_error=None,
     )
+    host._record_batch_error = DistributedAsyncEnvironmentalGRPOTrainer._record_batch_error.__get__(host)
     return DistributedAsyncEnvironmentalGRPOTrainer._stamp_group_efforts.__get__(host), host
+
+
+def _group_prompts(rows: int, group: int) -> list[str]:
+    """Group-expanded prompts, as the RepeatSampler hands them: ``group`` consecutive rows per problem."""
+    return [f"problem {i // group}" for i in range(rows)]
 
 
 def test_stamp_group_efforts_uniform_within_group():
     stamp, _ = _effort_host(4)
     contexts = [None] * 12  # 3 groups of 4
-    stamp(contexts)
+    stamp(_group_prompts(12, 4), contexts)
     levels = [ctx["reasoning_effort"] for ctx in contexts]
     assert all(lv in VALID_REASONING_EFFORTS for lv in levels)
     for start in range(0, 12, 4):
@@ -350,7 +460,7 @@ def test_stamp_group_efforts_uniform_within_group():
 def test_stamp_group_efforts_preserves_existing_context_keys():
     stamp, _ = _effort_host(2)
     contexts = [{"answer": "42"}, None]
-    stamp(contexts)
+    stamp(_group_prompts(2, 2), contexts)
     assert contexts[0]["answer"] == "42"
     assert contexts[0]["reasoning_effort"] == contexts[1]["reasoning_effort"]
 
@@ -362,7 +472,7 @@ def test_stamp_group_efforts_records_a_split_group_rather_than_raising():
     ``test_env_ragged_eval_batch_uniform_raise.py``)."""
     stamp, host = _effort_host(4)
     contexts = [None] * 6
-    stamp(contexts)
+    stamp(_group_prompts(6, 4), contexts)
     assert "multiple of the group size" in host._batch_build_error
     assert contexts == [None] * 6, "a refused batch must not be half-stamped"
 
@@ -370,8 +480,31 @@ def test_stamp_group_efforts_records_a_split_group_rather_than_raising():
 def test_stamp_group_efforts_eval_uses_eval_group_size():
     stamp, _ = _effort_host(4, training=False, num_generations_eval=1)
     contexts = [None] * 3  # not a multiple of 4 — fine in eval (group size 1)
-    stamp(contexts)
+    stamp(_group_prompts(3, 1), contexts)
     assert all(ctx["reasoning_effort"] in VALID_REASONING_EFFORTS for ctx in contexts)
+
+
+def test_training_groups_of_one_problem_still_draw_their_levels_at_random():
+    """The stable draw is the eval's alone: a training group's level is the lottery the effort-conditioned
+    policy learns over, so one problem drawn in many rounds must see more than one level."""
+    stamp, _ = _effort_host(2)
+    contexts = [None] * 60
+    stamp(["the same problem"] * 60, contexts)
+    assert len({ctx["reasoning_effort"] for ctx in contexts}) > 1
+
+
+def test_an_eval_scores_each_problem_at_one_level_whatever_the_draw_order():
+    """Every eval round must put a problem at the same level, or the checkpoints' per-level scores (and the
+    level mix behind the headline one) are not comparable."""
+    stamp, _ = _effort_host(4, training=False, num_generations_eval=1)
+    prompts = [f"problem {i}" for i in range(60)]
+    first, second = [None] * 60, [None] * 60
+    stamp(prompts, first)
+    stamp(list(reversed(prompts)), second)
+    by_problem = {p: c["reasoning_effort"] for p, c in zip(prompts, first, strict=False)}
+    assert all(by_problem[p] == c["reasoning_effort"] for p, c in zip(reversed(prompts), second, strict=False))
+    assert set(by_problem.values()) == set(VALID_REASONING_EFFORTS), "the draw still spreads over every level"
+    assert by_problem["problem 0"] == stable_reasoning_effort([{"role": "user", "content": "problem 0"}])
 
 
 def test_resolve_episode_effort_prefers_context():

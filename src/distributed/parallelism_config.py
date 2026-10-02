@@ -218,7 +218,8 @@ class ParallelismConfig:
     # Store non-expert params in FP32 for stable optimizer updates (compute stays BF16 via autocast).
     fp32_non_ep_params: bool = False
 
-    # Reduce grads in fp32 with bf16 params (bf16 sums lose precision); fp32_non_ep_params implies this.
+    # Reduce grads in fp32 with bf16 params (bf16 sums lose precision). fp32_non_ep_params already makes
+    # FSDP2's reduce fp32; the other reduce paths read only this flag.
     fp32_grad_reduce: bool = False
 
     # Tri-state AdamWBF16 switch. None = auto (on under bf16 + a default optim, off under DDP).
@@ -852,10 +853,9 @@ class ParallelismConfig:
             f"without gradient checkpointing. Use a SINGLE dispatch group per domain: expert_parallel_size=2, "
             f"or raise expert_parallel_size * expert_tensor_parallel_size to the domain "
             f"({self.nvlink_domain_size}), or shrink the job to {self.ep_group_size} GPUs. Sizing "
-            f"expert_parallel_size itself to the domain works "
-            f"only where the model has that many experts per rank to give (rarely on a "
-            f"{self.nvlink_domain_size}-wide rack); attention TP leaves ep_group_size unchanged, so "
-            f"EP+TP lands back on this same rejection."
+            f"expert_parallel_size itself to the domain works only where the model has that many "
+            f"experts per rank to give (rarely on a {self.nvlink_domain_size}-wide rack); attention TP "
+            f"leaves ep_group_size unchanged, so EP+TP lands back on this same rejection."
         )
 
     def _validate_ep_buffer_backend(self):
@@ -922,13 +922,20 @@ class ParallelismConfig:
                 "grad-accum window defeats it. Use SHARD_GRAD_OP (fsdp_reshard_after_forward=False) "
                 "with the backward reshard off."
             )
+        if self.fsdp_defer_grad_sync and self.fsdp_reshard_after_forward:
+            raise ValueError(
+                "fsdp_defer_grad_sync=True contradicts fsdp_reshard_after_forward=True: deferring the "
+                "reduce holds every module's full unsharded gradient across the grad-accum window (2 B/param "
+                "at a bf16 reduce dtype, 4 B/param under fp32_grad_reduce), the state FULL_SHARD exists to "
+                "shard. Use SHARD_GRAD_OP (fsdp_reshard_after_forward=False) with the deferred reduce, or "
+                "remove fsdp_defer_grad_sync."
+            )
         if not self.fsdp_reshard_after_backward and (self.tp_size > 1 or self.pp_size > 1):
             raise ValueError(
                 f"fsdp_reshard_after_backward=False is only wired through the plain-DP/CP/EP torchrun "
-                f"path (tensor_parallel_size={self.tp_size}, pipeline_parallel_size={self.pp_size}): the TP "
-                f"setup shards through "
-                f"its own fully_shard calls and PP already pins params unsharded per stage. Remove "
-                f"the flag for those modes."
+                f"path (tensor_parallel_size={self.tp_size}, pipeline_parallel_size={self.pp_size}): "
+                f"the TP setup shards through its own fully_shard calls and PP already pins params "
+                f"unsharded per stage. Remove the flag for those modes."
             )
         if self.fsdp_defer_grad_sync and (self.pp_size > 1 or (self.tp_size > 1 and self.data_parallel_size == 1)):
             raise ValueError(

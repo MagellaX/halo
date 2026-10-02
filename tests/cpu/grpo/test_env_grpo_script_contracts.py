@@ -17,6 +17,7 @@
 """
 
 import dataclasses
+import logging
 import re
 import sys
 import types
@@ -62,6 +63,23 @@ def test_system_prompt_rejected_at_startup(env_grpo_module, tmp_path):
         env_grpo_module.main()
 
 
+def test_unknown_environment_type_fails_before_any_load(env_grpo_module, tmp_path):
+    """The registry refuses an unregistered name, naming the available ones; the probe env that hits
+    it is built ahead of the distributed init and the model load."""
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"model_name_or_path: dummy/model\noutput_dir: {tmp_path / 'out'}\n"
+        "bf16: false\nuse_cpu: true\nenvironment_type: no_such_env\n"
+    )
+    with (
+        mock.patch("src.training.parser.install_log_tee"),
+        mock.patch.object(sys, "argv", ["prog", str(config)]),
+        mock.patch.object(env_grpo_module, "init_training_script", side_effect=AssertionError("reached the load")),
+        pytest.raises(ValueError, match=r"Unknown environment type: 'no_such_env'.*code_contests"),
+    ):
+        env_grpo_module.main()
+
+
 def test_retired_parallel_weight_sync_key_rejected_at_startup(env_grpo_module, tmp_path):
     """``use_parallel_weight_sync`` is retired — multi-server weight sync is always rolling. A YAML
     still carrying it must reach the parser's strict unknown-key check, not be absorbed while the
@@ -98,8 +116,10 @@ class _Tokenizer:
         return {"input_ids": list(range(len(text)))}
 
 
-def _env(system_prompt="SYSTEM PROMPT", tools=None):
-    return types.SimpleNamespace(system_prompt=system_prompt, get_tools_schema=lambda: tools)
+def _env(system_prompt="SYSTEM PROMPT", tools=None, tools_arrive_on_reset=False):
+    return types.SimpleNamespace(
+        system_prompt=system_prompt, get_tools_schema=lambda: tools, TOOLS_ARRIVE_ON_RESET=tools_arrive_on_reset
+    )
 
 
 def test_overhead_counts_system_prompt_and_tool_schema(env_grpo_module):
@@ -142,6 +162,22 @@ def test_overhead_without_env_system_prompt_still_measures(env_grpo_module):
     overhead = env_grpo_module.measure_env_prompt_overhead(_env(system_prompt=None), _Tokenizer(), {})
     assert overhead >= 0
     assert overhead != env_grpo_module.FALLBACK_ENV_PROMPT_OVERHEAD
+
+
+def test_tools_discovered_on_reset_are_warned_as_missing(env_grpo_module, caplog):
+    """An MCP environment learns its tools when its first reset connects, and the probe env is never reset,
+    so the overhead omits their schema and the run must say so. An environment whose tools are declared up
+    front has nothing missing, with no tools (closed-book ``exam_qa``) or no tool protocol at all."""
+
+    def warned():
+        return [r for r in caplog.records if "tools arrive when its first reset" in r.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger=env_grpo_module.logger.logger.name):
+        for declared in (None, []):
+            env_grpo_module.measure_env_prompt_overhead(_env(tools=declared), _Tokenizer(), {})
+        assert not warned()
+        env_grpo_module.measure_env_prompt_overhead(_env(tools=[], tools_arrive_on_reset=True), _Tokenizer(), {})
+    assert warned()
 
 
 def test_overhead_falls_back_conservatively_when_render_fails(env_grpo_module):

@@ -68,6 +68,7 @@ from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.config_levels import config_sources, snapshot_special_token_ids
 from src.models.loading.dtype import resolve_training_dtype
 from src.models.moe_balancing import ep_wraps_experts
+from src.models.patches.flex_sliding_attention import reject_full_determinism_after_warmup
 from src.models.structure import lora_fold_targets, model_has_quantized_params, unwrap_framework_wrappers
 from src.optimizers.adamw_bf16 import build_bf16_optimizer
 from src.optimizers.param_groups import build_tensor_type_grouped_optimizer
@@ -106,8 +107,8 @@ _FSDP_SHAPING_KNOBS = (
 # ParallelismConfig knobs only the mixin-managed (torchrun) FSDP2 wrap implements.
 _ACCELERATE_UNSUPPORTED_KNOBS = (*_FSDP_SHAPING_KNOBS, "fp32_grad_reduce")
 
-# Where TRL keeps its fused Liger loss: preference trainers (DPO/KTO), GRPO, and the name later TRL uses.
-_TRL_LIGER_LOSS_ATTRS = ("liger_loss_fn", "liger_grpo_loss", "liger_loss")
+# Where TRL keeps its fused Liger loss: the preference trainers (DPO/KTO) and GRPO.
+_TRL_LIGER_LOSS_ATTRS = ("liger_loss_fn", "liger_grpo_loss")
 
 # Peak-allocated fraction of device memory above which the post-first-step margin warning fires.
 # A rank this close to full after the first optimizer step OOMs on a later backward.
@@ -325,6 +326,8 @@ class DistributedTrainerMixin(
         self._accelerate_manages_ddp = self._should_accelerate_manage_ddp()
 
         self._validate_parallelism_modes()
+        # Here, before HF's Trainer.__init__ turns on the deterministic mode the warmed graphs were compiled without.
+        reject_full_determinism_after_warmup(getattr(training_args, "full_determinism", False))
         kwargs = self._maybe_prepare_pipeline_model(kwargs, training_args, ctor_args)
 
         # Force use_reentrant before super().__init__ enables GC. Not under PP, which requires non-reentrant.
@@ -790,12 +793,14 @@ class DistributedTrainerMixin(
     def _reject_unsynced_trainable_params(self, model: nn.Module, candidates: Iterable[nn.Parameter]) -> None:
         """Raise on every rank if a trainable parameter in ``candidates`` has no gradient sync.
 
-        ``candidates`` is what every FSDP2 wrap leaves out (:meth:`_fsdp_exclusions`): frozen dtype
+        ``candidates`` is what the FSDP2 wraps leave out (:meth:`_fsdp_exclusions`): frozen dtype
         exclusions and the parameters of the EP modules that sync their own gradients. Such a parameter
         keeps its local gradient unless its EP layer's hooks (``synced_trainable_param_ids``: experts +
         LoRA, router, replicated submodules) or the deferred post-backward sweep average it; without
         either it trains on this rank's batch only and drifts across DP ranks while every loss stays
-        finite. Collective: every rank must call it.
+        finite. The TP wrap leaves nothing out: its experts are FSDP-managed
+        (``fsdp_shard_ep1_experts=False`` is refused under TP), and the dtype exclusions it shards are
+        frozen, so none is flagged. Collective: every rank must call it.
         """
         candidate_set = IdentityParamSet(candidates)
         # The deferred sweep averages every trainable non-DTensor parameter, and a parameter outside the

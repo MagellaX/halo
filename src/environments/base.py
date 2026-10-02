@@ -3,6 +3,7 @@ base classes an environment subclasses. ``AsyncBaseEnvironment`` runs its turn b
 ``asyncio.gather`` for I/O-bound tool/API calls. The episode driver is :mod:`src.environments.episode`."""
 
 import asyncio
+import hashlib
 import itertools
 import logging
 import math
@@ -29,15 +30,21 @@ from src.rewards.spec import (
 
 logger = logging.getLogger(__name__)
 
-# Reasoning-effort levels for the chat template ("Reasoning: <level>"). "random" resolves per episode.
+# Reasoning-effort levels for the chat template ("Reasoning: <level>"), and the setting that resolves to one
+# per episode.
 VALID_REASONING_EFFORTS = ("low", "medium", "high")
+RANDOM_REASONING_EFFORT = "random"
 
-# Set in ``info`` when an episode's reward carries no learning signal — a grading or sandbox backend
-# failed, a scorer returned nothing, a null ``answer`` cell; the trainer excludes it from the GRPO group
-# baseline.
+# The context key, and so the dataset column, an episode's expected answer travels under (the training
+# script carries the configured ``answer_field`` into it); a ``requires_answer`` env grades against it.
+ANSWER_KEY = "answer"
+
+# Set in ``info`` when an episode's reward carries no learning signal (the grade reached no verdict, a
+# grading or sandbox backend failed, a scorer returned nothing, a null ``answer`` cell); the trainer
+# excludes it from the GRPO group baseline.
 EPISODE_INVALID_KEY = "episode_invalid"
-# Why an episode is invalid (a sandbox or scorer fault, a failed chat-template re-render); read by the
-# trainer's all-invalid step halt so its message names the cause.
+# Why an episode is invalid (a grade with no signal, a sandbox or scorer fault, a trajectory the chat
+# template cannot re-render); read by the all-invalid step halt and the eval runner so each names the cause.
 EPISODE_INVALID_REASON_KEY = "episode_invalid_reason"
 # The cause on an episode its driver lost (a generation that raised), the spelling the Ray actor
 # stamps on the row it hands back for one. A driver stamps it before closing the episode through
@@ -46,6 +53,9 @@ EPISODE_ERROR_KEY = "error"
 # Stamped by the rollout driver under the episode thinking scope: whether the episode's reasoning budget
 # ran down to the per-turn reserve (a later turn would have reasoned only its reserve).
 THINKING_BUDGET_EXHAUSTED_KEY = "thinking_budget_exhausted"
+# Set in a turn's step context by the rollout driver when the engine cut the turn while it held an unfinished
+# tool call, so the recovery can say the call ran past the turn's length limit (``LENGTH_CUTOFF_IN_CALL_NUDGE``).
+CUT_IN_TOOL_CALL_KEY = "cut_in_tool_call"
 # Set in ``info`` when a sandbox fault ended the episode, naming its class: ``SANDBOX_FAULT_INFRA`` for
 # a backend/transport failure (the episode is also marked invalid and leaves the GRPO group baseline),
 # ``SANDBOX_FAULT_AGENT`` for a sandbox the program's own action broke (the episode stays in the
@@ -54,8 +64,7 @@ SANDBOX_FAULT_KEY = "sandbox_fault"
 SANDBOX_FAULT_INFRA = "infra"
 SANDBOX_FAULT_AGENT = "agent"
 
-# The environment's own grade, priced by the reward's environment term, in ``reward_components``: the
-# term advantage shaping gates on (it falls back to the total reward when absent).
+# The environment's own grade, priced by the reward's environment term, in ``reward_components``.
 OBJECTIVE_REWARD_KEY = component_key(OBJECTIVE_TERM_NAME)
 # Every term of the episode reward, ``reward/<name>`` → contribution; the values sum to the reward.
 REWARD_COMPONENTS_KEY = "reward_components"
@@ -103,9 +112,34 @@ def resolve_reasoning_effort(effort: str | None) -> str | None:
     ``"random"`` picks uniformly from :data:`VALID_REASONING_EFFORTS`; call once per episode so every
     turn shares the level. Other values pass through.
     """
-    if effort == "random":
+    if effort == RANDOM_REASONING_EFFORT:
         return random.choice(VALID_REASONING_EFFORTS)
     return effort
+
+
+def task_prompt(prompt: str | list[dict[str, Any]]) -> Any:
+    """What an environment is handed as the task for a dataset prompt: a string as is, or a conversation's
+    LAST user turn (its earlier turns and system message are the dataset's framing, not the task). The
+    trainer and the eval driver both reduce a prompt through here, so an environment gets the same task
+    from either. A conversation with no user turn raises ``ValueError``: there is nothing to hand it."""
+    if not isinstance(prompt, list):
+        return prompt
+    for message in reversed(prompt):
+        if message.get("role") == "user":
+            return message["content"]
+    raise ValueError(
+        f"the conversation has no 'user' message (roles: {[m.get('role') for m in prompt]}); an environment "
+        "is handed the last user turn as the task, so there is nothing to send it"
+    )
+
+
+def stable_reasoning_effort(task: str | list[dict[str, Any]]) -> str:
+    """A level drawn from the task alone, the same in every process and every run: an evaluation's draw for
+    a ``"random"`` setting, so each problem is scored at one level from checkpoint to checkpoint. A
+    conversation is keyed by its :func:`task_prompt`, so it draws what its task text alone would."""
+    text = str(task_prompt(task) or "")
+    digest = hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=8).digest()
+    return VALID_REASONING_EFFORTS[int.from_bytes(digest, "big") % len(VALID_REASONING_EFFORTS)]
 
 
 def solve_verdict(metrics: Mapping[str, float]) -> bool | None:
@@ -171,13 +205,13 @@ class Message:
     routing_mask: str | None = None
     routing_prompt_tokens: int | None = None
     prompt_token_ids: list[int] | None = None
-    # Engine cut the turn off at its token cap: the text is a fragment, so the trainer skips it.
+    # Engine cut the turn off at its token cap: the text is a fragment, never rewarded (``untrainable``).
     truncated: bool = False
-    # Every tool call named a tool that does not exist, so the turn accomplished nothing; skipped
-    # like a fragment to avoid reinforcing the invented call.
+    # Every tool call named a tool that does not exist, so the turn accomplished nothing — never
+    # rewarded like a fragment, or a recovering episode reinforces the invented call that cost it a turn.
     calls_rejected: bool = False
-    # The model ended the turn with neither visible content nor a tool call — skipped for the same
-    # reason: a recovering episode would reinforce stopping on nothing.
+    # The model ended the turn with neither visible content nor a tool call — never rewarded for the
+    # same reason: a recovering episode would reinforce stopping on nothing.
     empty: bool = False
 
     def to_dict(self, include_thinking: bool = False) -> dict[str, Any]:
@@ -197,10 +231,11 @@ class Message:
 
     @property
     def untrainable(self) -> bool:
-        """An assistant turn no tokenization path may weight: an engine-cut fragment (``truncated``),
+        """An assistant turn no tokenization path may reward: an engine-cut fragment (``truncated``),
         a turn whose every tool call named a nonexistent tool (``calls_rejected``) or one that ended
-        on nothing (``empty``). It stays in the render later turns condition on, but reinforcing it
-        would reward the runaway, the invented call or the empty stop whenever the episode recovers."""
+        on nothing (``empty``). It stays in the render later turns condition on; its sampled ids train
+        only under a negative advantage, so the runaway, the invented call or the empty stop takes the
+        failure signal of an episode that fails and none of the credit of one that recovers."""
         return self.truncated or self.calls_rejected or self.empty
 
     @classmethod
@@ -321,8 +356,9 @@ class EnvStep:
 class BaseEnvironment(ABC):
     """Abstract base class for multi-turn GRPO environments.
 
-    Subclasses implement ``_reset_single``, ``_step_single``, ``_grade_episode``. Parallel rollout
-    collection runs one episode per Ray actor instance (see ray_actors.py).
+    Subclasses implement ``_reset_single``, ``_step_single``, ``_grade_episode``. One instance serves
+    several concurrent episodes (a Ray actor multiplexes them on its event loop, see ray_actors.py), so
+    per-episode state lives on the trajectory, never on the instance.
     """
 
     # Turn budget used when the config names none. Per class, since an agentic edit-run-test loop and
@@ -340,6 +376,10 @@ class BaseEnvironment(ABC):
     # answer wherever a row carries one, paying for completing the task where no row does.
     requires_answer: bool = False
 
+    # Whether the tools are discovered on the first reset (an MCP server's arrive when it connects), so an
+    # instance never reset reports none of them.
+    TOOLS_ARRIVE_ON_RESET: bool = False
+
     # Declared here because ``_add_action_message`` trims stored ``tool_calls`` to it; ``None`` = no cap.
     max_tool_calls_per_turn: int | None = None
 
@@ -350,8 +390,10 @@ class BaseEnvironment(ABC):
     # What :meth:`_handle_length_cutoff` feeds back after the engine cuts a turn short, and what
     # :meth:`_handle_empty_turn` feeds back after the model ends one on nothing. Per protocol, since
     # the text must ask for that protocol's next move; ``None`` means the protocol has no recovery
-    # path for that kind of turn and does not route it there.
+    # path for that kind of turn and does not route it there. ``LENGTH_CUTOFF_IN_CALL_NUDGE`` is the cut nudge
+    # for a turn that ran out while writing a tool call, where the protocol can tell (``None`` = the plain one).
     LENGTH_CUTOFF_NUDGE: str | None = None
+    LENGTH_CUTOFF_IN_CALL_NUDGE: str | None = None
     EMPTY_TURN_NUDGE: str | None = None
 
     # Names of the episode-level shaping components this class adds to the reward (``reward/<name>``),
@@ -367,13 +409,9 @@ class BaseEnvironment(ABC):
 
     # Profile keys this class admits and the minimum each takes; a subclass declares only the keys it
     # adds, and the union over the MRO is what a profile may carry. ``thinking_tokens`` is the
-    # level's CoT budget (per turn, or the episode's total under the episode thinking scope),
-    # ``max_length_cutoff_recoveries`` tightens the env's recovery cap for the level. An int minimum
-    # declares a count (only ints admitted); a float minimum admits any finite number.
-    EFFORT_PROFILE_KEY_MINIMA: dict[str, int | float] = {
-        "thinking_tokens": 1,
-        "max_length_cutoff_recoveries": 0,
-    }
+    # level's CoT budget (per turn, or the episode's total under the episode thinking scope). An int
+    # minimum declares a count (only ints admitted); a float minimum admits any finite number.
+    EFFORT_PROFILE_KEY_MINIMA: dict[str, int | float] = {"thinking_tokens": 1}
 
     def __init__(
         self,
@@ -450,11 +488,9 @@ class BaseEnvironment(ABC):
         self.tool_error_penalty = tool_error_penalty
         self.tool_reward_cap = tool_reward_cap
         reasoning_effort = kwargs.pop("reasoning_effort", None)
-        if reasoning_effort is not None and reasoning_effort not in (*VALID_REASONING_EFFORTS, "random"):
-            raise ValueError(
-                f"reasoning_effort must be one of {(*VALID_REASONING_EFFORTS, 'random')} or None, "
-                f"got {reasoning_effort!r}"
-            )
+        settings = (*VALID_REASONING_EFFORTS, RANDOM_REASONING_EFFORT)
+        if reasoning_effort is not None and reasoning_effort not in settings:
+            raise ValueError(f"reasoning_effort must be one of {settings} or None, got {reasoning_effort!r}")
         self.reasoning_effort = reasoning_effort
         self.reasoning_effort_profiles = self._merge_effort_profiles(reasoning_effort_profiles)
         terms = (
@@ -508,10 +544,7 @@ class BaseEnvironment(ABC):
     def _merge_effort_profiles(
         self, overrides: dict[str, dict[str, int | float]] | None
     ) -> dict[str, dict[str, int | float]]:
-        """Validate ``reasoning_effort_profiles`` overrides and merge them per level over the class defaults.
-
-        A level's recovery cap may tighten the env's ``max_length_cutoff_recoveries``, never exceed it.
-        """
+        """Validate ``reasoning_effort_profiles`` overrides and merge them per level over the class defaults."""
         minima = self.effort_profile_key_minima()
         profiles = {level: dict(entry) for level, entry in self.REASONING_EFFORT_PROFILES.items()}
         for level, entry in (overrides or {}).items():
@@ -537,27 +570,16 @@ class BaseEnvironment(ABC):
                 if value < minimum:
                     raise ValueError(f"{key} for effort {level!r} must be >= {minimum}, got {value}")
             profiles.setdefault(level, {}).update(entry)
-        env_cap = self.max_length_cutoff_recoveries
-        for level, profile in profiles.items():
-            if env_cap is not None and profile.get("max_length_cutoff_recoveries", 0) > env_cap:
-                raise ValueError(
-                    f"reasoning_effort_profiles[{level!r}].max_length_cutoff_recoveries "
-                    f"({profile['max_length_cutoff_recoveries']}) exceeds the env's max_length_cutoff_recoveries ({env_cap})"
-                )
         return profiles
 
     def _bind_effort_profile(self, trajectory: Trajectory, context: dict[str, Any] | None) -> None:
-        """Stamp the episode's effort profile once its level is concrete at reset.
-
-        The generic keys land as the ``info`` stamps their consumers read (``_handle_length_cutoff``);
-        task-specific keys go through :meth:`_apply_effort_profile`.
-        An undetermined level (:meth:`reset_effort_level` returns ``None``) binds an empty profile, so
-        the hook still runs and can state the class caps.
+        """Bind the episode's effort profile once its level is concrete at reset, through
+        :meth:`_apply_effort_profile` (the thinking budget is read per request, by
+        :meth:`thinking_budget_for_effort`). An undetermined level (:meth:`reset_effort_level` returns
+        ``None``) binds an empty profile, so the hook still runs and can state the class caps.
         """
         level = self.reset_effort_level(context)
         profile = self.reasoning_effort_profiles.get(level, {}) if level is not None else {}
-        if "max_length_cutoff_recoveries" in profile:
-            trajectory.info["episode_max_length_cutoff_recoveries"] = profile["max_length_cutoff_recoveries"]
         self._apply_effort_profile(trajectory, level, profile)
 
     def _apply_effort_profile(  # noqa: B027  optional hook; task envs override
@@ -580,12 +602,25 @@ class BaseEnvironment(ABC):
             return cap
         return None
 
+    @classmethod
+    def _tool_budgets_left(cls, trajectory: Trajectory) -> dict[str, int]:
+        """The calls each capped tool has left in the episode, by tool name."""
+        budgets = trajectory.info.get(EPISODE_TOOL_BUDGETS_KEY, {})
+        return {name: max(0, cap - cls._tool_calls_made(trajectory, name)) for name, cap in budgets.items()}
+
     @staticmethod
     def _count_tool_call(trajectory: Trajectory, name: str) -> int:
         """Count one admitted call of tool ``name`` for the episode; returns the new count."""
         counts = trajectory.info.setdefault(TOOL_CALL_COUNTS_KEY, {})
         counts[name] = counts.get(name, 0) + 1
         return counts[name]
+
+    @staticmethod
+    def _refund_tool_call(trajectory: Trajectory, name: str) -> None:
+        """Return one admitted call of tool ``name`` to the episode's budget, for a handler that found the
+        call spent nothing (the inverse of :meth:`_count_tool_call`)."""
+        counts = trajectory.info.setdefault(TOOL_CALL_COUNTS_KEY, {})
+        counts[name] = max(0, counts.get(name, 0) - 1)
 
     def _credit_tool_call(self, trajectory: Trajectory, success: bool) -> float:
         """Book one executed tool call on the episode's counters and return its reward delta:
@@ -651,7 +686,7 @@ class BaseEnvironment(ABC):
 
     def _flag_calls_rejected(self, trajectory: Trajectory) -> None:
         """Mark the turn just taken as one whose every call named a nonexistent tool
-        (:attr:`Message.calls_rejected`), so no tokenization path weights it."""
+        (:attr:`Message.calls_rejected`), so no tokenization path rewards it."""
         self._last_assistant_message(trajectory).calls_rejected = True
 
     def _truncate_observation(self, content: str) -> str:
@@ -663,8 +698,8 @@ class BaseEnvironment(ABC):
         return content
 
     def get_tools_schema(self) -> list[dict[str, Any]] | None:
-        """OpenAI-format tool schema passed to vLLM as ``tools=``. Default ``None``; overridden by the
-        tool-use envs."""
+        """OpenAI-format tool schema passed to the rollout engine as ``tools=``. Default ``None``;
+        overridden by the tool-use envs."""
         return None
 
     def thinking_budget_for_effort(self, effort: str) -> int | None:
@@ -701,6 +736,7 @@ class BaseEnvironment(ABC):
         # Tracked separately: a termination-rate metric cannot tell a cut-off turn, or one that
         # stopped inside its reasoning, from an answer.
         metrics["episode/length_cutoff_turns"] = float(trajectory.info.get("length_cutoff_turns", 0))
+        metrics["episode/length_cutoff_in_call_turns"] = float(trajectory.info.get("length_cutoff_in_call_turns", 0))
         metrics["episode/empty_turns"] = float(trajectory.info.get("empty_turns", 0))
         if THINKING_BUDGET_EXHAUSTED_KEY in trajectory.info:
             metrics["episode/thinking_budget_exhausted"] = (
@@ -784,23 +820,31 @@ class BaseEnvironment(ABC):
             )
         )
 
-    def _handle_length_cutoff(self, trajectory: Trajectory) -> tuple[Trajectory, float, bool, bool, dict[str, Any]]:
-        """Handle a turn the engine cut short before it produced anything — at its token cap, or by
-        aborting it (:data:`~src.inference.response.ENGINE_CUT_FINISH_REASONS`).
+    def _handle_length_cutoff(
+        self, trajectory: Trajectory, in_tool_call: bool = False
+    ) -> tuple[Trajectory, float, bool, bool, dict[str, Any]]:
+        """Handle a turn the engine cut short — at its token cap, or by aborting it
+        (:data:`~src.inference.response.ENGINE_CUT_FINISH_REASONS`) — before a finished call or answer.
 
         Never graded — the fragment would end the episode on a mid-sentence string that reads as a
         *natural* termination. Owned by the base so ``episode/length_cutoff_turns`` means the same
         thing for every protocol that can recover; the wording is each protocol's
-        (:data:`LENGTH_CUTOFF_NUDGE`).
+        (:data:`LENGTH_CUTOFF_NUDGE`). A turn that ran out ``in_tool_call`` is counted under
+        ``episode/length_cutoff_in_call_turns`` too and told so (:data:`LENGTH_CUTOFF_IN_CALL_NUDGE`).
         """
-        return self._recover_unproductive_turn(trajectory, "length_cutoff", "LENGTH_CUTOFF_NUDGE")
+        nudge = "LENGTH_CUTOFF_NUDGE"
+        if in_tool_call:
+            trajectory.info["length_cutoff_in_call_turns"] = trajectory.info.get("length_cutoff_in_call_turns", 0) + 1
+            if self.LENGTH_CUTOFF_IN_CALL_NUDGE is not None:
+                nudge = "LENGTH_CUTOFF_IN_CALL_NUDGE"
+        return self._recover_unproductive_turn(trajectory, "length_cutoff", nudge)
 
     def _handle_empty_turn(self, trajectory: Trajectory) -> tuple[Trajectory, float, bool, bool, dict[str, Any]]:
         """Handle a turn the model ended with neither visible content nor a tool call: a stop inside
         its reasoning, below the cap.
 
         Graded, it would end the episode on an empty final answer; the turn is flagged
-        (:attr:`Message.empty`) so no tokenization path weights it, and the episode recovers like it
+        (:attr:`Message.empty`) so no tokenization path rewards it, and the episode recovers like it
         does from a cut. The wording is each protocol's (:data:`EMPTY_TURN_NUDGE`).
         """
         self._last_assistant_message(trajectory).empty = True
@@ -814,9 +858,8 @@ class BaseEnvironment(ABC):
     def _recover_unproductive_turn(
         self, trajectory: Trajectory, kind: str, nudge_attr: str
     ) -> tuple[Trajectory, float, bool, bool, dict[str, Any]]:
-        """Nudge and retry a turn that produced nothing, within ``max_turns`` and within the episode's
-        recovery cap (``episode_max_length_cutoff_recoveries`` when an env stamped one, else
-        ``max_length_cutoff_recoveries``), which the two kinds of unproductive turn share. The turn is
+        """Nudge and retry a turn that produced nothing, within ``max_turns`` and within
+        ``max_length_cutoff_recoveries``, which the two kinds of unproductive turn share. The turn is
         counted under ``<kind>_turns`` and stamped ``<kind>`` in the step info. A turn past the cap, or
         on the episode's last turn, cannot be retried: it ends the episode truncated, priced like a
         ``max_turns`` overflow and never as a recovered turn (``unrecovered_turn``).
@@ -830,7 +873,7 @@ class BaseEnvironment(ABC):
             )
         counter = f"{kind}_turns"
         trajectory.info[counter] = trajectory.info.get(counter, 0) + 1
-        cap = trajectory.info.get("episode_max_length_cutoff_recoveries", self.max_length_cutoff_recoveries)
+        cap = self.max_length_cutoff_recoveries
         past_cap = cap is not None and self._unproductive_turns(trajectory) > cap
         if past_cap or trajectory.num_turns >= self.max_turns:
             return trajectory, 0.0, True, True, {kind: True, "unrecovered_turn": True}
@@ -868,8 +911,8 @@ class BaseEnvironment(ABC):
         for key in [key for key in trajectory.info if key.startswith("_")]:
             del trajectory.info[key]
         context = trajectory.info.get("context")
-        if context and "answer" in context:
-            trajectory.info["context"] = {key: value for key, value in context.items() if key != "answer"}
+        if context and ANSWER_KEY in context:
+            trajectory.info["context"] = {key: value for key, value in context.items() if key != ANSWER_KEY}
 
     def _finalize_step(
         self,
@@ -934,8 +977,9 @@ class BaseEnvironment(ABC):
         that finished, and to its whole GRPO group, since every sibling finishes just as easily. The
         episode leaves the baseline instead, the contract of a grading-infra outage.
         """
-        logger.warning("Episode context carries a null 'answer'; scoring it invalid, not a success")
+        logger.warning("Episode context carries a null %r; scoring it invalid, not a success", ANSWER_KEY)
         trajectory.info[EPISODE_INVALID_KEY] = True
+        trajectory.info[EPISODE_INVALID_REASON_KEY] = f"the row's {ANSWER_KEY!r} cell is null: nothing to grade"
         return EpisodeGrade(0.0)
 
     @staticmethod
@@ -989,7 +1033,7 @@ class BaseEnvironment(ABC):
             (i for i, message in enumerate(trajectory.messages) if message.role == "assistant"), len(messages)
         )
         context = trajectory.info.get("context") or {}
-        return ScoringSample(prompt=messages[:first], completion=messages[first:], reference=context.get("answer"))
+        return ScoringSample(prompt=messages[:first], completion=messages[first:], reference=context.get(ANSWER_KEY))
 
     def _apply_external_scores(self, trajectory: Trajectory, verdict: Mapping[str, ScoreResult]) -> None:
         """Price the external terms' verdicts into the components, record their diagnostics, and close
@@ -1044,14 +1088,23 @@ class BaseEnvironment(ABC):
 
         asyncio.run(settle_and_release())
 
+    def _episode(self, episode_id: int) -> Trajectory:
+        """The open episode ``episode_id`` names; an unknown id raises."""
+        trajectory = self._trajectories.get(episode_id)
+        if trajectory is None:
+            raise ValueError(f"Episode {episode_id} not found")
+        return trajectory
+
     def _episodes(self, episode_ids: list[int]) -> list[Trajectory]:
-        trajectories = []
-        for episode_id in episode_ids:
-            trajectory = self._trajectories.get(episode_id)
-            if trajectory is None:
-                raise ValueError(f"Episode {episode_id} not found")
-            trajectories.append(trajectory)
-        return trajectories
+        return [self._episode(episode_id) for episode_id in episode_ids]
+
+    def _register_episode(self, episode_id: int, trajectory: Trajectory, context: dict[str, Any] | None) -> EnvStep:
+        """Open a freshly reset episode under ``episode_id`` (sync + async reset paths): bind its effort
+        profile, stamp and store it, and return its opening step."""
+        self._bind_effort_profile(trajectory, context)
+        trajectory.info["episode_id"] = episode_id
+        self._trajectories[episode_id] = trajectory
+        return self._first_step(trajectory)
 
     def _run_or_schedule(self, coroutine) -> None:
         """Run a teardown coroutine to completion when no loop runs here, else schedule it on the
@@ -1078,19 +1131,11 @@ class BaseEnvironment(ABC):
         if contexts is None:
             contexts = [None] * len(prompts)
 
-        results = []
+        episode_ids, steps = [], []
         for prompt, context in zip(prompts, contexts, strict=True):
             episode_id = self._get_next_episode_id()
-            trajectory = self._reset_single(prompt, context)
-            self._bind_effort_profile(trajectory, context)
-            trajectory.info["episode_id"] = episode_id
-
-            self._trajectories[episode_id] = trajectory
-
-            results.append((episode_id, self._first_step(trajectory)))
-
-        episode_ids = [r[0] for r in results]
-        steps = [r[1] for r in results]
+            episode_ids.append(episode_id)
+            steps.append(self._register_episode(episode_id, self._reset_single(prompt, context), context))
         return episode_ids, steps
 
     def step(
@@ -1102,10 +1147,7 @@ class BaseEnvironment(ABC):
 
         steps = []
         for episode_id, action, context in zip(episode_ids, actions, contexts, strict=True):
-            trajectory = self._trajectories.get(episode_id)
-            if trajectory is None:
-                raise ValueError(f"Episode {episode_id} not found")
-
+            trajectory = self._episode(episode_id)
             if trajectory.done:
                 steps.append(self._done_step(trajectory))
                 continue
@@ -1129,9 +1171,7 @@ class BaseEnvironment(ABC):
         """
         steps = []
         for episode_id in episode_ids:
-            trajectory = self._trajectories.get(episode_id)
-            if trajectory is None:
-                raise ValueError(f"Episode {episode_id} not found")
+            trajectory = self._episode(episode_id)
             if trajectory.done:
                 steps.append(self._done_step(trajectory))
                 continue
@@ -1193,12 +1233,9 @@ class AsyncBaseEnvironment(BaseEnvironment):
 
         async def reset_one(prompt, context):
             episode_id = self._get_next_episode_id()
-            trajectory = await self._reset_single_async(prompt, context)
-            self._bind_effort_profile(trajectory, context)
-            trajectory.info["episode_id"] = episode_id
-            self._trajectories[episode_id] = trajectory
-
-            return episode_id, self._first_step(trajectory)
+            return episode_id, self._register_episode(
+                episode_id, await self._reset_single_async(prompt, context), context
+            )
 
         results = await asyncio.gather(*[reset_one(p, c) for p, c in zip(prompts, contexts, strict=True)])
 
@@ -1212,10 +1249,7 @@ class AsyncBaseEnvironment(BaseEnvironment):
             contexts = [None] * len(episode_ids)
 
         async def step_one(episode_id, action, context):
-            trajectory = self._trajectories.get(episode_id)
-            if trajectory is None:
-                raise ValueError(f"Episode {episode_id} not found")
-
+            trajectory = self._episode(episode_id)
             if trajectory.done:
                 return self._done_step(trajectory)
 

@@ -12,8 +12,8 @@ their tools. Ray configures itself on one node, so the only thing to start by ha
 
 ![One async GRPO step: a weight push to every engine, then a rank's round of rows dispatched round-robin over Ray
 environment actors and the servers; each row runs generate, parse tool calls, execute, observe until done or
-max_turns, the environment grades it, every assistant turn becomes a training row, the group shares one advantage,
-and the loss drives the optimizer step](../../agent-docs/assets/diagrams/batch_rollout_pipeline.png)
+max_turns, the environment grades it, every assistant turn becomes a training row, each episode's advantage is its reward minus the group's
+baseline, shared by its turn rows, and the loss drives the optimizer step](../../agent-docs/assets/diagrams/batch_rollout_pipeline.png)
 
 Each step pushes weights, collects a round of episodes, turns the sampled tokens into training rows and steps.
 
@@ -28,7 +28,7 @@ Each step pushes weights, collects a round of episodes, turns the sampled tokens
 | `qa_search` | factual question answering with a web-search tool | yes |
 | `exam_qa` | multiple-choice and open exams, closed-book unless `open_book: true` | yes |
 | `swe` | edit-run-test loop over a workspace that survives across turns | yes (unless judge-only) |
-| `code_contests`, `codeforces` | write a program, try it in a scratchpad, submit it against hidden tests | yes |
+| `code_contests`, `codeforces` | write a program, try it in a scratchpad, submit it; scores 1 only when every hidden test passes | yes |
 | `mcp` | whatever tools an MCP server advertises | no |
 
 Where the answer is required, a dataset without that column is refused at startup. Actor hosts need what their
@@ -54,8 +54,7 @@ The episode reward is the environment's grade priced by a term, plus its own sha
 
 ```yaml
 rewards:
-  - source: environment    # the env's grade in [0, 1]: pass fraction, answer match, adherence
-    exponent: 2.0          # convex partial credit — half-right earns a quarter
+  - source: environment    # the env's grade in [0, 1]: a solved problem, an answer match, a passing test
 ```
 
 The other two sources, `judge` and `reward_model`, are configured exactly as on the
@@ -92,7 +91,9 @@ Three decisions matter more than the rest.
 
 - **Turn budget.** `rollout_max_tokens` caps one turn, `max_turns` the turns. The trajectory accumulates across turns
   and is never truncated — the context window bounds it, and a row past that fails the step. Watch `episode/turns`:
-  pinned at the cap, raise it; far below, lower it, since turns are sequential and set step time.
+  pinned at the cap, raise it; far below, lower it, since turns are sequential and set step time. A turn cut at
+  its cap, an empty turn, or one that calls only tools that do not exist is never rewarded: it trains only as a
+  penalty, when its episode scored below the group's mean ([Objective](../../agent-docs/training-methods/grpo/async-grpo/objective.md#untrainable-turns) ↗).
 - **Reasoning effort.** `environment_kwargs.reasoning_effort` (`low` / `medium` / `high` / `random`) sets how much the
   model should think, and `reasoning_effort_profiles` gives each level its own caps, as the code-contests recipes do
   (`{high: {thinking_tokens: 16384, max_submissions: 3, max_test_calls: 6}}`). `rollout_max_thinking_tokens`,
@@ -146,13 +147,16 @@ Evaluation runs the same loop: set `eval_strategy`, plus `num_generations_eval: 
 
 `reward/objective` says whether the task is being learned — a rising total reward with a flat objective is shaping,
 not progress (code contests add `outcome/solve_rate` beside it). `episode/turns` and `episode/truncation_rate` say
-whether episodes finish, and `sampling/logratio_mean` drifting steadily negative means the weight sync is broken and
-the policy is training on stale rollouts. With several servers, `async/prefetch_hit_rate` says which phase bounds the
+whether episodes finish, and `sampling/logratio_mean` drifting steadily negative means the weight
+sync is broken and the policy is training on stale rollouts, or, with `advantage/net_token_mass` staying negative and
+`entropy` climbing after it, a KL-free run drifting, which `balance_token_mass` and the early stop address. With several servers, `async/prefetch_hit_rate` says which phase bounds the
 step: it climbs toward 1 on a short single-turn environment (below ~0.8, add servers) and sits near 0 by construction
 once a multi-turn round outlasts the update.
 
-`reward/within_group_std` near zero is the quiet failure: every episode in a group scored the same, so the advantages
-are zero and that prompt teaches nothing. Rollouts land in `<output_dir>/completions/` as parquet.
+`reward/within_group_std` near zero is the quiet failure: every episode in a group scored the same, so that prompt
+teaches nothing. Such groups are dropped from the loss by default (`drop_degenerate_groups`), and
+`sampling/degenerate_group_frac` counts them. The tie is judged on the reward the environment settled (its grade, shaping and any judge or
+reward-model score), without the trainer's effort-length terms, so a length price on top does not hide it. Rollouts land in `<output_dir>/completions/` as parquet.
 
 ## Sizing a run
 

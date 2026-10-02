@@ -16,6 +16,8 @@ from src.distributed.expert_parallel.config import EPConfig, ExpertLoraSpec
 from src.distributed.group_layout import cross_node_rank_and_group, node_local_rank_and_group
 from src.distributed.parallelism_config import ParallelismConfig
 from src.trainers.mixins.base import DistributedTrainerMixin
+from src.trainers.preference.dpo import DistributedDPOTrainer
+from src.trainers.sft import DistributedSFTTrainer
 from src.training.parallelism_args import parallelism_config_from_args
 from tests.common.gloo import run_gloo_ranks
 from tests.common.parallelism import create_config, make_parallelism_config, simulated_world
@@ -757,6 +759,16 @@ def test_parallelism_config_from_args_rejects_pp_when_unsupported():
         assert "DistributedTrainerMixin does not support Pipeline Parallelism" in str(e)
 
 
+def test_parallelism_config_from_args_rejects_cp_when_unsupported():
+    """A trainer class declaring ``_supports_cp = False`` rejects a requested context_parallel_size>1
+    at config time, before any model loads; a trainer declaring it builds the CP config."""
+    args = DistributedArguments(context_parallel_size=2)
+    with simulated_world(world_size=8, gpus_per_node=8):
+        with pytest.raises(ValueError, match="DistributedDPOTrainer does not support Context Parallelism"):
+            parallelism_config_from_args(args, trainer_cls=DistributedDPOTrainer)
+        assert parallelism_config_from_args(args, trainer_cls=DistributedSFTTrainer).cp_size == 2
+
+
 def test_parallelism_config_from_args_rejects_lowp_when_disallowed():
     """A non-bf16 lowp_precision is rejected when allow_low_precision=False (non-SFT trainers)."""
     args = _DistArgs()
@@ -1000,7 +1012,6 @@ def test_reshard_after_backward_false_is_gated():
         {"ep_size": 2},  # multi-group EP: experts synced by the post-backward sweep, once per step
         {"world_size": 16, "use_hsdp": True},
         {"fsdp_reshard_after_backward": False},
-        {"fsdp_reshard_after_forward": True},
         {"fp32_grad_reduce": True},
     ],
 )
@@ -1022,6 +1033,18 @@ def test_defer_grad_sync_rejected_without_a_per_microstep_reduce(shape, named_kn
     with pytest.raises(ValueError, match="fsdp_defer_grad_sync") as excinfo:
         create_config(fsdp_defer_grad_sync=True, **shape)
     assert named_knob in str(excinfo.value)
+
+
+@pytest.mark.parametrize("fp32_grad_reduce", [False, True])
+def test_defer_grad_sync_rejected_under_full_shard(fp32_grad_reduce):
+    """Deferring holds every module's full unsharded gradient across the window, the state ZeRO-3
+    shards; the refusal names both knobs and the ZeRO-2 remedy."""
+    with pytest.raises(
+        ValueError, match="fsdp_defer_grad_sync=True contradicts fsdp_reshard_after_forward=True"
+    ) as excinfo:
+        create_config(fsdp_defer_grad_sync=True, fsdp_reshard_after_forward=True, fp32_grad_reduce=fp32_grad_reduce)
+    assert "fsdp_reshard_after_forward=False" in str(excinfo.value)
+    create_config(fsdp_defer_grad_sync=False, fsdp_reshard_after_forward=True, fp32_grad_reduce=fp32_grad_reduce)
 
 
 def test_reshard_rejects_ep():

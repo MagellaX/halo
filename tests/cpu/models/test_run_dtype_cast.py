@@ -16,6 +16,7 @@ Run: python tests/cpu/models/test_run_dtype_cast.py  (or pytest)
 """
 
 import functools
+import os
 import types
 from unittest import mock
 
@@ -52,7 +53,7 @@ from tests.common.pinned_params import pins_off_stored, stored_fp32_pins
 from tests.common.source_sweep import builds_a_model, functions_calling
 from tests.common.tiny_models import PINNED_FP32_FAMILIES, TINY_MOE_FAMILIES, build_tiny_family_checkpoint
 from tests.common.tokenizers import load_cached_tokenizer
-from tests.common.utils import params_off_dtype
+from tests.common.utils import params_off_dtype, safetensors_state_dict
 
 # The loaders log through accelerate's logger, which requires an initialized state.
 PartialState()
@@ -237,7 +238,9 @@ def test_a_request_that_is_not_a_dtype_leaves_the_model_as_loaded(dtype):
 def _tiny_checkpoints(tmp_path_factory, name: str, families, *, fp32_pins: bool = False) -> dict[str, str]:
     """``families``' tiny checkpoints under a fresh ``name`` directory, keyed by family."""
     root = tmp_path_factory.mktemp(name)
-    checkpoints = {family: str(root / family) for family in families}
+    # A per-process directory name: transformers copies a checkpoint's remote code into the shared
+    # HF_MODULES_CACHE under its directory name, so two xdist workers loading one family would race.
+    checkpoints = {family: str(root / f"{family}_{os.getpid()}") for family in families}
     for family, path in checkpoints.items():
         build_tiny_family_checkpoint(TINY_MOE_FAMILIES[family], path, fp32_pins=fp32_pins)
     return checkpoints
@@ -387,6 +390,23 @@ def _assert_keeps_exactly(model: nn.Module, pinned: dict[str, str], stored: dict
     assert fp32 == (set(pinned) if keep_fp32 else set())
     off = pins_off_stored(model, stored, pinned) if keep_fp32 else []
     assert not off, f"pins off their stored fp32 value: {off}"
+
+
+@pytest.mark.parametrize("loader", FP32_MASTER_LOADERS)
+def test_every_loader_keeps_a_pinned_buffer_fp32(roster_checkpoints, loader, monkeypatch):
+    """GLM-5 Next pins its router's ``e_score_correction_bias`` buffer. The tiny checkpoint stores it
+    bf16 and ``from_pretrained`` loads it fp32, so every training loader must too: the lazy ones read a
+    buffer at its stored dtype unless it is pinned."""
+    stored = {
+        name: tensor.dtype
+        for name, tensor in safetensors_state_dict(roster_checkpoints["glm5_next"]).items()
+        if name.endswith("e_score_correction_bias")
+    }
+    assert stored and set(stored.values()) == {torch.bfloat16}, f"the premise is a bf16-stored bias: {stored}"
+    model = _load_with(loader, "glm5_next", roster_checkpoints["glm5_next"], False, monkeypatch)
+
+    dtypes = {name: b.dtype for name, b in model.named_buffers() if name.endswith("e_score_correction_bias")}
+    assert dtypes and set(dtypes.values()) == {torch.float32}, dtypes
 
 
 @pytest.mark.parametrize("keep_fp32", [False, True], ids=["bf16", "fp32_masters"])

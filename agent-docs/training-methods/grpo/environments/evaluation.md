@@ -22,7 +22,11 @@ python scripts/environments/inference/run_env.py --env_type qa_search \
 | `--success_threshold` | `1.0` | `run_env.py` only: reward counting a sample as solved, for an environment that reports no solve verdict |
 | `--max_workers` | 32 (16 coding) | Concurrent episodes |
 | `--max_turns` / `--env_kwargs` | the env's own; coding 15 / `{}` | Turn cap override; JSON merged into the env config |
-| `--temperature` / `--top_p` / `--max_tokens` / `--request_timeout` | 0.7 (0.2 coding) / 0.95 / 32768 (coding at a level: its effort budget) / 180 s | Sampling, HTTP timeout |
+| `--temperature` / `--top_p` / `--max_tokens` / `--request_timeout` | 0.7 (0.2 coding) / 0.95 / 32768 (coding at a level: the level's `thinking_tokens` + 4096) / 180 s | Sampling, HTTP timeout |
+
+A `prompt` given as a message list reaches the environment as its last `user` turn, the task
+training hands it ([Async GRPO with Environments](../async-grpo/README.md)); a row with no `user` turn
+is refused before any episode runs.
 
 `run_env.py` reads `--prompt_field` / `--answer_field`, passes extra columns through
 `--context_fields`, buckets by `--group_by` and names each example by `--id_field` (default `id`);
@@ -39,7 +43,8 @@ flag of its own (`--max_turns`, `--language`, `--eval_protocol`, `--reasoning_ef
 `--training_config <yaml>` parses the YAML with the training script's own config classes: its
 `RolloutConfig` (template variables, stop tokens, thinking budget, sampling) and environment config
 (rewards, `max_turns`, `environment_kwargs`, `environment_type`) become the eval's. An explicit flag
-wins over the YAML, the YAML over the default.
+wins over the YAML, the YAML over the default. An environment at `reasoning_effort: random` draws each problem's level
+from the problem's text, as the trainer's eval does, so a rerun scores every problem at the same level.
 
 The training run's check of `episode_timeout` against the NCCL watchdog stays with training: the
 eval joins no process group, so a recipe whose budget needs a raised `DIST_NCCL_TIMEOUT_MINUTES`
@@ -72,7 +77,7 @@ every score (the telemetry line still counts it), and `generation_errors` counts
 no sample reads `nan`.
 
 `invalid` counts the samples scored 0 with no signal, each carrying `error`: an invalid grade (a
-grading or sandbox outage, a failed scorer, a null `answer`) or an episode whose run raised. Invalid
+grading or sandbox outage, an inconclusive code grade, a failed scorer, a null `answer`) or an episode whose run raised. Invalid
 samples stay in the means, unlike in training, where the baseline drops them.
 
 ## Output files
@@ -95,8 +100,8 @@ coding, also the adapter, contest `selection`, language, `eval_protocol`, effort
 Each later line is an `episode`, addressed by `index` and `id`: `reward`, `success`,
 `generation_error` (null on a scored sample), `stats`, the messages, `reasoning_effort` /
 `reasoning_budget`, `info`. The answer key (`_`-prefixed `info`
-fields), the `info` tool-call log, `context` and assistant chain-of-thought are stripped; each
-message keeps its own `tool_calls`, which the re-grader replays.
+fields), `context` and assistant chain-of-thought are stripped; each message keeps its own
+`tool_calls`, which the re-grader replays.
 
 ## Re-grading recorded trajectories
 
@@ -110,7 +115,8 @@ python scripts/environments/inference/regrade_trajectories.py \
 ```
 
 It rebuilds each problem's hidden tests by `index` under the meta line's contest `selection`, and
-replays every recorded `submit_solution`, up to that episode's own budget, through `grade_solution`
+replays every recorded `submit_solution`, its arguments read as the environment read them (a
+Python-literal arguments string included), up to that episode's own budget, through `grade_solution`
 under the meta line's `env_grading` contract. The meta's `eval_protocol` only rebuilds the
 environment, whose `max_submissions` is the budget of an episode that stamped none. Grading stops at
 the first failing test and `max_grading_seconds` does not apply. It reports, per file, the protocol

@@ -227,7 +227,8 @@ fused SR kernel, fp32 params standard in-place AdamW. See
 [DeepEP](../infrastructure/deepep.md) owns installation, buffer sizing, transport and fabric tuning.
 What an EP run has to plan around:
 
-- **Two dispatch ceilings**, both raised at buffer sizing rather than left to fault mid-kernel:
+- **Two dispatch ceilings**, both refused at config time off the declared budget and re-checked at buffer
+  sizing, rather than left to fault mid-kernel:
 
     - The 32-bit wire index caps every topology at `2³¹ / (num_topk × padded_hidden)` ≈ **175k tokens
       per forward** for GPT-OSS.
@@ -245,9 +246,8 @@ What an EP run has to plan around:
   with `num_generations` or `gradient_accumulation_steps`, and the buffer is per-rank, so raising
   `ep_size` does not lower it. Bound the *single-sequence* length: `per_device_train_batch_size = 1`
   for long sequences, and cap SFT `max_length` or the RL rollout budget.
-- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` composes with the `ElasticBuffer`** on
-  single-node runs — set it when variable-shape packing at `per_device_train_batch_size > 1`
-  fragments the allocator.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` composes with the `ElasticBuffer`**
+  ([DeepEP → Memory allocation failures](../infrastructure/deepep.md#runtime-errors)).
 - **Dtype contract** (`src/distributed/expert_parallel/autograd.py`): `topk_weights` must be FP32
   contiguous; token tensors keep their dtype across dispatch/combine. The wire zero-pads the feature
   dim to a multiple of 256 and slices it back symmetrically (GPT-OSS hidden 2880 → 3072), so
@@ -353,10 +353,13 @@ on EP MoE — the DeepEP all-to-all breaks the graph at every MoE boundary eithe
 
 Whichever kernel a family resolves, a layer with a real dispatch group (`ep_size > 1`) traces it on
 its **first forward, before that forward's dispatch** (`_warm_activation_graphs`): one grad-enabled
-pass with a backward and one under `no_grad`. Where the fused permute runs (the grouped-GEMM path with `top_k >= ep_size`), the
+pass with a backward and one under `no_grad`, outside inference mode, so a first forward under
+`torch.inference_mode()` still warms the backward kernels a later training forward runs. Where the fused permute runs (the grouped-GEMM path with `top_k >= ep_size`), the
 same pass runs the permute's backward and the weighted unpermute's forward and backward. One token count
 covers every dispatch size: the kernels take their row count with `do_not_specialize`, so Triton
-compiles no separate binary per class of it (1, a multiple of 16, neither).
+compiles no separate binary per class of it (1, a multiple of 16, neither). The weighted unpermute's
+backward takes its routing-weight-gradient switch the same way, so the one warm compile also serves
+routing weights that need no gradient.
 
 The inputs are zeros rather than a draw, and the backward runs under identity saved-tensor hooks.
 The warm-up sits inside the gradient-checkpointed block, whose recompute restores the RNG to region
@@ -373,7 +376,9 @@ warm-up.
 buffers computed for real** (`accelerate.init_empty_weights(include_buffers=False)`), then streams
 each rank's expert slice straight from safetensors
 (`src/distributed/expert_parallel/lazy_loader.py`). The shell carries the **run's** dtype, not the
-checkpoint config's.
+checkpoint config's. Float parameters stream at that dtype; a float buffer keeps its stored dtype unless the
+family's fp32 pins name it (GLM-5 Next's `e_score_correction_bias`), which then loads fp32, as `from_pretrained`
+loads it.
 
 Buffers must be real: a config-less rotary derives `inv_freq` from ctor args it never stores, which a
 meta build loses irrecoverably. The `from_pretrained(device_map="meta")` route strands the
@@ -504,7 +509,7 @@ topology rejections sit on top: single-domain multi-group EP with `ep_size > 2`
 | `use_grouped_gemm: false` | drops the wrappers at `ep_size == 1`; peeled expert-LoRA targets then raise rather than silently vanish | `_validate_expert_lora_realized` |
 | `fsdp_reshard_after_forward` | rejected — the backward all-gather can race the DeepEP combine | `_validate_fsdp_settings` |
 | `use_hsdp` | rejected — EP already shards over the EP group | `_validate_hsdp` |
-| `bf16_optimizer: false` with a stock AdamW `optim` | rejected at optimizer build ([why](../optimization/bf16-optimizer.md#master-weight-and-grad-reduce-options)); `fp32_non_ep_params: true`, `muon` and `flash_adamw` build | `mixins/base.py` |
+| `bf16_optimizer: false` with a stock AdamW `optim` | rejected at optimizer build ([why](../optimization/bf16-optimizer.md#usage)); `fp32_non_ep_params: true`, `muon` and `flash_adamw` build | `mixins/base.py` |
 | `ref_model` (explicit) | rejected — the reference is never parallelized, so its log-probs would not match the policy | `_validate_reference_model` |
 | `init_from_scratch` | rejected — no sharded random init | `model_loading.py` |
 | `accelerate launch` | rejected — EP requires `torchrun`; the same rejection covers a grouped-GEMM MoE at `ep_size == 1` | `model_loading.py`, `ParallelismValidationMixin` |

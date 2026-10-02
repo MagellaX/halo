@@ -31,7 +31,7 @@ changes.
 
 | `src/` area | Owning doc page(s) |
 |---|---|
-| `src/distributed/parallelism_config.py` (ParallelismConfig, validation) | `agent-docs/parallelism/*` (all), `agent-docs/reference/configuration-reference.md`, the parallelism matrix in `CLAUDE.md` + `agent-docs/README.md` |
+| `src/distributed/parallelism_config.py` (ParallelismConfig, validation) | `agent-docs/parallelism/*` (all; the combination table in `agent-docs/parallelism/README.md#supported-combinations`), `agent-docs/reference/configuration-reference.md`, the parallelism matrix in `CLAUDE.md` |
 | `src/distributed/expert_parallel/` (DeepEP, all-to-all, per-family layers, expert compute) | `agent-docs/parallelism/expert-parallelism.md`, `agent-docs/parallelism/expert-tensor-parallelism.md`, `agent-docs/optimization/grouped-gemm.md`, `agent-docs/infrastructure/deepep.md` |
 | `src/distributed/context_parallel/` (Ulysses) | `agent-docs/parallelism/context-parallelism.md` |
 | `src/distributed/tensor_parallel/` (DTensor) | `agent-docs/parallelism/tensor-parallelism.md` |
@@ -47,7 +47,9 @@ changes.
 | `src/trainers/grpo/rollout/routing_replay.py` (R2/R3 capture, wire decode, engine-layer slicing) | `agent-docs/training-methods/grpo/async-grpo/objective.md`, `agent-docs/infrastructure/rollout-servers.md` |
 | `src/trainers/grpo/rollout/trajectory_tokenize.py`, `trajectory_spans.py` (trajectory → training rows: whole-render spans, per-turn sampled ids) | `agent-docs/training-methods/grpo/async-grpo/rollouts.md` |
 | `src/trainers/grpo/rollout/rollout_metrics.py`, `completions_logging.py` (per-episode rollout diagnostics, completion/trajectory artifacts) | `agent-docs/training-methods/grpo/async-grpo/monitoring.md`, `agent-docs/training-methods/callbacks.md` |
-| `src/trainers/grpo/objective/` (group-relative advantages, truncated log-ratio corrections, RLRR relative rewards) | `agent-docs/training-methods/grpo/async-grpo/objective.md`, `agent-docs/training-methods/grpo/{online-grpo,offline-grpo}.md` |
+| `src/trainers/grpo/early_stop.py` (the shared GRPO early stop; knobs in `GRPOEarlyStopArguments`) | `agent-docs/training-methods/grpo/async-grpo/monitoring.md` (early stop), `agent-docs/training-methods/grpo/online-grpo.md`, `agent-docs/reference/configuration-reference.md` |
+| `src/trainers/grpo/world_metrics.py` (`WorldMetrics` / `gathered_fractions`: step metrics folded from every rank's counts, shared by online + environmental GRPO) | `agent-docs/training-methods/grpo/async-grpo/monitoring.md`, `agent-docs/training-methods/grpo/online-grpo.md` |
+| `src/trainers/grpo/objective/` (group-relative advantages, truncated log-ratio corrections, RLRR relative rewards, offline GRPO's loss-type reduction: `offline_loss_numerator` / `offline_loss_normalizer`, `LOSS_TYPES` / `PG_FORMULATIONS`) | `agent-docs/training-methods/grpo/async-grpo/objective.md`, `agent-docs/training-methods/grpo/{online-grpo,offline-grpo}.md` |
 | `src/trainers/grpo/mixins/chunked_logprobs.py` (`use_chunked_grpo_logprobs` — the chunked log-prob path past the logits wall) | `agent-docs/training-methods/grpo/async-grpo/performance.md`, `agent-docs/reference/configuration-reference.md` |
 | `src/environments/ray_actors.py` (actor pool, dispatch, Ray init) | `agent-docs/infrastructure/ray.md`, `agent-docs/training-methods/grpo/async-grpo/setup.md` (trainer-side knobs) |
 | `src/distributed/checkpoint/` (save ladder, weight loader, OptimizerShardStore, PeftAdapterSaver) | `agent-docs/reference/checkpoints.md` |
@@ -60,6 +62,8 @@ changes.
 | `src/distributed/checkpoint/write.py` (the collective half of a write: retain-gated DTensor resolve of params and buffers with neutralized sinks, the streamed part writer, the shard-index exchange) | `agent-docs/reference/checkpoints.md`, `agent-docs/parallelism/data-parallelism.md` |
 | `src/models/structure.py` (module-tree introspection: unwrap, PEFT names and folds, decoder layers, norms) | `agent-docs/reference/checkpoints.md`, `agent-docs/parallelism/data-parallelism.md`, `agent-docs/optimization/peft.md` |
 | `src/models/head_transform.py` (per-family head transform, verified against the family forward) | `agent-docs/models/adding-a-model.md`, `agent-docs/training-methods/grpo/async-grpo/performance.md`, `agent-docs/parallelism/pipeline-parallelism.md` |
+| `src/distributed/loading/frozen_models.py` (unsharded teacher / reference loads + freeze) | `agent-docs/training-methods/distillation/teacher-distillation.md`, `agent-docs/training-methods/preference/dpo.md` |
+| `src/distributed/loading/vlm_setup.py` (modality-aware entry points) | `agent-docs/training-methods/sft.md` (Vision-language models), `agent-docs/models/README.md` |
 | `src/distributed/fsdp.py` (FSDP2 wrapping + reshard) | `agent-docs/parallelism/data-parallelism.md`, `agent-docs/reference/checkpoints.md` |
 | `src/distributed/runtime.py` (rank/world state, barriers, cross-rank consensus, group timeouts), `src/distributed/filesystem.py` (c10d-store phases, main-first ordering, output-FS probe, load throttle) | `agent-docs/parallelism/multi-node.md`, `agent-docs/data/filesystem-handling.md`, `agent-docs/reference/architecture.md` |
 | `src/distributed/nvlink.py` (fabric probes behind `nvlink_domain_size`) | `agent-docs/parallelism/multi-node.md`, `agent-docs/infrastructure/deepep.md` |
@@ -73,8 +77,11 @@ changes.
 |---|---|
 | EP layer wrappers `src/distributed/expert_parallel/layers/<family>.py` | the per-family page under `agent-docs/models/` + `agent-docs/parallelism/expert-parallelism.md` (supported-models table) + `agent-docs/optimization/grouped-gemm.md` (supported-models table) |
 | `src/distributed/expert_parallel/layers/zaya.py`, `src/models/patches/zaya.py` | `agent-docs/models/zaya.md` |
-| `src/distributed/loading/model_loading.py`, `src/distributed/loading/warmup.py`, `src/models/loading/model_preparation.py`, `src/models/patches/remote_code_compat.py`, `src/models/patches/remote_code_hooks.py` | `agent-docs/models/README.md`, `agent-docs/models/adding-a-model.md`, the affected per-family page |
+| `src/distributed/loading/model_loading.py`, `src/distributed/loading/warmup.py`, `src/models/loading/model_preparation.py`, `src/models/patches/remote_code_compat.py`, `src/models/patches/remote_code_hooks.py` | `agent-docs/models/README.md`, `agent-docs/models/adding-a-model.md`, the affected per-family page; `agent-docs/optimization/flash-attention.md` (the FA4 and flex warm-up) |
 | `src/models/seq_cls_heads.py` (Gemma 4 + MoE Qwen3.5/3.6 seq-cls heads, registered by an import in `src/models/loading/model_preparation.py`) | `agent-docs/training-methods/classification.md`, `agent-docs/training-methods/preference/reward-modeling.md` |
+| `src/models/loading/tokenizer_setup.py` (processing class + length budget, `resolve_peft_processing_class`) | `agent-docs/getting-started/configuration.md`, `agent-docs/reference/configuration-reference.md` |
+| `src/models/patches/buffer_fixes.py` (`finalize_loaded_model`: the non-persistent buffer repair every load path ends in) | `agent-docs/models/README.md`, `agent-docs/models/adding-a-model.md` |
+| `src/models/patches/kernel_dispatch.py` (device-aware repair of transformers' kernel-fallback dispatch) | `agent-docs/models/README.md`, `agent-docs/models/qwen3_5.md` |
 | `src/models/loading/checkpoint_coverage.py` (random-init load gate) | `agent-docs/reference/checkpoints.md`, `agent-docs/reference/troubleshooting.md` |
 | `src/models/loading/dtype.py` (run dtype, the loaded-parameter cast: fp32 pins → run dtype, fp8 refused; fp32-matmul precision) | `agent-docs/models/README.md` (Load precision), `agent-docs/reference/configuration-reference.md` (`HALO_FP32_MATMUL_PRECISION`) |
 | `src/models/loading/config_levels.py` (composite-config field access, run-scoped writes, `config_export_ready`) | `agent-docs/models/README.md`, `agent-docs/reference/checkpoints.md`, `agent-docs/training-methods/callbacks.md` |
@@ -107,9 +114,12 @@ changes.
 | `src/kernels/liger/` (orchestrator + appliers) | `agent-docs/optimization/liger-kernels.md` |
 | `src/optimizers/` (AdamWBF16, Muon, FlashAdamW) | `agent-docs/optimization/{bf16-optimizer,muon-optimizer,flash-adamw}.md` |
 | `src/kernels/lowp/` (quantization, linear, deepgemm, mixed_precision) | `agent-docs/optimization/low-precision-moe-kernels.md` |
+| `src/kernels/histogram.py` (the expert-load histogram behind the `moe/*` metrics and the bias update) | `agent-docs/training-methods/callbacks.md` |
 | `src/kernels/grouped_gemm.py` (precision dispatch), `src/kernels/grouped_mm_autograd.py` (bf16 primitive) | `agent-docs/optimization/grouped-gemm.md` |
-| `src/kernels/fused_glu.py` (fused SwiGLU kernels + `is_silu_activation` gate) | `agent-docs/models/glm4.md` (gate), `agent-docs/models/gpt-oss.md` (clamped variant) |
+| `src/kernels/fused_glu.py` (fused GLU kernels, activation probes, the `HALO_FUSED_GLU` switch) | `agent-docs/models/glm4.md` (gate), `agent-docs/models/gpt-oss.md` (clamped variant), `agent-docs/optimization/liger-kernels.md` (Fused GLU under an EP wrapper), `agent-docs/reference/configuration-reference.md` (`HALO_FUSED_GLU`), `agent-docs/reference/troubleshooting.md` (Turning off a fused kernel), `agent-docs/optimization/grouped-gemm.md` (packed GLU), `agent-docs/optimization/torch-compile.md`, `agent-docs/parallelism/expert-parallelism.md` (the EP warm-up) |
+| `src/kernels/moe_permute.py` (atomic-free token permute: `build_inv_map`, `MoEGatherPermute`, the fused weighted un-permute) | `agent-docs/optimization/grouped-gemm.md` |
 | attention selection (`src/models/patches/attention.py`, `_detect_attention_impl`) | `agent-docs/optimization/flash-attention.md` |
+| `src/models/patches/flex_sliding_attention.py` (FlexAttention on SDPA sliding-window and wide-head layers) | `agent-docs/optimization/flash-attention.md`, `agent-docs/models/gemma4.md` |
 | GptOss sink policy (`src/models/patches/gpt_oss_sinks.py`) | `agent-docs/models/gpt-oss.md` (Attention sinks), the `reset_sinks`/`train_sinks` rows of `agent-docs/reference/configuration-reference.md` |
 | `torch.compile` paths | `agent-docs/optimization/torch-compile.md` |
 | LoRA/QLoRA (`src/distributed/loading/peft_setup.py`) | `agent-docs/optimization/peft.md` |
@@ -142,7 +152,7 @@ changes.
 |---|---|
 | `src/configs/`, `src/args/` (config/arg dataclasses) | `agent-docs/reference/configuration-reference.md` + the method page that owns the config |
 | `src/training/parser.py` (H4ArgumentParser, toolkit defaults, the unknown-key raise) | `agent-docs/getting-started/configuration.md`, `agent-docs/reference/configuration-reference.md` |
-| `src/env.py` (the `env_*` readers, `HALO_DATA_ROOT` / `data_path`) and any `HALO_`/`DIST_`/`VLLM_`/`SGLANG_` knob wherever it is read | `agent-docs/reference/configuration-reference.md` (Environment variables), `agent-docs/infrastructure/docker.md` |
+| `src/env.py` (the `env_*` readers, `HALO_DATA_ROOT` / `data_path`) and any `HALO_`/`DIST_`/`VLLM_`/`SGLANG_`/`NVLINK_`/`EP_` knob wherever it is read | `agent-docs/reference/configuration-reference.md` (Environment variables), `agent-docs/infrastructure/docker.md` |
 | `src/log.py` (root logging setup, CLI verbosity, `warn_once`) | `agent-docs/reference/debugging.md` |
 | `src/cli.py` (`halo launch` / `halo run` surface, tool aliases) | `README.md` quick start, `agent-docs/reference/scripts-reference.md` |
 
@@ -151,7 +161,7 @@ changes.
 | `src/` area | Owning doc page(s) |
 |---|---|
 | `src/training/environment.py` (output-dir validation, HF cache wiring, seed, tracking vars, resume detection) | `agent-docs/getting-started/configuration.md`, `agent-docs/data/filesystem-handling.md`, `agent-docs/reference/checkpoints.md` |
-| `src/training/script_runner.py` (the `scripts/training/**` backbone: window pins, tokenizer/attention resolution, the modality verdict (`resolve_vlm_run`), callback assembly, `reject_*` guards incl. the TRL dataset-prep refusal (`reject_trl_dataset_prep_args`)) | `agent-docs/reference/scripts-reference.md`, `agent-docs/getting-started/configuration.md` |
+| `src/training/script_runner.py` (the `scripts/training/**` backbone: window pins, tokenizer/attention resolution, the modality verdict (`resolve_vlm_run`), callback assembly, `reject_*` guards incl. the TRL dataset-prep refusal (`reject_trl_dataset_prep_args`), the rank-0 backend probe (`verify_backend_on_rank0`), the context-window apply (`apply_context_window`)) | `agent-docs/reference/scripts-reference.md`, `agent-docs/getting-started/configuration.md` |
 | `src/training/parallelism_args.py` (`DistributedArguments` → `ParallelismConfig`, the per-script CP/PP/lowp gates) | `agent-docs/parallelism/*`, `agent-docs/reference/configuration-reference.md` |
 | `src/training/run_logging.py` (per-rank transformers verbosity, the `run.log` console tee) | `agent-docs/reference/debugging.md` |
 | `src/inference/openai_client.py` (OpenAI-compatible endpoint defaults, async client, parallel-request helpers), `src/inference/response.py` (`OpenAIResponse`, the finish-reason contract), `src/inference/resume_store.py` (resumable request checkpoints) | `agent-docs/reference/scripts-reference.md` |
@@ -185,12 +195,25 @@ changes.
 | a new user-facing fail-fast raise or failure mode (config-time rejection, NCCL/DeepEP fault, OOM path) | `agent-docs/reference/troubleshooting.md` (symptom → cause → fix), plus `agent-docs/reference/debugging.md` when it needs a diagnosis helper |
 | a new, moved, renamed, or deleted `src/` subpackage or top-level module | `agent-docs/reference/architecture.md` (source map) + the architecture tree in `CLAUDE.md` |
 
+## Cross-cutting pages
+
+These pages own no `src/` area; they summarize or route. Update them when the fact they summarize
+changes on its owner page.
+
+| Page | Summarizes |
+|---|---|
+| `agent-docs/README.md`, `agent-docs/training-methods/README.md`, `agent-docs/training-methods/preference/README.md`, `agent-docs/data/README.md`, `agent-docs/infrastructure/README.md`, `agent-docs/optimization/README.md`, `agent-docs/reference/README.md` | the section's pages and their one-line scope |
+| `agent-docs/getting-started/{installation,quickstart,choosing-a-method}.md` | the image, the first run, the method choice |
+| `agent-docs/contributing/development-environment.md` | the host setup, credentials and paths |
+| `agent-docs/optimization/halo-vs-stock-trl.md` | the measured toolkit-vs-TRL comparisons |
+| `agent-docs/reference/{glossary,gpu-training-theory,scale-and-limitations,why-this-framework}.md` | terms, the performance model, the known limits, the design rationale |
+
 ## When in doubt
 
 - Trainer/mixin behavior → `agent-docs/reference/trainer-architecture.md`.
 - Any new config field → `agent-docs/reference/configuration-reference.md`.
 - A change to what parallelism combinations are valid → the parallelism matrix in
-  `CLAUDE.md` and the mode list in `agent-docs/README.md`, plus the owning
-  `agent-docs/parallelism/` page.
+  `CLAUDE.md` and the Supported combinations table in `agent-docs/parallelism/README.md`, plus the
+  owning `agent-docs/parallelism/` page.
 - A new page → wire it into its section `README.md` and the `CLAUDE.md` Documentation
   index, then run `./scripts/docs/check_links.sh`.

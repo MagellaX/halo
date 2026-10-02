@@ -8,7 +8,7 @@ The MoE expert step sorts tokens by expert (contiguous per-expert blocks), build
 
 **Isolated kernel** — B300 (SM103, PyTorch 2.11), Qwen3-30B-A3B dims (hidden 2048, moe_intermediate 768), median over 50 iters: **≈11.93×** over the per-expert loop (forward and fwd+bwd alike), e.g. 128 experts / 4K tokens fwd+bwd 17.24 ms → 1.45 ms (11.93×), forward 1.33 ms → 0.11 ms (achieved TFLOPS 9.68 → 115.43). The ratio scales with expert count (more launches saved). These are launch-dominated; end-to-end is far smaller.
 
-**End-to-end** — Qwen3-30B-A3B (128 experts, top_k=8), 2× B300 EP=2, FA4+Liger, seq 8192, GC on, 8 steps: **3.43×** at batch 1 (10,711 vs 3,122 tokens/s/GPU), narrowing to **2.12×** at batch 4 (15,307 vs 7,211). With 64 local experts/rank the launch saving is worth most at small batch; as per-expert GEMMs grow, the win narrows.
+**End-to-end** the launch saving is worth most at small batch and narrows as per-expert GEMMs grow (the Qwen3-30B EP=2 row below).
 
 ### Why grouped GEMM also saves memory
 
@@ -49,30 +49,32 @@ Around the kernel sit the token permutation and, for expert-bias models (GptOss)
 
 PyTorch's default backward for a duplicate-valued gather is `index_add_`, whose bf16 kernel has no native atomic add and emulates one with a CAS loop that serializes under the duplicate-row contention. On a profiled gpt-oss-20b EP step that atomic scatter took ≈20% of all GPU time and inflated the DeepEP combine wait.
 
-**Rule: never let a duplicate-valued gather fall back to the default `index_add_` backward in a training forward.** Both gathers route through custom autograd Functions in `src/distributed/expert_parallel/autograd.py` that keep the gather forward and replace the backward.
+**Rule: never let a duplicate-valued gather fall back to the default `index_add_` backward in a training forward.** Both gathers route through custom autograd Functions that keep the gather forward and replace the backward: `MoEGatherPermute` (`src/kernels/moe_permute.py`) and `MoEExpertBiasGather` (`src/distributed/expert_parallel/autograd.py`).
 
 The bias gather (`MoEExpertBiasGather`, applied in `EPGptOssMoELayer`'s grouped path) computes `grad_bias` as one GEMM (`onehot(eids)ᵀ @ grad_out`, fp32 tensor-core accumulation): atomic-free and numerically identical (more accurate than the bf16 atomic add).
 
-The atomic-free path runs the EP step at ~6,310 vs ~1,256 tok/s/GPU for the default-backward path (≈5×, board power ~34% → ~56% of limit), and ~6,773 vs ~4,100 tok/s for plain FSDP grouped (~1.65×); the loss curve is identical.
+On that gpt-oss-20b EP step the atomic-free path runs ≈5× faster than the default backward (board power ~34% → ~56% of limit), and plain FSDP grouped ~1.65× faster; the loss curve is identical.
 
 ### The atomic-free gather-reduce permute
 
-The token permute/unpermute (`MoEGatherPermute`, `MoEWeightedUnpermute`) is the larger lever for high-top_k MoE. Qwen3.6 (top-8, 256 experts, 32 local/rank at EP8) measures the scatter-back `index_add_` at ~32% of the step: 4.3 ms/call vs gpt-oss (top-4, 4 local/rank) 0.38 ms/call (11× gap, pure collision rate).
+The token permute/unpermute (`MoEGatherPermute`, `MoEWeightedUnpermute`, `src/kernels/moe_permute.py`) is the larger lever for high-top_k MoE. Qwen3.6 (top-8, 256 experts, 32 local/rank at EP8) measures the scatter-back `index_add_` at ~32% of the step: 4.3 ms/call vs gpt-oss (top-4, 4 local/rank) 0.38 ms/call (11× gap, pure collision rate).
 
-The permute expresses both directions with no atomics via a precomputed `inv_map` (`[recv_N, top_k]` of sorted positions feeding each recv token, sentinel-padded), turning the scatter into gather + reduction (numerically identical to `index_add_`, float64-checked fwd+bwd).
+The permute expresses both directions with no atomics via a precomputed `inv_map` (`[recv_N, top_k]` of sorted positions feeding each recv token, sentinel-padded, built by `build_inv_map`), turning the scatter into gather + reduction. It matches `index_add_` to rounding, not bit for bit: the kernels accumulate in fp32, and the unpermute skips the bf16 rounding of each weighted row (checked fwd+bwd against a float64 `index_add_`).
 
-It is gated on **`top_k ≥ ep_size`** (`base_layer._sort_tokens_for_grouped_mm` builds `inv_map` via `_build_inv_map`). The atomic-free path pays for building `inv_map` and wins only where many rows add into the same token, which is what `top_k ≥ ep_size` means. Below that (gpt-oss top-4 at EP8, the top-8 families at `ep16`, DeepSeek-V4-Flash top-6 at `ep8`) a received token lands on few local rows, the atomics rarely collide, and the plain `index_select` + `index_add_` is kept.
+It is gated on **`top_k ≥ ep_size`** (`_uses_fused_permute`, read by `base_layer._sort_tokens_for_grouped_mm` and the EP warm-up). The atomic-free path pays for building `inv_map` and wins only where many rows add into the same token, which is what `top_k ≥ ep_size` means. Below that (gpt-oss top-4 at EP8, the top-8 families at `ep16`, DeepSeek-V4-Flash top-6 at `ep8`) a received token lands on few local rows, the atomics rarely collide, and the plain `index_select` + `index_add_` is kept.
 
-Above the gate both reductions run as one Triton kernel (`src/kernels/moe_permute.py`) that walks `inv_map` per output row and accumulates in fp32, so no `[recv_N, top_k, H]` transient or padded copy exists. The grouped path folds the routing-weight multiply into the unpermute (`MoEWeightedUnpermute`), and its backward writes the expert-output gradient and the routing-weight gradient in one pass. The fused `[gate | up]` GLU output is read in place by the packed GLU kernels (`PACKED_GLU_MULS` in `src/kernels/fused_glu.py`), whose backward writes one `[..., 2M]` gradient.
+Above the gate both reductions run as one Triton kernel (`src/kernels/moe_permute.py`) that walks `inv_map` per output row and accumulates in fp32, so no `[recv_N, top_k, H]` transient or padded copy exists. The grouped path folds the routing-weight multiply into the unpermute (`MoEWeightedUnpermute`), and its backward writes the expert-output gradient and the routing-weight gradient in one pass. Routing weights that need no gradient leave the expert outputs unsaved, since only the routing-weight gradient reads them. The fused `[gate | up]` GLU output is read in place by the packed GLU kernels (`PACKED_GLU_MULS` in `src/kernels/fused_glu.py`), whose backward writes one `[..., 2M]` gradient.
 
-Gemma 4 26B-A4B expert block (hidden 2816, intermediate 704, 128 experts, top-8), fwd+bwd on one B300: 2.09 / 3.33 / 10.56 ms at 2k / 8k / 32k tokens, against 2.45 / 4.99 / 16.46 ms for the padded-gather permute Halo v1.0.0 runs (a separate routing-weight multiply, a padded `[N, top_k, H]` gather-sum each way), and 42% less peak transient memory at 32k: 3.8 against 6.6 GiB (`tests/gpu/profiling/benchmark_moe_block.py`, rows `halo` and `halo_padded_gather`).
+The Qwen3.6 table is a same-session A/B of `index_add_` against the atomic-free permute in its padded-gather form (the `halo_padded_gather` baseline below), on Qwen3.6-35B-A3B at EP=8; compare within it only (tuned absolute figures: [Throughput Benchmarks](throughput-benchmarks.md#ep-scaling-seq-4096)).
 
-| Qwen3.6-35b EP=8 | `index_add_` | atomic-free | win |
+| Qwen3.6-35b EP=8 | `index_add_` | atomic-free (padded gather) | win |
 |---|---|---|---|
 | seq 4096  | 2,736 tok/s/GPU | 3,231 | +18% |
 | seq 16384 | 2,465 tok/s/GPU | 4,056 | +65% |
 
 The win grows with sequence length (larger recv buffers → worse contention).
+
+The fused kernels against that padded-gather permute (a separate routing-weight multiply, a padded `[N, top_k, H]` gather-sum each way, the same sort), on the Gemma 4 26B-A4B expert block (hidden 2816, intermediate 704, 128 experts, top-8), fwd+bwd on one B300: 1.78 / 3.25 / 10.63 ms at 2k / 8k / 32k tokens, against 2.21 / 4.73 / 16.24 ms, and peak transient memory of 3.7 against 6.5 GiB at 32k (`tests/gpu/profiling/benchmark_moe_block.py`, rows `halo` and `halo_padded_gather`).
 
 Per-device batch multiplies the per-call recv buffer exactly like sequence length, so on the families the gate leaves on the CAS path (`top_k < ep_size`) batch shape is a real lever. At high router skew scale with GA, not per-device batch.
 
@@ -82,9 +84,9 @@ gpt-oss-120b at EP8, same 64-sequence effective batch: bs2 × GA4 measures ~20% 
 
 The grouped GEMM is one part of an EP step (also: all-to-all dispatch/combine, permute, attention, optimizer). The general sequence/batch playbook is in [Throughput Benchmarks](throughput-benchmarks.md#maximizing-throughput-sequence--batch); the kernel-side levers, measured on 8× B300 (SM 10.3, PyTorch 2.11+cu130, FA4, bf16):
 
-1. **Pick parallelism by fit.** If it fits FSDP2, FSDP has no all-to-all and reaches higher achieved TFLOPS — gpt-oss-20b 1,203 TFLOPS (FSDP, experts replicated) vs 228 (EP=8) at seq 4096, batch 1 — but is memory-heavy (148 GB at b1, near OOM at larger batch). Use EP only when FSDP OOMs.
-2. **Smallest EP degree that fits the experts.** Fewer ranks = smaller all-to-all + larger per-rank GEMMs. gpt-oss EP2 (DP8) 745 TFLOPS vs EP8 228 at seq 4096, batch 1.
-3. **GC off when the batch fits** — recompute is ~+19% overhead on a 288 GB B300 at moderate seq.
+1. **Pick parallelism by fit.** If it fits FSDP2, FSDP has no all-to-all and reaches higher achieved TFLOPS, at a high memory cost; use EP only when FSDP OOMs ([Maximizing achieved TFLOPS](throughput-benchmarks.md#maximizing-achieved-tflops)).
+2. **Smallest EP degree that fits the experts.** Fewer ranks = smaller all-to-all + larger per-rank GEMMs.
+3. **GC off when the batch fits** ([the gpt-oss-20b EP case study](throughput-benchmarks.md#where-the-ep-steps-time-goes-gpt-oss-20b-ep8-b1s4096-8-b300-fa4)).
 4. **Atomic-free expert permute** (above) — automatic for `top_k ≥ ep_size`, +18% (seq 4k) to +65% (seq 16k) on qwen3.6.
 5. **Do not use low precision** (fp8/fp4) — measured net-slower (experts are tiny-M / bandwidth-bound, bf16 at the roofline). See [Low-Precision Kernels](low-precision-moe-kernels.md).
 
@@ -150,7 +152,7 @@ torchrun --nproc_per_node=8 scripts/training/sft.py \
     --expert_parallel_size=1 --use_grouped_gemm=true
 ```
 
-The wrapper keeps the packed-3D layout used at EP>1, so checkpoints stay shape-compatible across `ep_size`. Requires `torchrun`: an MoE with `use_grouped_gemm: true` under any `accelerate launch` is rejected at load (the wrappers need the mixin-managed FSDP2 path) — launch with torchrun or set `use_grouped_gemm: false`. Standalone benchmark: **3.07× over the naive loop** at 128 experts × 4096 tokens on B300 (naive 51.66 → grouped 158.66 TFLOPS).
+The wrapper keeps the packed-3D layout used at EP>1, so checkpoints stay shape-compatible across `ep_size`. Requires `torchrun`: an MoE with `use_grouped_gemm: true` under any `accelerate launch` is rejected at load (the wrappers need the mixin-managed FSDP2 path) — launch with torchrun or set `use_grouped_gemm: false`.
 
 Liger's fused MoE kernel never runs the routed experts: its `LigerExperts` swap is inert under this wrapper (EP=1 included), which replaces the very module the swap targets, and is kept off wherever no wrapper is installed ([Liger Kernels](liger-kernels.md#routed-experts)). Non-expert Liger kernels (RMSNorm, RoPE, CrossEntropy/FusedLinearCE) still apply, and a family whose toolkit spec also names the dense and shared-expert MLPs keeps its fused GLU: [Liger Kernels](liger-kernels.md#ep--cp--tp-behavior).
 

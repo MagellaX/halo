@@ -57,9 +57,13 @@ __all__ = [
 DEFAULT_BUCKET = env_str("HALO_S3_DEFAULT_BUCKET")
 
 
-# Bounded so concurrency x each file's multipart connections stays within max_pool_connections=50.
-# Clamped rather than ``or``-defaulted: an explicit 0 would become 16 instead of the no-workers it
-# asks for, and env_int already turns unset/malformed values into the default.
+# The client's connection pool and the threads one multipart transfer takes from it (boto3 takes 10).
+_S3_MAX_POOL_CONNECTIONS = 50
+_S3_TRANSFER_THREADS = 5
+# Past _S3_MAX_POOL_CONNECTIONS // _S3_TRANSFER_THREADS workers a large-file folder queues on the pool
+# (urllib3 warns "Connection pool is full"). Clamped rather than ``or``-defaulted: an explicit 0 would
+# become 16 instead of the no-workers it asks for, and env_int already turns unset/malformed values into
+# the default.
 _S3_FOLDER_CONCURRENCY = max(1, env_int("HALO_S3_MAX_FOLDER_CONCURRENCY", 16))
 
 # Staged-push protocol (push_dataset): the tree uploads whole to a dot-prefixed sibling prefix
@@ -216,14 +220,11 @@ class S3Client:
             session_kwargs["region_name"] = self.region_name
 
         boto_config = Config(
-            max_pool_connections=50,
+            max_pool_connections=_S3_MAX_POOL_CONNECTIONS,
             retries={"max_attempts": 3, "mode": "standard"},
         )
 
-        # 5 threads/transfer, not boto3's 10: parallel workers must stay within max_pool_connections=50.
-        self._transfer_config = TransferConfig(
-            max_concurrency=5,
-        )
+        self._transfer_config = TransferConfig(max_concurrency=_S3_TRANSFER_THREADS)
 
         client_kwargs = {"config": boto_config}
         if self.endpoint_url:

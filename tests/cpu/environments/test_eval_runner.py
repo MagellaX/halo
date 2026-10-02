@@ -14,9 +14,11 @@ Run:
     python tests/cpu/environments/test_eval_runner.py
 """
 
+import itertools
 import json
 import logging
 import math
+import random
 import types
 from typing import Any
 
@@ -38,10 +40,12 @@ from src.configs.rollout_config import RolloutConfig
 from src.environments.base import (
     EPISODE_ERROR_KEY,
     OBJECTIVE_REWARD_KEY,
+    RANDOM_REASONING_EFFORT,
     REWARD_COMPONENTS_KEY,
     SOLVE_RATE_KEY,
     Message,
     Trajectory,
+    stable_reasoning_effort,
 )
 from src.environments.envs.protocols.native import NativeToolUseEnvironment
 from src.environments.eval_runner import (
@@ -81,7 +85,6 @@ def _leaky_traj() -> Trajectory:
             "submission_result": "Passed 2/2 test cases.",
             "_test_cases": [{"input": "1", "output": "EXPECTED_OUTPUT_42"}],  # answer key (underscored)
             "context": {"answer": '{"tests": [{"output": "EXPECTED_OUTPUT_42"}]}'},  # answer key (context)
-            "tool_calls": [{"name": "submit_solution"}],  # raw per-turn log
             "_eval_stats": {"generations": 1, "completion_tokens": 50},
         },
     )
@@ -99,7 +102,6 @@ def test_serialize_trajectory_drops_answer_key_and_internals():
     s = serialize_trajectory(_leaky_traj())
     assert "_test_cases" not in s["info"]
     assert "context" not in s["info"]
-    assert "tool_calls" not in s["info"]
     assert "EXPECTED_OUTPUT_42" not in json.dumps(s)
     assert serialize_trajectory(None) is None
 
@@ -338,6 +340,46 @@ async def test_run_episode_reads_the_tool_schema_after_reset(monkeypatch):
     assert seen["tools"], "the generation ran without the tools the environment registers on reset"
 
 
+async def test_a_random_level_is_drawn_from_the_problem_so_reruns_agree(monkeypatch):
+    """Under ``reasoning_effort: random`` a rerun, or the next checkpoint's eval, must score each problem at
+    the level it got before; the draw follows the problem text, as the trainer's eval does. ``random.choice``
+    walks the levels in turn here, so a per-episode draw lands on every level across the reruns and cannot
+    match the stable one by chance."""
+    env = _tooled_env()
+    env.reasoning_effort = RANDOM_REASONING_EFFORT
+    turn = itertools.count()
+    monkeypatch.setattr(random, "choice", lambda seq: seq[next(turn) % len(seq)])
+    levels: list[str] = []
+    real_reset = env.reset
+
+    def _reset(prompts, contexts):
+        levels.append(contexts[0]["reasoning_effort"])
+        return real_reset(prompts, contexts)
+
+    async def _generate(**kwargs):
+        return types.SimpleNamespace(
+            answer="done", finish_reason="stop", completion_tokens=1, tool_calls=None, reasoning=None, token_ids=None
+        )
+
+    monkeypatch.setattr(env, "reset", _reset)
+    monkeypatch.setattr(eval_runner, "generate_openai_response", _generate)
+    rollout = RolloutConfig(model_name="m", temperature=0.0, max_tokens=16)
+    problems = [f"problem {i}" for i in range(12)]
+    for _ in range(2):
+        for problem in problems:
+            await run_episode(env, problem, {}, client=object(), rollout=rollout)
+    stable = [stable_reasoning_effort(problem) for problem in problems]
+    assert len(set(stable)) > 1, "every problem draws one level, so matching it proves nothing"
+    assert levels == stable * 2
+
+
+def test_a_conversation_with_no_user_turn_has_no_level_to_draw():
+    """The draw is keyed by the task, and a conversation with no user turn has none: drawn as an empty task,
+    every such problem would share one level without a word."""
+    with pytest.raises(ValueError, match="no 'user' message"):
+        stable_reasoning_effort([{"role": "system", "content": "frame"}])
+
+
 async def test_run_episode_cleans_up_on_mid_episode_exception(monkeypatch):
     """An exception escaping the episode loop must still release the trajectory (try/finally), else
     every failed episode leaks its trajectory + sandbox session for the run's lifetime."""
@@ -432,6 +474,61 @@ async def test_collect_results_forwards_the_whole_rollout_contract(monkeypatch):
     assert seen[0]["model"] == "served-model"
     assert seen[0]["request_timeout"] == pytest.approx(42.0)
     assert results[0]["samples"][0]["success"] is True
+
+
+async def test_a_conversation_prompt_hands_the_environment_its_last_user_turn(monkeypatch):
+    """Training hands an environment a conversation's last user turn as the task; an eval handing it
+    the whole list opens the episode on the dataset's framing turns and grades a different task than
+    the policy trained on."""
+    convo = [
+        {"role": "system", "content": "dataset framing"},
+        {"role": "user", "content": "an earlier turn"},
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "the task"},
+    ]
+    done = types.SimpleNamespace(
+        answer="done", finish_reason="stop", completion_tokens=1, tool_calls=None, reasoning=None, token_ids=None
+    )
+    monkeypatch.setattr(eval_runner, "generate_openai_response", _scripted_generate([done]))
+    (row,) = await collect_results(
+        _tooled_env(),
+        [{"prompt": convo, "context": {}}],
+        client=object(),
+        rollout=_RETRYING,
+        collect_trajectories=True,
+    )
+    messages = row["samples"][0]["trajectory"]["messages"]
+    assert [(m["role"], m["content"]) for m in messages] == [("user", "the task"), ("assistant", "done")]
+
+
+async def test_a_conversation_without_a_user_turn_is_refused_before_any_episode(monkeypatch):
+    async def _never(**kwargs):
+        raise AssertionError("no episode may run for a prompt with no task in it")
+
+    monkeypatch.setattr(eval_runner, "generate_openai_response", _never)
+    with pytest.raises(ValueError, match="no 'user' message"):
+        await collect_results(
+            _tooled_env(),
+            [{"prompt": [{"role": "system", "content": "s"}], "context": {}}],
+            object(),
+            rollout=_RETRYING,
+        )
+
+
+async def test_a_recorded_native_episode_carries_its_tool_calls_once(monkeypatch):
+    """The messages carry every call and result; a second log of them in ``info`` would be pickled through
+    Ray and the TP broadcast and written to the JSONL for nothing."""
+    done = types.SimpleNamespace(
+        answer="done", finish_reason="stop", completion_tokens=1, tool_calls=None, reasoning=None, token_ids=None
+    )
+    monkeypatch.setattr(eval_runner, "generate_openai_response", _scripted_generate([_tool_call_response(), done]))
+    (row,) = await collect_results(
+        _tooled_env(), [{"prompt": "q", "context": {}}], client=object(), rollout=_RETRYING, collect_trajectories=True
+    )
+    trajectory = row["samples"][0]["trajectory"]
+    assert [m["role"] for m in trajectory["messages"]] == ["user", "assistant", "tool", "assistant"]
+    assert trajectory["messages"][1]["tool_calls"][0]["id"] == "c1" and trajectory["messages"][2]["content"] == "ok"
+    assert not {"tool_calls", "tool_results"} & trajectory["info"].keys()
 
 
 async def test_collect_results_omits_the_model_for_a_single_model_endpoint(monkeypatch):

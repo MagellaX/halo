@@ -1,6 +1,6 @@
 # ReAct Environments
 
-The model writes a `Thought:`, then an `Action:` or a `Final Answer:`, and the environment parses the action out of the plain text ([ReAct](https://arxiv.org/abs/2210.03629), `src/environments/envs/protocols/react.py`). No tool schema reaches the server, so serve the model **without** a tool-call parser: a parser lifts the call out of the text, the environment finds no `Action:` line, and the turn burns on a format hint.
+The model writes a `Thought:`, then an `Action:` or a `Final Answer:`, and the environment parses the action out of the plain text ([ReAct](https://arxiv.org/abs/2210.03629), `src/environments/envs/protocols/react.py`). A `tool(name=value, ...)` action is read as a Python call of literals, so a triple-quoted `code` argument arrives whole; text that is no such call (an unquoted expression, JSON's `true`, a literal Python cannot build such as an unhashable dict key) falls back to a `name=value` pattern, and an action no reader parses gets the format hint, never an episode error. No tool schema reaches the server, so serve the model **without** a tool-call parser: a parser lifts the call out of the text, the environment finds no `Action:` line, and the turn burns on a format hint.
 
 Two registry names: `react_math` (`calculate`, `python`) and `react_search` (`web_search`); each hardcodes its own system prompt. Shipped config: `examples/grpo/environmental/qwen3_5/vllm/qwen3.6-35b-a3b-react-math-full-ep4.yaml`.
 
@@ -27,12 +27,12 @@ environment_kwargs:
 | `require_thought` | `true` | gate for that penalty; a turn doing neither is free either way |
 | `tool_budgets` | `{}` | per-tool episode caps, `{tool: cap}`; `0` disables a tool, an over-cap call is refused as a tool error |
 
-The knobs every environment shares are in the [overview](README.md#configuration). The native protocol's episode-level knobs (`no_tool_use_penalty`, `multi_turn_reward`, `turn_overflow_penalty`, `require_tool_use`) are not parameters here and raise `TypeError`.
+The knobs every environment shares are in the [overview](README.md#configuration). The native protocol's episode-level knobs (`no_tool_use_penalty`, `turn_overflow_penalty`, `length_cutoff_penalty`) are not parameters here and raise `TypeError`.
 
 ## Tools
 
 - `calculate` — restricted arithmetic and math functions, one `expression`.
-- `python` — in-process sandboxed REPL, imports blocked.
+- `python` — the in-process restricted REPL, imports blocked.
 - `web_search` — `query` and optional `max_results` (default 5).
 
 ## Reward
@@ -41,7 +41,7 @@ The grade is 1 when the final answer matches, 0 otherwise, priced by the reward'
 
 Per turn: `+thought_reward` or `-no_thought_penalty` for the Thought, `+tool_success_reward` / `-tool_error_penalty` for the call, paid up to `tool_reward_cap`; these deltas log as `reward/turn_shaping`. Every magnitude must be ≥ 0; the minus is applied at the use site, so a negative value raises instead of paying a penalty as a bonus.
 
-A call that ends on a sandbox fault is booked by its class and ends the episode ([Sandbox faults](sandbox.md#sandbox-faults)). An `Action:` naming an unregistered tool is a tool error whose observation lists the real tools, and that turn is dropped from training. A turn the engine cut short, or one that comes back empty, is neither executed nor graded: the environment appends a nudge asking for the Action or Final Answer and retries within `max_turns` and `max_length_cutoff_recoveries`; both kinds of turn are dropped from training. A turn with text but neither an Action nor a Final Answer gets the format hint instead and stays trainable.
+A call that ends on a sandbox fault is booked by its class and ends the episode ([Sandbox faults](sandbox.md#sandbox-faults)). An `Action:` naming an unregistered tool is a tool error whose observation lists the real tools, and that turn trains only on a negative advantage ([Untrainable turns](../async-grpo/objective.md#untrainable-turns)). An `Action:` naming an argument the tool does not declare, or missing a required one, is refused before it runs: its observation names the declared arguments or the missing one (`Error: <tool>: unknown argument '<name>'; its arguments are …`, `Error: <tool>: missing a required argument: '<name>'`), and it is a tool error, paying `tool_error_penalty` while spending none of `tool_budgets`. A turn the engine cut short, or one that comes back empty, is neither executed nor graded: the environment appends a nudge asking for the Action or Final Answer and retries within `max_turns` and `max_length_cutoff_recoveries`; both kinds of turn train only on a negative advantage. A turn with text but neither an Action nor a Final Answer gets the format hint instead and stays trainable.
 
 ## Dataset
 

@@ -23,19 +23,31 @@ from src.trainers.grpo.rollout.trajectory_spans import TemplateSpanError, locate
 
 logger = logging.getLogger(__name__)
 
+# Untrainable turns (``Message.untrainable``) that became no negative-only row, over all of them.
+UNTRAINABLE_TURNS_ROWLESS_FRAC_KEY = "sampling/untrainable_turns_rowless_frac"
+# ``warn_once`` key of the re-render fallback for a rollout that returned no sampled ids: in the trainer's
+# ``_warned_once`` once any trajectory of the run fell back.
+SAMPLED_IDS_MISSING_WARNING = "sampled_ids_missing"
+
 
 # Engine MoE routing for one turn: decoded mask + the prompt-token count it is aligned on.
 TurnRouting = tuple[torch.Tensor, int | None]
 
 
 class TurnRow(NamedTuple):
-    """One per-turn training row (tuple-compatible; the trajectory fallback builds it by splat)."""
+    """One per-turn training row (tuple-compatible; the trajectory fallback builds it by splat).
+
+    ``negative_only`` tags the row of an untrainable turn (:attr:`Message.untrainable`): built like
+    any other, it stays in the loss only when its trajectory's advantage is negative, so the turn
+    takes the failure signal and is never rewarded.
+    """
 
     prompt_ids: torch.Tensor
     completion_ids: torch.Tensor
     completion_mask: torch.Tensor
     sampling_logps: torch.Tensor | None
     turn_routing: TurnRouting | None
+    negative_only: bool = False
 
 
 def single_trajectory_row(tokenized: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> list[TurnRow]:
@@ -61,12 +73,26 @@ def rollout_template_kwargs(
     return kwargs
 
 
+def context_overflow_error(
+    row: str, prompt_len: int, completion_label: str, completion_len: int, limit: int, suspect: str
+) -> str:
+    """The batch error for a training row longer than the model context window. Rows are trained whole,
+    so the overflow can only be a mismatch the rollout engine could not have produced."""
+    return (
+        f"{row} of {prompt_len + completion_len} tokens (prompt {prompt_len} + {completion_label} "
+        f"{completion_len}) exceeds the model context window {limit}. Rollouts are context-bounded by the "
+        f"rollout engine, so this points to a mismatch between the served context length (vLLM "
+        f"max_model_len / SGLang context-length), the trainer context, or {suspect} — trajectories are "
+        f"trained in full, never truncated."
+    )
+
+
 class TrajectoryTokenizeMixin:
     """Chat-template rendering and trajectory tokenization for the environmental GRPO trainer.
 
     Reads the trainer's tokenizer/processor, environment spec, context window and routing-replay
-    state. Fatal per-row failures are recorded in ``self._batch_build_error`` rather than raised, so
-    the trainer's rank-uniform fence raises them together.
+    state. Fatal per-row failures are recorded through the trainer's ``_record_batch_error`` rather than
+    raised, so its rank-uniform fence raises them together.
     """
 
     def _render_messages_to_ids(
@@ -101,8 +127,8 @@ class TrajectoryTokenizeMixin:
 
     @cached_property
     def _tools_schema(self) -> list[dict] | None:
-        """OpenAI tool schema the rollout passes to vLLM (``tools=``), or ``None``, rendered into the
-        trainer's prompt so recompute conditions on vLLM's exact context."""
+        """OpenAI tool schema the rollout passes to the engine (``tools=``), or ``None``, rendered into
+        the trainer's prompt so recompute conditions on the engine's exact context."""
         return self._rollout_env.get_tools_schema()
 
     @cached_property
@@ -144,7 +170,7 @@ class TrajectoryTokenizeMixin:
         """Model context window bounding every training row.
 
         The tokenizer is consulted first: the training script pins the *served* window there, which is
-        the limit vLLM enforces during rollout. An unset value (``None``, non-positive, or at/above
+        the limit the engine enforces during rollout. An unset value (``None``, non-positive, or at/above
         :data:`UNSET_MODEL_MAX_LENGTH`, the threshold HF's oversized "no limit" sentinels sit above)
         falls through to :func:`get_model_context_window`, which reads the model config (composite/VLM
         safe) and raises when no window is derivable; a large fallback would instead disable the
@@ -160,7 +186,7 @@ class TrajectoryTokenizeMixin:
 
         Every trajectory that yields nothing trainable comes through here. A weighted row would
         reinforce, at that trajectory's advantage, either P(EOS | non-completion) or — when every
-        assistant turn was excluded as unusable — the fragment the exclusion suppresses.
+        assistant turn was excluded — a fragment no row may reward.
         """
         completion_token = self.eos_token_id if self.eos_token_id is not None else self.pad_token_id
         return (
@@ -189,7 +215,9 @@ class TrajectoryTokenizeMixin:
 
         Also the one reader of the row-cap tally: ``sampling/rows_over_cap_frac`` is the rows the cap
         left out over those plus the rows that train, each row counted once — an over-cap trajectory
-        comes back as a zero-weight placeholder, which is neither.
+        comes back as a zero-weight placeholder, which is neither. :data:`UNTRAINABLE_TURNS_ROWLESS_FRAC_KEY`
+        is the untrainable turns that became no negative-only row: no sampled ids to train (the
+        re-render path, or a turn the engine returned none for), a zero-token capture, or over the cap.
         """
         self._rows_over_cap = 0
         per_trajectory = [
@@ -198,6 +226,16 @@ class TrajectoryTokenizeMixin:
             else single_trajectory_row(self._tokenize_trajectory(result))
             for result in rollout_results
         ]
+        untrainable_turns = sum(
+            m.role == "assistant" and m.untrainable
+            for r in rollout_results
+            if r.trajectory
+            for m in r.trajectory.messages
+        )
+        tagged_rows = sum(row.negative_only for rows in per_trajectory for row in rows)
+        self._world_metrics.fraction(
+            UNTRAINABLE_TURNS_ROWLESS_FRAC_KEY, untrainable_turns - tagged_rows, untrainable_turns
+        )
         if self._max_train_row_tokens is not None:
             trainable_rows = sum(bool(row.completion_mask.any()) for rows in per_trajectory for row in rows)
             self._world_metrics.fraction(
@@ -212,8 +250,11 @@ class TrajectoryTokenizeMixin:
         the serving template emits; per-turn spans are located inside it
         (:func:`locate_assistant_spans`) rather than accumulated from independently rendered prefixes,
         which no non-monotone template reproduces. The returned mask is the loss mask (1 on the
-        trainable assistant spans, 0 on env-injected tokens and on the turns the per-turn path also
-        excludes), consumed as TRL's ``tool_mask``; ``_build_training_tensors`` derives the
+        trainable assistant spans, 0 on env-injected tokens and on untrainable turns), consumed as
+        TRL's ``tool_mask``. An untrainable turn trains only as a negative-only row of its sampled ids
+        (:meth:`_tokenize_trajectory_turns`): its re-render is not what the engine emitted — a cut
+        turn comes back closed by template tokens it never sampled, and penalizing those would teach
+        the model to stop closing. ``_build_training_tensors`` derives the
         attention-valid ``completion_mask`` (all real tokens) from it, so tool outputs stay visible to
         attention while contributing no loss.
         """
@@ -266,12 +307,16 @@ class TrajectoryTokenizeMixin:
         # No truncation (reward would decouple from trained tokens); recorded rather than raised.
         context_limit = self._context_limit()
         total_len = len(prompt_token_ids) + len(completion_ids)
-        if total_len > context_limit and self._batch_build_error is None:
-            self._batch_build_error = (
-                f"Trajectory of {total_len} tokens (prompt {len(prompt_token_ids)} + completion "
-                f"{len(completion_ids)}) exceeds the model context window {context_limit}. Rollouts are "
-                f"context-bounded by vLLM, so this points to a mismatch between the served max_model_len, "
-                f"the trainer context, or the prompt length — trajectories are trained in full, never truncated."
+        if total_len > context_limit:
+            self._record_batch_error(
+                context_overflow_error(
+                    "Trajectory",
+                    len(prompt_token_ids),
+                    "completion",
+                    len(completion_ids),
+                    context_limit,
+                    "the prompt length",
+                )
             )
 
         if self._max_train_row_tokens is not None and total_len > self._max_train_row_tokens:
@@ -302,6 +347,10 @@ class TrajectoryTokenizeMixin:
           behavior-policy reference for the IS trust region. ``None`` when the turn has no aligned
           logprobs.
         * ``turn_routing`` — decoded engine routing plus its prompt-token count, else ``None``.
+        * ``negative_only`` — the turn is untrainable (:attr:`Message.untrainable`): the trainer keeps
+          the row in the loss only when the trajectory's advantage is negative. An episode whose every
+          assistant turn is untrainable trains on that condition alone; one that yields no row at all
+          (no ids, zero tokens, all over the cap) is a single masked row.
 
         Per turn, not concatenated: a template may drop prior-turn CoT, so splicing would score a later
         turn under a context it never saw. Rows share the trajectory's advantage; falls back to the single
@@ -314,24 +363,27 @@ class TrajectoryTokenizeMixin:
         messages = traj.messages
         if not any(m.role == "assistant" for m in messages):
             return single_trajectory_row(self._tokenize_trajectory(result))
-        # All-or-nothing over the turns that train: one trainable turn without captured ids falls the
-        # whole trajectory back rather than silently dropping that turn. ``is None`` — an empty
-        # capture is a zero-token turn, not a missing one.
+        # All-or-nothing over the always-trained turns: one without captured ids falls the whole
+        # trajectory back rather than silently dropping that turn. An untrainable turn without ids is
+        # left out instead (the re-render cannot train it either). ``is None`` — an empty capture is a
+        # zero-token turn, not a missing one.
         if any(m.token_ids is None for m in messages if m.role == "assistant" and not m.untrainable):
-            if not self._warned_capture_missing:
-                self._warned_capture_missing = True
-                # The remedy is engine-specific; naming the wrong one points at a flag the configured
-                # server does not accept.
-                remedy = (
-                    "Run the vLLM server with --return-tokens-as-token-ids (docker-compose.vllm.yml passes it)."
-                    if self._rollout_backend == VLLM_BACKEND
-                    else "SGLang needs no server flag for this — the ids are requested per call, so a "
-                    "rollout that returned none usually means the engine errored or was killed mid-turn."
-                )
-                logger.warning(
-                    f"train_on_sampled_tokens is on but a rollout returned no sampled token ids — "
-                    f"falling back to re-tokenization for that trajectory. {remedy}"
-                )
+            # The remedy is engine-specific; naming the wrong one points at a flag the configured
+            # server does not accept.
+            remedy = (
+                "Run the vLLM server with --return-tokens-as-token-ids (docker-compose.vllm.yml passes it)."
+                if self._rollout_backend == VLLM_BACKEND
+                else "SGLang needs no server flag for this — the ids are requested per call, so a "
+                "rollout that returned none usually means the engine errored or was killed mid-turn."
+            )
+            warn_once(
+                logger,
+                self._warned_once,
+                SAMPLED_IDS_MISSING_WARNING,
+                "train_on_sampled_tokens is on but a rollout returned no sampled token ids — falling back to "
+                "re-tokenization for that trajectory. %s",
+                remedy,
+            )
             return single_trajectory_row(self._tokenize_trajectory(result))
 
         template_kwargs = rollout_template_kwargs(
@@ -340,14 +392,12 @@ class TrajectoryTokenizeMixin:
 
         context_limit = self._context_limit()
         rows: list[TurnRow] = []
-        excluded_unusable = False
         for idx, m in enumerate(messages):
             if m.role != "assistant":
                 continue
             # A zero-token turn has nothing to train either: rendering it would weight the template
-            # scaffolding the engine never emitted.
-            if m.untrainable or not m.token_ids:
-                excluded_unusable = True
+            # scaffolding the engine never emitted. An untrainable turn is built like any other, tagged.
+            if not m.token_ids:
                 continue
             # Engine prompt ids take priority: a client re-render drifts on effort steering, tool
             # schemas and channel placement.
@@ -356,13 +406,15 @@ class TrajectoryTokenizeMixin:
             else:
                 # A template that rejects this prefix (a turn ending on a `tool` message) fails on
                 # one rank only, so it must never raise per rank; the episode is dropped instead, as
-                # one masked row — no earlier turn of it trains, and the whole-trajectory fallback
-                # below cannot hand the invalidated episode a weighted row.
+                # one masked row, so no earlier turn of it trains.
                 try:
                     prompt_ids = self._render_messages_to_ids(
                         engine_view(messages[:idx], self._carry_reasoning), True, template_kwargs
                     )
                 except Exception as e:  # never a per-rank raise; the episode is dropped, the run goes on
+                    if m.untrainable:
+                        # Its row only ever adds a penalty; losing it costs no other turn its row.
+                        continue
                     self._invalidate_untrainable_episode(
                         result,
                         f"per-turn re-render of the prompt prefix failed ({type(e).__name__}: {e}); the engine "
@@ -373,20 +425,20 @@ class TrajectoryTokenizeMixin:
             row_len = len(prompt_ids) + len(comp)
             # The context check comes first, as on the whole-trajectory path: a row the served model
             # could not have produced is a config error, not a row the memory cap below may absorb.
-            if row_len > context_limit and self._batch_build_error is None:
-                # First error wins, like every sibling write: a later overflow would otherwise
-                # replace the root cause.
-                self._batch_build_error = (
-                    f"Per-turn training row of {row_len} tokens (prompt {len(prompt_ids)} + sampled "
-                    f"completion {len(comp)}) exceeds the model context window {context_limit}. Rollouts "
-                    f"are context-bounded by vLLM, so this points to a mismatch between the served "
-                    f"max_model_len, the trainer context, or a template re-render drift — trajectories "
-                    f"are trained in full, never truncated."
+            if row_len > context_limit:
+                self._record_batch_error(
+                    context_overflow_error(
+                        "Per-turn training row",
+                        len(prompt_ids),
+                        "sampled completion",
+                        len(comp),
+                        context_limit,
+                        "a template re-render drift",
+                    )
                 )
             if self._max_train_row_tokens is not None and row_len > self._max_train_row_tokens:
                 # Over the rank's memory bound: this turn leaves the batch, the episode's other turns stay.
                 self._rows_over_cap += 1
-                excluded_unusable = True
                 continue
             lp = m.token_logprobs
             sampling_logps = torch.tensor(lp, dtype=torch.float32) if lp and len(lp) == len(comp) else None
@@ -396,8 +448,7 @@ class TrajectoryTokenizeMixin:
                 try:
                     turn_routing = (self._routing_injector.decode_engine_mask(m.routing_mask), m.routing_prompt_tokens)
                 except ValueError as e:
-                    if self._batch_build_error is None:
-                        self._batch_build_error = f"routing_replay='rollout': malformed routed_experts payload: {e}"
+                    self._record_batch_error(f"routing_replay='rollout': malformed routed_experts payload: {e}")
             rows.append(
                 TurnRow(
                     prompt_ids=torch.tensor(prompt_ids, dtype=torch.long),
@@ -405,14 +456,12 @@ class TrajectoryTokenizeMixin:
                     completion_mask=torch.ones(len(comp), dtype=torch.long),
                     sampling_logps=sampling_logps,
                     turn_routing=turn_routing,
+                    negative_only=m.untrainable,
                 )
             )
 
         if not rows:
-            if excluded_unusable:
-                # Every assistant turn was excluded, so the whole-trajectory render below could only
-                # mask out the same turns and return this row anyway — at the cost of re-rendering a
-                # trajectory that carries no trainable token.
-                return single_trajectory_row(self._masked_trajectory_tensors())
-            return single_trajectory_row(self._tokenize_trajectory(result))
+            # Every assistant turn was excluded: a whole-trajectory render could only mask out the same
+            # turns, at the cost of re-rendering a trajectory that carries no trainable token.
+            return single_trajectory_row(self._masked_trajectory_tensors())
         return rows

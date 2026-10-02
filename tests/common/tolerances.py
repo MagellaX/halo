@@ -21,13 +21,14 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class _Tolerances:
     # ── Cross-rank agreement ────────────────────────────────────────────────
-    # Identical batch on every rank, so only a reduction order varies (the EP combine; TP's partial-sum
-    # all-reduce hands every rank one sum); 1e-3 is headroom over that reorder, and a real mis-dispatch
-    # or mis-shard moves one rank's loss well past it.
+    # Identical batch on every rank. An all-reduce hands every rank one sum and DeepEP's combine sums a
+    # token's partials in top-k slot order; what can still vary is EP's un-permute below the fused-permute
+    # gate (top_k < ep_size), a bf16 atomic index_add_ over a token's local expert outputs. 1e-3 is
+    # headroom over that, and a real mis-dispatch or mis-shard moves one rank's loss well past it.
     ep_identical_batch_rank_spread_abs: float = 1e-3
-    # Identical batch through an all-reduce with no EP combine in the path (pure TP, pure ETP): the
-    # all-reduce hands every rank one sum, so ranks agree far tighter than across the combine, and a loss
-    # or grad norm read off a shard misses by orders of magnitude more.
+    # Identical batch through an all-reduce with no EP un-permute in the path (pure TP, pure ETP): the
+    # all-reduce hands every rank one sum, and a loss or grad norm read off a shard misses by orders of
+    # magnitude more.
     all_reduced_rank_spread_abs: float = 1e-4
 
     # ── Parallel mode vs single-GPU / FSDP reference ────────────────────────
@@ -48,12 +49,10 @@ class _Tolerances:
     # ── Weights / optimizer ─────────────────────────────────────────────────
     # save→load round-trip at bf16 ULP scale.
     weight_atol: float = 1e-6
-    # A resume that restores the saved state and replays the uninterrupted run's batches: the
-    # merged-resume and embedding-resume bodies (nothing reset between the runs; the bf16 optimizer
-    # keys its rounding by step and parameter position) and the precompute-resume body's first
-    # resumed step, which precedes any update after the restore. Every compared loss and final
-    # adapter measured bit-exact on every row; 1e-4 is kernel headroom, under the 1.2e-4 first-step
-    # miss of adapters restarted from init.
+    # A resume that restores the saved state and replays the uninterrupted run exactly: nothing is reset
+    # between the runs, the bf16 optimizer keys its rounding by step and parameter position, and an EP run
+    # pins deterministic dispatch. Every compared loss and final tensor measured bit-exact; 1e-4 is kernel
+    # headroom, under the 1.2e-4 first-step miss of adapters restarted from init.
     replayed_resume_loss_abs: float = 1e-4
     # The same comparison on the final trainable tensors, as a relative L2; a restart misses by ~1.
     replayed_resume_weight_rtol: float = 1e-4
@@ -61,8 +60,9 @@ class _Tolerances:
     # Loss across a resume boundary (same data, same step).
     resume_loss_abs: float = 0.05
     # Fixed-batch forward loss before a save and after the resume, on a forward with no
-    # nondeterministic reduction (FSDP, TP, CP; not DeepEP's combine): bf16 round-trip noise. An
-    # unrestored or mis-gathered weight set moves it by more than 1.
+    # nondeterministic reduction: FSDP, TP, CP, and EP at top_k >= ep_size, whose expert rows are computed
+    # independently and combined in top-k slot order whatever order DeepEP receives them in. bf16
+    # round-trip noise; an unrestored or mis-gathered weight set moves it by more than 1.
     resume_fixed_batch_loss_abs: float = 1e-2
 
     # ── Gradients through a sharded axis ────────────────────────────────────

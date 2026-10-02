@@ -3,7 +3,9 @@
 
 * ``use_rlrr`` + ``drop_degenerate_groups`` cancels RLRR's point — the drop keys on raw-reward
   equality, so every all-correct group RLRR just gave length-ranked advantages is masked out of the
-  loss — and must be refused at construction like the shaping and std-floor pairings.
+  loss — and must be refused at construction like the std-floor pairing.
+* ``balance_token_mass`` rescales whatever advantages the earlier hooks left, RLRR's included, and is
+  refused under a loss whose tokens do not share one normalizer (``grpo`` among them; TRL's default is ``dapo``).
 * ``multi_objective_aggregation`` other than ``sum_then_normalize`` makes every hook's recompute
   diverge from TRL's; it is refused at construction, not at the first train step.
 * A hook computes on the FULL gathered set and slices this rank's rows the way TRL does, so a group
@@ -23,7 +25,7 @@ import pytest
 import torch
 from trl import GRPOTrainer
 
-from src.args.mixins import AdvantageShaping, RLRRConfig
+from src.args.mixins import RLRRConfig
 from src.trainers.grpo.objective.advantages import degenerate_group_mask
 from src.trainers.grpo.objective.relative_rewards import relative_advantages_grouped
 from src.trainers.grpo.online import DistributedGRPOTrainer
@@ -44,12 +46,32 @@ def _resolve(kwargs: dict, grpo_args=SUM_THEN_NORMALIZE) -> DistributedGRPOTrain
     [
         ({"drop_degenerate_groups": True}, "drop_degenerate_groups and rlrr_config"),
         ({"scale_rewards_std_floor": 0.05}, "scale_rewards_std_floor and rlrr_config"),
-        ({"advantage_shaping": AdvantageShaping(mode="qae")}, "both replace the advantages"),
     ],
 )
 def test_rlrr_refuses_every_hook_that_would_cancel_it(extra, match):
     with pytest.raises(ValueError, match=match):
         _resolve({"rlrr_config": RLRRConfig(), **extra})
+
+
+def test_the_balance_is_refused_under_a_per_completion_loss_and_resolves_beside_rlrr():
+    """TRL's ``grpo`` loss averages each completion over its own length, so token mass is not what it pulls
+    with; under ``dapo``, TRL's default, the balance rescales whatever advantages RLRR set."""
+    per_completion = types.SimpleNamespace(
+        multi_objective_aggregation="sum_then_normalize",
+        loss_type="grpo",
+        top_entropy_quantile=1.0,
+        off_policy_mask_threshold=None,
+    )
+    with pytest.raises(ValueError, match="balance_token_mass needs a loss"):
+        _resolve({"balance_token_mass": True}, per_completion)
+    token_sum = types.SimpleNamespace(
+        multi_objective_aggregation="sum_then_normalize",
+        loss_type="dapo",
+        top_entropy_quantile=1.0,
+        off_policy_mask_threshold=None,
+    )
+    trainer = _resolve({"balance_token_mass": True, "rlrr_config": RLRRConfig()}, token_sum)
+    assert trainer._balance_token_mass and trainer._rlrr_config is not None
 
 
 def test_rlrr_alone_resolves_and_consumes_its_kwargs():
@@ -72,7 +94,6 @@ def test_drop_without_rlrr_still_masks_degenerate_groups():
     [
         {"drop_degenerate_groups": True},
         {"scale_rewards_std_floor": 0.05},
-        {"advantage_shaping": AdvantageShaping(mode="qae")},
         {"rlrr_config": RLRRConfig()},
     ],
 )
@@ -94,14 +115,13 @@ FULL_REWARDS = torch.tensor([[1.0], [1.0], [1.0], [0.0], [1.0], [0.0]])
 FULL_LENGTHS = torch.tensor([2, 30, 10, 5, 20, 5])
 
 
-def _rank(process_index: int, num_processes: int, *, rlrr=None, drop=False):
+def _rank(process_index: int, num_processes: int, *, rlrr=None, drop=False, std_floor=0.0):
     """One rank's view: the stashed rewards are the gathered set, ``gather`` returns world order."""
     n_local = FULL_REWARDS.shape[0] // num_processes
     me = types.SimpleNamespace(
         _rlrr_config=rlrr,
-        _advantage_shaping=None,
         _drop_degenerate_groups=drop,
-        _scale_rewards_std_floor=0.0,
+        _scale_rewards_std_floor=std_floor,
         _last_rewards_per_func=FULL_REWARDS,
         reward_weights=torch.ones(1),
         num_generations=G,
@@ -117,6 +137,7 @@ def _rank(process_index: int, num_processes: int, *, rlrr=None, drop=False):
         "_install_advantages",
         "_apply_rlrr_advantages",
         "_apply_degenerate_group_drop",
+        "_apply_std_floor_advantages",
     ):
         setattr(me, name, types.MethodType(getattr(DistributedGRPOTrainer, name), me))
     start = process_index * n_local
@@ -172,6 +193,7 @@ def test_degenerate_drop_on_a_spanning_group_masks_the_rows_of_each_rank():
     [
         ("_apply_rlrr_advantages", {"rlrr": RLRRConfig()}),
         ("_apply_degenerate_group_drop", {"drop": True}),
+        ("_apply_std_floor_advantages", {"std_floor": 0.2}),
     ],
 )
 def test_an_armed_hook_without_a_stash_raises_in_train(hook, armed):
@@ -197,12 +219,34 @@ def test_the_generation_batch_consumes_the_stash(monkeypatch):
     ``_calculate_rewards``, applying one batch's rewards to another batch's rows."""
     monkeypatch.setattr(GRPOTrainer, "_generate_and_score_completions", lambda self, inputs: {})
     me = object.__new__(DistributedGRPOTrainer)
-    me._rlrr_config, me._advantage_shaping, me._drop_degenerate_groups = None, None, False
-    me._scale_rewards_std_floor = 0.0
+    me._rlrr_config, me._drop_degenerate_groups = None, False
+    me._scale_rewards_std_floor, me._balance_token_mass = 0.0, False
+    me.model = types.SimpleNamespace(training=False)
     me.parallelism_config = types.SimpleNamespace(is_tp_mode=False, is_expert_tp_mode=False)
     me._last_rewards_per_func = FULL_REWARDS
     DistributedGRPOTrainer._generate_and_score_completions(me, [])
     assert me._last_rewards_per_func is None
+
+
+def test_the_balance_weighs_what_the_other_hooks_leave(monkeypatch):
+    """RLRR and the std floor replace the batch's advantages and the drop narrows its loss mask; the balance
+    must weigh the result, or it cancels the net push of advantages the loss never sees."""
+    monkeypatch.setattr(GRPOTrainer, "_generate_and_score_completions", lambda self, inputs: {})
+    me = object.__new__(DistributedGRPOTrainer)
+    me.model = types.SimpleNamespace(training=True)
+    me.parallelism_config = types.SimpleNamespace(is_tp_mode=False, is_expert_tp_mode=False)
+    calls = []
+    hooks = (
+        "_apply_rlrr_advantages",
+        "_apply_std_floor_advantages",
+        "_apply_degenerate_group_drop",
+        "_apply_token_mass_balance",
+    )
+    for hook in hooks:
+        setattr(me, hook, lambda result, hook=hook: calls.append(hook))
+    DistributedGRPOTrainer._generate_and_score_completions(me, [])
+    assert sorted(calls) == sorted(hooks), calls
+    assert calls[-1] == "_apply_token_mass_balance", calls
 
 
 if __name__ == "__main__":

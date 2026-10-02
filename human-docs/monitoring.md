@@ -47,12 +47,15 @@ metric groups on top:
 | `report_mfu_diagnostics` | off | logs MFU and achieved TFLOPS; needs `enable_efficiency_metrics` on. The S-MFU variants appear only for MoE, where plain MFU misreads sparse models |
 | `enable_moe_metrics` | on | per-layer expert load balance: `moe/load_max`, `moe/load_cv`, `moe/dead_frac`, … (no-op on dense models) |
 | `generate_eval_examples` | on (off for SFT) | a table of sample generations at each evaluation (skipped under TP/CP) |
-| `save_completions` (GRPO) | on | writes each step's rollouts to `<output_dir>/completions/completions_<step>.parquet` (prompt, completion, reward, advantage) plus a `completions` table on the tracking backend |
+| `save_completions` (GRPO) | on | writes each step's rollouts to `<output_dir>/completions/completions_<step>.parquet` (prompt, completion, reward, advantage), plus a `completions` table in W&B when `report_to` includes `wandb` |
 | `log_completions` (GRPO) | off | additionally prints the per-sample table to the console |
 
 For async GRPO with environments, give `sampling/logratio_mean` a standing
 dashboard panel: a steady negative drift means the weight sync to the rollout
-server is broken. Online GRPO does not emit it; there, watch reward and KL
+server is broken, or, with `advantage/net_token_mass` staying negative and
+`entropy` climbing after it, a KL-free run drifting, which `balance_token_mass` and the
+[early stop](../agent-docs/training-methods/grpo/async-grpo/monitoring.md#early-stop) ↗
+address. Online GRPO does not emit it; there, watch reward and KL
 instead. Details on every callback:
 [Callbacks](../agent-docs/training-methods/callbacks.md) ↗.
 

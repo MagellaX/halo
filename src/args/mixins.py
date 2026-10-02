@@ -7,17 +7,13 @@ field only to change its default (e.g. ``DistillScriptArguments``' ``conversatio
 """
 
 import math
+import string
 from dataclasses import dataclass, field, fields, make_dataclass
 from typing import ClassVar, Literal, get_args
 
 from src.args.validation import RangeValidatedConfig
 
-# Advantage-shaping modes: the annotation gates YAML/CLI, and ``get_args`` gives
-# :class:`AdvantageShaping` the same tuple to validate against, so the two stay in step.
-AdvantageMode = Literal["mean", "qae", "asymmetric", "neg_mask_hard"]
-
-# RLRR shaping modes, same arrangement: the annotation gates YAML/CLI and RLRRConfig validates
-# against it.
+# The RLRR shaping modes: the annotation gates YAML/CLI and RLRRConfig validates against it.
 RLRRMode = Literal["hrr", "prr"]
 
 # The script-argument spelling of each RLRRConfig field is ``rlrr_<field>``, except λ: ``lambda`` is a
@@ -25,14 +21,28 @@ RLRRMode = Literal["hrr", "prr"]
 RLRR_ARG_PREFIX = "rlrr_"
 _RLRR_ARG_SPELLINGS = {"lam": "rlrr_lambda"}
 
+# The OPD losses ``get_self_distillation_loss_fn`` resolves: a mirror of the trainer-side registry's keys
+# (the args layer imports no trainer), pinned to it by a test. The annotation gates YAML/CLI and
+# SDPGArguments validates against it.
+SelfDistillationLoss = Literal["reverse_kl", "forward_kl", "unnormalized_kl"]
+
+# The teacher hint both OPD flows default to, through SDPGArguments.
+PRIVILEGED_HINT_TEMPLATE = "\n[Hint] The correct answer is: {answer}. Do NOT state that you were given the answer.\n"
+
 
 def rlrr_arg_name(config_field: str) -> str:
     """The YAML/CLI spelling of one :class:`RLRRConfig` field."""
     return _RLRR_ARG_SPELLINGS.get(config_field, RLRR_ARG_PREFIX + config_field)
 
 
-# Shared by :class:`SDPGArguments` and the SDPG trainer so both OPD flows steer the teacher alike.
-PRIVILEGED_HINT_TEMPLATE = "\n[Hint] The correct answer is: {answer}. Do NOT state that you were given the answer.\n"
+def format_field_names(template: str) -> set[str]:
+    """The replacement-field names ``str.format`` looks up in ``template``, nested format specs
+    included. A lone brace raises ``ValueError``, as ``str.format`` would."""
+    names: set[str] = set()
+    for _, name, spec, _ in string.Formatter().parse(template):
+        if name is not None:
+            names |= {name, *format_field_names(spec or "")}
+    return names
 
 
 @dataclass
@@ -113,44 +123,6 @@ class PromptDatasetArguments:
         default="prompt",
         metadata={"help": "Field in the dataset containing the prompt (string or conversation list)"},
     )
-
-
-@dataclass(frozen=True)
-class AdvantageShaping:
-    """Optional advantage-channel surgery, applied by
-    :func:`~src.trainers.grpo.objective.advantages.group_relative_advantages`.
-
-    ``mode``:
-
-    * ``"mean"`` — plain group-mean baseline (default; bit-identical to no shaping).
-    * ``"qae"`` — Quantile Advantage Estimation: baseline is the per-group ``quantile``, not the mean.
-    * ``"asymmetric"`` — mean baseline, then scale positive advantages by ``pos_scale`` and negative
-      by ``neg_scale`` (``neg_scale=0`` is the full negative mask).
-    * ``"neg_mask_hard"`` — mean baseline, then zero negative advantages only in hard groups (no
-      member's ``gate_rewards`` reached ``hard_group_threshold``).
-
-    Built by :class:`AdvantageShapingArguments` and consumed by the GRPO objective.
-    """
-
-    mode: str = "mean"
-    quantile: float = 0.4
-    pos_scale: float = 1.0
-    neg_scale: float = 0.4
-    hard_group_threshold: float = 0.5
-
-    _MODES = get_args(AdvantageMode)
-
-    def __post_init__(self):
-        if self.mode not in self._MODES:
-            raise ValueError(f"advantage mode must be one of {self._MODES}, got {self.mode!r}")
-        if not 0.0 < self.quantile < 1.0:
-            raise ValueError(f"quantile must be in (0, 1), got {self.quantile}")
-        # Finite as well as signed: a NaN/inf scale makes every shaped advantage non-finite, which the
-        # normalizer refuses only at the first step.
-        for name in ("pos_scale", "neg_scale"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be a finite value >= 0, got {value}")
 
 
 @dataclass
@@ -253,54 +225,15 @@ class RLRRArguments(_RLRRTunables, RangeValidatedConfig):
 
 @dataclass
 class AdvantageShapingArguments(RangeValidatedConfig):
-    """Group-baseline / negative-side advantage surgery + reward-scaling guards.
+    """Reward scaling, the degenerate-group drop and the token-mass balance of the GRPO group-relative
+    advantages.
 
     Shared by the online (RLVR) and environmental GRPO configs, which feed the same
-    :class:`AdvantageShaping` and the same ``group_relative_advantages`` normalizer.
+    ``group_relative_advantages`` normalizer.
     ``drop_degenerate_groups`` defaults differ per trainer (opt-in online, on by default for
     env-GRPO's sparse verifiable rewards), so that one is re-declared on the env config.
     """
 
-    advantage_mode: AdvantageMode = field(
-        default="mean",
-        metadata={
-            "help": "Group-baseline / negative-side advantage surgery (AdvantageShaping, applied by "
-            "src/trainers/grpo/objective/advantages.py). 'mean' (default) = plain "
-            "GRPO group-mean baseline. 'qae' = per-group quantile baseline (QAE): on "
-            "failure-dominated groups failures get ~0 advantage and only rare successes train — the "
-            "entropy-safest constant baseline per regime. 'asymmetric' = mean baseline, then scale "
-            "positive/negative advantages by advantage_pos_scale/advantage_neg_scale (continuous "
-            "failure-cone attenuation). 'neg_mask_hard' = zero negative advantages only in groups "
-            "where no member's gate reward reached advantage_hard_group_threshold. Targets entropy "
-            "explosion in failure-dominated batches — the substitute that lets a strong KL anchor "
-            "be retired."
-        },
-    )
-    advantage_quantile: float = field(
-        default=0.4,
-        metadata={"help": "QAE baseline quantile K for advantage_mode='qae' (paper default 0.4)."},
-    )
-    advantage_pos_scale: float = field(
-        default=1.0,
-        metadata={"help": "Positive-advantage multiplier for advantage_mode='asymmetric'."},
-    )
-    advantage_neg_scale: float = field(
-        default=0.4,
-        metadata={
-            "help": "Negative-advantage multiplier for advantage_mode='asymmetric' (0 = full negative "
-            "mask; production analogues discard or heavily down-weight negatives)."
-        },
-    )
-    advantage_hard_group_threshold: float = field(
-        default=0.5,
-        metadata={
-            "help": "advantage_mode='neg_mask_hard': a group is HARD (negatives zeroed) when no "
-            "member's gate reward reaches this value. The gate reward is the objective reward "
-            "component on the environmental arm and the TOTAL weighted reward on the online (RLVR) "
-            "arm, which has no objective decomposition (a multi-reward run warns). Set it to the "
-            "value that counts as a solve on that scale."
-        },
-    )
     scale_rewards_std_floor: float = field(
         default=0.0,
         metadata={
@@ -321,38 +254,122 @@ class AdvantageShapingArguments(RangeValidatedConfig):
             "`sampling/degenerate_group_frac`."
         },
     )
+    balance_token_mass: bool = field(
+        default=False,
+        metadata={
+            "help": "Scale down the heavier sign of each generation round's advantages so the round's "
+            "token-weighted advantage mass nets to zero. Under a token-sum loss a completion pulls with its "
+            "advantage times its trained tokens; where failures run longer than solves the round pushes "
+            "down the tokens the policy sampled and entropy climbs, where solves run longer it sharpens "
+            "the policy. Needs `loss_type` `cispo`, `dapo` or `dr_grpo`, `top_entropy_quantile` 1.0 and no "
+            "`off_policy_mask_threshold`, refused otherwise. The pre-balance share is logged as "
+            "`advantage/net_token_mass` either way (its sign reads as the entropy push only under a "
+            "token-sum loss) and the applied factor as `advantage/token_mass_scale`. Default off."
+        },
+    )
 
     def _validate_ranges(self) -> None:
-        """Run :class:`AdvantageShaping`'s own guards at parse time, plus the two knobs it does not check.
-
-        A NaN threshold compares False everywhere, so no group member ever reaches it and every
-        group is treated as hard (all negative advantages zeroed); a negative or NaN std floor turns
-        ``max(std, floor)`` into a no-op or a NaN that propagates to every advantage in the batch.
-        """
+        """Refuse a negative or NaN std floor, which fails silently: ``max(std, floor)`` becomes a
+        no-op or a NaN that propagates to every advantage in the batch."""
         super()._validate_ranges()
-        self.build_advantage_shaping()
-        if not math.isfinite(self.advantage_hard_group_threshold):
-            raise ValueError(
-                f"advantage_hard_group_threshold must be finite, got {self.advantage_hard_group_threshold}"
-            )
         if not math.isfinite(self.scale_rewards_std_floor) or self.scale_rewards_std_floor < 0:
             raise ValueError(
                 f"scale_rewards_std_floor must be a finite value >= 0 (0 = off), got {self.scale_rewards_std_floor}"
             )
 
-    def build_advantage_shaping(self) -> AdvantageShaping | None:
-        """Return an :class:`AdvantageShaping` from these fields, or ``None`` at the default 'mean' mode.
 
-        Built eagerly so the numeric knobs are validated even when the mode discards them.
-        """
-        shaping = AdvantageShaping(
-            mode=self.advantage_mode,
-            quantile=self.advantage_quantile,
-            pos_scale=self.advantage_pos_scale,
-            neg_scale=self.advantage_neg_scale,
-            hard_group_threshold=self.advantage_hard_group_threshold,
+@dataclass(frozen=True)
+class EarlyStopConfig:
+    """What a GRPO early stop checks on the logged training steps; the single home of its validation.
+
+    Built by :class:`GRPOEarlyStopArguments`; ``on_skipped_updates`` comes from the environmental config,
+    the one whose trainer has a trust-region breaker that can skip an update."""
+
+    entropy_band: tuple[float, ...] | None = None
+    logratio_gap: float | None = None
+    on_skipped_updates: bool = False
+    patience: int = 3
+
+    def __post_init__(self) -> None:
+        band = self.entropy_band
+        if band is not None and not (
+            len(band) == 2 and all(math.isfinite(v) for v in band) and 0.0 <= band[0] < band[1]
+        ):
+            raise ValueError(f"early_stop_entropy_band must be [low, high] with 0 <= low < high, got {list(band)}")
+        gap = self.logratio_gap
+        if gap is not None and not (math.isfinite(gap) and gap > 0.0):
+            raise ValueError(f"early_stop_logratio_gap must be a finite positive number or null, got {gap}")
+        patience = self.patience
+        if isinstance(patience, bool) or not isinstance(patience, int) or patience < 1:
+            raise ValueError(f"early_stop_patience must be an int >= 1, got {patience!r}")
+        if not self.active and patience != EarlyStopConfig.patience:
+            raise ValueError(f"early_stop_patience is {patience} but no early-stop condition is set to count it")
+
+    @property
+    def active(self) -> bool:
+        return self.entropy_band is not None or self.logratio_gap is not None or self.on_skipped_updates
+
+
+@dataclass
+class GRPOEarlyStopArguments(RangeValidatedConfig):
+    """Early stop for a KL-free GRPO run, shared by the online and environmental configs.
+
+    A policy without a KL anchor drifts slowly before it fails: entropy leaves its band and the
+    trainer-vs-sampler log-ratio widens with it. A condition ends training once it breaches on
+    ``early_stop_patience`` readings in a row, without saving or evaluating that step; the run keeps the
+    periodic checkpoints it took before.
+    """
+
+    early_stop_entropy_band: list[float] | None = field(
+        default=None,
+        metadata={
+            "help": "Early stop: end training once TRL's `entropy` metric stays outside this [low, high] band "
+            "for `early_stop_patience` readings in a row. The metric counts a micro-batch whose loss tokens "
+            "were all dropped (degenerate groups, invalid episodes) as 0, so under drops it reads below the "
+            "policy's entropy. A KL-free run drifts in either direction, toward collapse below the band or "
+            "explosion above it, and both start slowly enough to stop on. The band is model-specific: read "
+            "it off a healthy run. None (default) = off."
+        },
+    )
+    early_stop_logratio_gap: float | None = field(
+        default=None,
+        metadata={
+            "help": "Early stop: end training once the trainer's log-prob gap metric stays above this many "
+            "nats per token for `early_stop_patience` readings in a row (one per generation round: a step "
+            "reusing its round carries none and leaves the count). Env GRPO reads the magnitude "
+            "of its signed mean `sampling/logratio_mean`, online GRPO TRL's mean absolute difference "
+            "`sampling/sampling_logp_difference/mean`; the two read differently, so a threshold does not "
+            "carry from one trainer to the other. The gap grows with entropy, and faster than it once the "
+            "policy flattens, so it is the earlier signal of the two. Needs the vLLM importance-sampling "
+            "correction, which logs it. None (default) = off."
+        },
+    )
+    early_stop_patience: int = field(
+        default=EarlyStopConfig.patience,
+        metadata={
+            "help": "Breaching readings in a row an early-stop condition needs before training ends (>= 1). "
+            "A reading is one training log line, so under `logging_steps` > 1 it is the window's mean. "
+            "Refused at a non-default value when no early-stop condition is set."
+        },
+    )
+
+    def _validate_ranges(self) -> None:
+        super()._validate_ranges()
+        self.build_early_stop()
+
+    def build_early_stop(self) -> EarlyStopConfig:
+        band = self.early_stop_entropy_band
+        return EarlyStopConfig(
+            entropy_band=tuple(band) if band is not None else None,
+            logratio_gap=self.early_stop_logratio_gap,
+            on_skipped_updates=self._stops_on_skipped_updates(),
+            patience=self.early_stop_patience,
         )
-        return shaping if shaping.mode != "mean" else None
+
+    def _stops_on_skipped_updates(self) -> bool:
+        """Whether a step whose every update was skipped counts toward the stop; only a config whose trainer
+        has a trust-region breaker overrides it."""
+        return False
 
 
 @dataclass
@@ -371,40 +388,88 @@ class ChunkedLogprobsArguments:
 
 
 @dataclass
-class SDPGArguments:
+class SDPGArguments(RangeValidatedConfig):
     """Privileged-teacher OPD term (SDPG, arXiv:2606.04036), shared by the offline self-distillation
     SFT script and the online RLVR GRPO script.
 
     The hint field the teacher fills is not declared here: self-distillation reads it from a
     configurable dataset column, while RLVR's ``process_for_rlvr`` has already normalized it to
-    ``answer``.
+    ``answer``. Validated on construction, so the trainers that build this block from their kwargs
+    hold a direct construction to the bounds a YAML run meets.
     """
+
+    # The placeholders the arm's hint formatter fills: the on-policy trainer has the gold answer alone;
+    # SelfDistillationArguments widens the set with its reference-solution column.
+    HINT_PLACEHOLDERS: ClassVar[frozenset[str]] = frozenset({"answer"})
 
     sdpg_hint_template: str = field(
         default=PRIVILEGED_HINT_TEMPLATE,
         metadata={
-            "help": "Template appended to the last user turn for the TEACHER forward only. Supports "
-            "an {answer} placeholder, and — on the self-distillation arm, which reads a reference "
-            "solution column — a {solution} placeholder."
+            "help": "Hint the TEACHER forward sees after its prompt: appended to the last user turn on "
+            "the self-distillation arm, to the rendered generation prompt on the online arm. A "
+            "str.format template: {answer} on both arms, {solution} on self-distillation only "
+            "(privileged_solution_field). Any other placeholder is refused at parse time."
         },
     )
-    sdpg_loss: Literal["reverse_kl", "forward_kl", "unnormalized_kl"] = field(
+    sdpg_loss: SelfDistillationLoss = field(
         default="reverse_kl",
         metadata={"help": "OPD loss: 'reverse_kl' (SDPG), 'forward_kl', or 'unnormalized_kl' (k3/UKL)."},
     )
     sdpg_temperature: float = field(
         default=1.0,
-        metadata={"help": "Softmax temperature for the OPD loss."},
+        metadata={"help": "Softmax temperature for the OPD loss (finite, > 0)."},
     )
     sdpg_beta_base: float = field(
         default=1.0,
-        metadata={"help": "Base distillation coefficient beta_base."},
+        metadata={"help": "Base distillation coefficient beta_base (finite, >= 0; 0 drops the OPD term)."},
     )
     sdpg_beta_warmup_steps: int = field(
         default=0,
-        metadata={"help": "Steps to ramp beta from 0 to sdpg_beta_base (SDPG warmup)."},
+        metadata={"help": "Steps to ramp beta from 0 to sdpg_beta_base (SDPG warmup; 0 = off)."},
     )
     sdpg_beta_decay_steps: int = field(
         default=0,
-        metadata={"help": "Final steps over which beta decays back to 0 (SDPG decay)."},
+        metadata={"help": "Final steps over which beta decays back to 0 (SDPG decay; 0 = off)."},
     )
+
+    def __post_init__(self) -> None:
+        self._validate_ranges()
+
+    def _validate_ranges(self) -> None:
+        super()._validate_ranges()
+        if self.sdpg_loss not in get_args(SelfDistillationLoss):
+            raise ValueError(f"sdpg_loss must be one of {get_args(SelfDistillationLoss)}, got {self.sdpg_loss!r}")
+        # Divides both distributions' logits: zero turns them infinite and NaNs the OPD loss without a
+        # raise, a negative one inverts them.
+        if not math.isfinite(self.sdpg_temperature) or self.sdpg_temperature <= 0:
+            raise ValueError(f"sdpg_temperature must be a finite value > 0, got {self.sdpg_temperature}")
+        # A NaN coefficient NaNs every loss; a negative one trains the student away from the teacher.
+        if not math.isfinite(self.sdpg_beta_base) or self.sdpg_beta_base < 0:
+            raise ValueError(
+                f"sdpg_beta_base must be a finite value >= 0 (0 drops the OPD term), got {self.sdpg_beta_base}"
+            )
+        # The schedule reads a negative length as off, so one is a typo the run would not report.
+        for name in ("sdpg_beta_warmup_steps", "sdpg_beta_decay_steps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be an int >= 0 (0 = off), got {value!r}")
+        self._validate_hint_template()
+
+    def _validate_hint_template(self) -> None:
+        """Refuse a placeholder the arm's formatter does not fill: ``str.format`` would raise it at the
+        first teacher prompt, after the model load (and on the online arm, the rollout server)."""
+        if not isinstance(self.sdpg_hint_template, str):
+            raise ValueError(
+                f"sdpg_hint_template must be a str.format template string, got {self.sdpg_hint_template!r}"
+            )
+        try:
+            names = format_field_names(self.sdpg_hint_template)
+        except ValueError as e:
+            raise ValueError(f"sdpg_hint_template is not a valid str.format template: {e}") from e
+        unknown = sorted(names - self.HINT_PLACEHOLDERS)
+        if unknown:
+            raise ValueError(
+                f"sdpg_hint_template names {[f'{{{name}}}' for name in unknown]}, which "
+                f"{type(self).__name__}'s hint does not fill; it fills "
+                f"{[f'{{{name}}}' for name in sorted(self.HINT_PLACEHOLDERS)]}."
+            )
