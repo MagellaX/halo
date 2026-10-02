@@ -22,7 +22,7 @@ from huggingface_hub.utils import HFValidationError, validate_repo_id
 from peft import PeftType
 from peft.utils import CONFIG_NAME as ADAPTER_CONFIG_NAME
 
-from src.checkpoint.atomic import STAGING_SUFFIX, create_staged_file, is_staged_file
+from src.checkpoint.atomic import FILE_STAGING_SUFFIX, create_staged_file, is_staged_file
 from src.log import warn_once
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ HUB_TAGS = ("halo",)
 # The staged card's name pattern: unique per write, and skipped by the non-weight copy should a
 # crash leave one behind.
 CARD_STAGING_PREFIX = f".{REPOCARD_NAME}."
-CARD_STAGING_SUFFIX = STAGING_SUFFIX
+CARD_STAGING_SUFFIX = FILE_STAGING_SUFFIX
 # The adapter types stock PEFT loads; the toolkit's native expert-LoRA types are outside it.
 _STOCK_PEFT_TYPES = frozenset(peft_type.value for peft_type in PeftType)
 # Export cards already warned about, so the config finalizer that follows a copy does not repeat it.

@@ -209,6 +209,9 @@ def test_a_policy_built_from_the_checkpoint_without_saved_columns_refuses(kind, 
 
     with pytest.raises(RuntimeError, match="TRAINED weights as the reference") as raised:
         trainer._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
+    assert "this resume built the policy from the checkpoint, so the sweep would score the TRAINED weights" in str(
+        raised.value
+    ), "the refusal must explain why this resume cannot sweep the policy"
     assert "--max_steps=1" in str(raised.value), "the refusal must name a way to recover"
     assert trainer.compute_ref_log_probs.batches == 0
 

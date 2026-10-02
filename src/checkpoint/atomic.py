@@ -9,13 +9,13 @@ from pathlib import Path
 
 import torch
 
-STAGING_SUFFIX = ".tmp"
+FILE_STAGING_SUFFIX = ".tmp"
 _LINK_COPY_ERRNOS = {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EOPNOTSUPP}
 
 
 def create_staged_file(directory: str | Path, filename: str) -> Path:
     """Create an exclusive sibling under the same ``0o666``-and-umask mode as a normal file."""
-    staged = Path(directory) / f".{filename}.{uuid.uuid4().hex}{STAGING_SUFFIX}"
+    staged = Path(directory) / f".{filename}.{uuid.uuid4().hex}{FILE_STAGING_SUFFIX}"
     os.close(os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
     return staged
 

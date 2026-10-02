@@ -201,8 +201,9 @@ class ReferenceLogpsCheckpointMixin:
         return (
             f"Cannot resume precompute_ref_log_probs from {checkpoint}: it holds no saved reference "
             f"log-probs for the '{name}' dataset ({REFERENCE_LOGPS_FILE} is missing or lacks that split), "
-            "and they cannot be recomputed here. With no separate reference model the sweep scores "
-            "the TRAINED weights as the reference and zero every log-ratio. To recover, run this config "
+            "and they cannot be recomputed here: this resume built the policy from the checkpoint, "
+            "so the sweep would score the TRAINED weights as the reference and zero every log-ratio. "
+            "To recover, run this config "
             f"for one step from the base model into a scratch directory (--output_dir={scratch} "
             "--max_steps=1 --save_strategy=steps --save_steps=1 --save_only_model=true "
             f"--resume_from_checkpoint=null) and copy its checkpoint-1/{REFERENCE_LOGPS_FILE} into "
