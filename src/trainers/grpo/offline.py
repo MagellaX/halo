@@ -1062,11 +1062,12 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     def _precompute_reference_logps(self, dataset, split: str):
         """Restore original KL scores or sweep the untrained policy once before any update."""
         settings = self._reference_settings()
-        restored = self._restore_reference_logps_or_none(dataset, split, settings=settings)
+        identity = self._reference_split_identity(dataset, split, settings)
+        restored = self._restore_reference_logps_or_none(dataset, split, settings=settings, identity=identity)
         if restored is not None:
             return restored
         rows = self._sweep_reference_logps(dataset, split)
-        return self._attach_scored_reference_logps(dataset, split, rows, settings=settings)
+        return self._attach_scored_reference_logps(dataset, split, rows, settings=settings, identity=identity)
 
     def _sweep_reference_logps(self, dataset, split: str) -> MappedReferenceScores:
         """Sweep contiguous DP shards in every mode and rebuild the original dataset order."""

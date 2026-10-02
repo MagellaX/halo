@@ -79,7 +79,12 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
         return {column: token_digest(dataset, column) for column in _TOKEN_COLUMNS}
 
     def _restore_reference_logps_or_none(
-        self, dataset: Dataset, split: str, *, settings: Mapping[str, object]
+        self,
+        dataset: Dataset,
+        split: str,
+        *,
+        settings: Mapping[str, object],
+        identity: Mapping | None = None,
     ) -> Dataset | None:
         reject_across_ranks(
             None if isinstance(dataset, Dataset) else f"'{split}' must be a finite datasets.Dataset",
@@ -87,7 +92,7 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
             exc_type=ValueError,
         )
         self._check_reference_resume_context()
-        identity = self._reference_split_identity(dataset, split, settings)
+        identity = self._reference_split_identity(dataset, split, settings) if identity is None else identity
         reject_divergent_settings(
             {"split": split, **identity},
             "Offline GRPO reference inputs",
@@ -102,13 +107,14 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
         rows: MappedReferenceScores,
         *,
         settings: Mapping[str, object],
+        identity: Mapping | None = None,
     ) -> Dataset:
         reject_across_ranks(
             f"Reference split '{split}' was already attached" if split in self._reference_logps_by_split else None,
             f"Recording the '{split}' GRPO reference",
             exc_type=ValueError,
         )
-        identity = self._reference_split_identity(dataset, split, settings)
+        identity = self._reference_split_identity(dataset, split, settings) if identity is None else identity
         digest = _assert_replicated_scores(split, rows.lengths, rows.values)
         guard = DeferredRankFailure(f"Attaching the '{split}' GRPO reference", exc_type=ValueError)
         attached = guard.run(lambda: _attach_reference_column(dataset, rows, digest))

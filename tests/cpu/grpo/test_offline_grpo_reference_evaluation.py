@@ -36,7 +36,7 @@ class _Base:
 
 class _Trainer(OfflineGRPOReferenceLifecycleMixin, _Base):
     def __init__(self, output_dir):
-        self.output_dir = output_dir
+        self.args = SimpleNamespace(output_dir=output_dir)
         self._init_reference_logps(resume_checkpoint=None)
         self._precompute_reference = True
         self.model = nn.Linear(1, 1)
