@@ -82,8 +82,7 @@ class OfflineGRPOReferenceLifecycleMixin(OfflineGRPOReferenceLogpsMixin):
         self._reference_dataset_by_split[name] = dataset
 
     def _reference_cache_output_dir(self) -> str:
-        args = getattr(self, "args", None)
-        return os.fspath(getattr(args, "output_dir", None) or self.output_dir)
+        return os.fspath(self.args.output_dir)
 
     def train(self, resume_from_checkpoint=None, *args, **kwargs):
         prepared = bool(self._reference_logps_by_split) or getattr(self, "_precompute_reference", False)

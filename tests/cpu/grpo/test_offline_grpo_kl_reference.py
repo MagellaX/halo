@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from trl import ModelConfig
 
 import scripts.training.offline_grpo as offline_grpo_script
+import src.trainers.grpo.reference_logps as reference_logps_module
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
 from src.distributed.expert_parallel.config import ExpertLoraSpec
@@ -399,6 +400,31 @@ def test_noncp_full_finetuning_restores_original_reference_instead_of_sweeping_t
     assert resumed.sweep_count == 0, "resume re-anchored KL to the trained policy"
     assert restored[REF_PER_TOKEN_LOGPS_COLUMN] == original[REF_PER_TOKEN_LOGPS_COLUMN]
     assert float(resumed.model.lm_head.weight[0, 0].detach()) == -7.0
+
+
+def test_fresh_reference_split_hashes_each_token_column_once_before_scoring(tmp_path, monkeypatch):
+    trainer = _anchor_trainer(output_dir=str(tmp_path))
+    dataset = _anchor_dataset()
+    original_digest = reference_logps_module.token_digest
+    digests = {}
+
+    def observed_digest(dataset, column):
+        assert column not in digests, f"fresh reference split hashed '{column}' twice"
+        digests[column] = original_digest(dataset, column)
+        return digests[column]
+
+    monkeypatch.setattr(reference_logps_module, "token_digest", observed_digest)
+    original_sweep = trainer._sweep_reference_logps
+
+    def sweep_after_identity(dataset, split):
+        assert set(digests) == {"prompt_input_ids", "completion_input_ids"}, "scoring preceded input validation"
+        return original_sweep(dataset, split)
+
+    trainer._sweep_reference_logps = sweep_after_identity
+    attached = trainer._precompute_reference_logps(dataset, "training")
+    assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == [[-0.25, -1.25], [-0.25]]
+    assert trainer._reference_logps_by_split["training"]["token_digests"] == digests
+    assert trainer.sweep_count == 1
 
 
 def test_explicit_reference_does_not_allow_a_resume_to_replace_its_missing_anchor(tmp_path):
