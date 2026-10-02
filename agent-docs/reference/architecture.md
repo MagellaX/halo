@@ -68,7 +68,8 @@ the shared `mixins/reference_logps.py` owns checkpoint identity and persistence.
 are elected from the checkpoint filesystem-owner predicate. Score transfers use one int64 metadata
 gather and one local-I/O failure join per batch, independent of DP size, writer count and chunk count.
 
-Run-local `_reference_cache/<uuid>/` files are unlinked once every rank has mapped them. Linux
+Run-local `_reference_cache/<uuid>/` files are merged and checked without durable publication.
+Mapping failures join across ranks; the files are unlinked once every rank has mapped them. Linux
 readers retain the mapped storage through training and checkpoint serialization, without a second
 in-memory token table. NFS may retain `.nfs*` inodes until their final mapped reader closes;
 underscore-prefixed scratch is excluded by Trainer's default Hub upload patterns.

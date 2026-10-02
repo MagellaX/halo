@@ -14,24 +14,18 @@ from src.trainers.grpo.reference_logps import REFERENCE_LOGPS_FILE
 from tests.common.gloo import run_gloo_ranks
 from tests.common.offline_grpo_reference import (
     SETTINGS,
+    ReferenceStorageTrainer,
     attach_reference,
-)
-from tests.common.offline_grpo_reference import (
-    ReferenceStorageTrainer as _Trainer,
-)
-from tests.common.offline_grpo_reference import (
-    reference_dataset as _dataset,
-)
-from tests.common.offline_grpo_reference import (
-    reference_rows as _scores,
+    reference_dataset,
+    reference_rows,
 )
 
 
 def _save_first_split(tmp_path):
-    trainer = _Trainer(tmp_path)
-    dataset = _dataset()
+    trainer = ReferenceStorageTrainer(tmp_path)
+    dataset = reference_dataset()
     assert trainer._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS) is None
-    attached = attach_reference(trainer, dataset, "train", _scores(), settings=SETTINGS)
+    attached = attach_reference(trainer, dataset, "train", reference_rows(), settings=SETTINGS)
     trainer.save_checkpoint()
     return attached, tmp_path / "checkpoint-1"
 
@@ -48,8 +42,8 @@ def test_raw_ragged_reference_is_saved_and_restored_without_a_second_sweep(tmp_p
     assert torch.equal(saved["lengths"], torch.tensor([2, 1, 0]))
     assert torch.equal(saved["values"], torch.tensor([-0.25, -1.5, -0.75]))
 
-    resumed = _Trainer(tmp_path, checkpoint=str(checkpoint), step=2)
-    unchanged = _dataset()
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint), step=2)
+    unchanged = reference_dataset()
     unchanged._fingerprint = "a-new-process-local-fingerprint"
     restored = resumed._restore_reference_logps_or_none(unchanged, "train", settings=SETTINGS)
     assert restored[REF_PER_TOKEN_LOGPS_COLUMN] == attached[REF_PER_TOKEN_LOGPS_COLUMN]
@@ -59,22 +53,22 @@ def test_raw_ragged_reference_is_saved_and_restored_without_a_second_sweep(tmp_p
 
 
 def test_live_reference_state_keeps_one_arrow_column_not_an_extra_flat_token_table(tmp_path):
-    trainer = _Trainer(tmp_path)
-    attached = attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
+    trainer = ReferenceStorageTrainer(tmp_path)
+    attached = attach_reference(trainer, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
     assert set(trainer._reference_logps_by_split["train"]) == {"num_rows", "token_digests", "settings"}
     assert not trainer._resumed_reference_logps
     assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == [[-0.25, -1.5], [-0.75], []]
 
 
 def test_train_and_eval_splits_survive_when_resume_uses_only_train(tmp_path):
-    trainer = _Trainer(tmp_path)
-    train = _dataset()
+    trainer = ReferenceStorageTrainer(tmp_path)
+    train = reference_dataset()
     eval_set = train.select([2, 0])
-    attach_reference(trainer, train, "train", _scores(), settings=SETTINGS)
-    attach_reference(trainer, eval_set, "eval", [_scores()[2], _scores()[0]], settings=SETTINGS)
+    attach_reference(trainer, train, "train", reference_rows(), settings=SETTINGS)
+    attach_reference(trainer, eval_set, "eval", [reference_rows()[2], reference_rows()[0]], settings=SETTINGS)
     trainer.save_checkpoint()
 
-    resumed = _Trainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"), step=2)
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"), step=2)
     assert resumed._restore_reference_logps_or_none(train, "train", settings=SETTINGS) is not None
     resumed.save_checkpoint()
     carried = torch.load(tmp_path / "checkpoint-2" / REFERENCE_LOGPS_FILE, weights_only=True)
@@ -85,19 +79,19 @@ def test_train_and_eval_splits_survive_when_resume_uses_only_train(tmp_path):
 def test_trained_policy_cannot_rescore_when_sidecar_is_missing(tmp_path):
     checkpoint = tmp_path / "checkpoint-1"
     checkpoint.mkdir()
-    resumed = _Trainer(tmp_path, checkpoint=str(checkpoint))
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises(RuntimeError, match="TRAINED checkpoint policy"):
-        resumed._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
+        resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
 
-    fresh_weights = _Trainer(tmp_path)
-    assert fresh_weights._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS) is None
+    fresh_weights = ReferenceStorageTrainer(tmp_path)
+    assert fresh_weights._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS) is None
 
 
 @pytest.mark.parametrize("change", ["row_order", "prompt", "completion", "settings"])
 def test_trained_policy_refuses_a_sidecar_for_other_tokens_or_settings(tmp_path, change):
     _, checkpoint = _save_first_split(tmp_path)
-    dataset = _dataset()
+    dataset = reference_dataset()
     settings = dict(SETTINGS)
     if change == "row_order":
         dataset = dataset.select([2, 1, 0])
@@ -111,7 +105,7 @@ def test_trained_policy_refuses_a_sidecar_for_other_tokens_or_settings(tmp_path,
         )
     else:
         settings["max_completion_length"] += 1
-    resumed = _Trainer(tmp_path, checkpoint=str(checkpoint))
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises(ValueError, match="does not belong"):
         resumed._restore_reference_logps_or_none(dataset, "train", settings=settings)
@@ -129,18 +123,18 @@ def test_trained_policy_refuses_missing_or_malformed_scores(tmp_path, damage):
     else:
         saved["train"]["values"] = torch.tensor([-0.25, float("nan"), -0.75])
     torch.save(saved, path)
-    resumed = _Trainer(tmp_path, checkpoint=str(checkpoint))
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises((RuntimeError, ValueError), match="lacks 'train'|does not belong"):
-        resumed._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
+        resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
 
 
 def test_a_failed_sidecar_write_keeps_the_previous_checkpoint(tmp_path, monkeypatch):
     previous = tmp_path / "checkpoint-0"
     previous.mkdir()
     (previous / "sentinel").write_text("complete")
-    trainer = _Trainer(tmp_path)
-    attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
+    trainer = ReferenceStorageTrainer(tmp_path)
+    attach_reference(trainer, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
 
     def fail_save(*args, **kwargs):
         raise OSError("disk full")
@@ -154,9 +148,9 @@ def test_a_failed_sidecar_write_keeps_the_previous_checkpoint(tmp_path, monkeypa
 
 def _ranked_restore(rank: int, root: str) -> None:
     checkpoint = os.path.join(root, f"rank-{rank}", "checkpoint-1")
-    trainer = _Trainer(root, checkpoint=checkpoint)
+    trainer = ReferenceStorageTrainer(root, checkpoint=checkpoint)
     try:
-        trainer._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
+        trainer._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
         outcome = "NO RAISE"
     except Exception as exc:
         outcome = f"{type(exc).__name__}: {exc}"
@@ -187,8 +181,8 @@ def test_one_nodes_corrupt_reference_is_rejected_on_every_rank(tmp_path, finite_
 
 
 def _ranked_interrupted_save(rank: int, root: str) -> None:
-    trainer = _Trainer(root)
-    attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
+    trainer = ReferenceStorageTrainer(root)
+    attach_reference(trainer, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
     patch = pytest.MonkeyPatch()
 
     def interrupted_save(payload, destination):

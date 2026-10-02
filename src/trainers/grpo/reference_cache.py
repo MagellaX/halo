@@ -14,7 +14,6 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 
-from src.checkpoint.atomic import fsync_directory
 from src.distributed.filesystem import store_reject_across_ranks
 from src.distributed.runtime import (
     DeferredRankFailure,
@@ -110,7 +109,7 @@ class ReferenceScoreCache:
         return os.path.join(self.directory, f"{shard}.{kind}")
 
     def discard(self) -> None:
-        """Remove only this unpublished UUID cache, without requiring a healthy process group."""
+        """Remove only this run's UUID cache, without requiring a healthy process group."""
         if fs_aware_save_rank() and os.path.isdir(self.directory):
             for name in os.listdir(self.directory):
                 if not name.startswith(".nfs"):
@@ -211,15 +210,13 @@ class ReferenceScoreCache:
 
         def merge():
             for kind in ("lengths", "values"):
-                with open(self._path("partial", kind), "wb") as destination:
+                with open(self._path("merged", kind), "wb") as destination:
                     for shard in range(self.dp_size):
                         path = self._path(shard, kind)
                         if os.path.exists(path):
                             with open(path, "rb") as source:
                                 shutil.copyfileobj(source, destination, length=REFERENCE_BUFFER_VALUES * 4)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-            mapped = self._map("partial")
+            mapped = self._map("merged")
             mismatch = reference_payload_mismatch(mapped.lengths, mapped.values, dataset)
             if mismatch:
                 raise ValueError(f"Incomplete offline GRPO reference cache: {mismatch}")
@@ -229,19 +226,8 @@ class ReferenceScoreCache:
         store_reject_across_ranks(
             f"reference-cache/{os.path.basename(self.directory)}/merge", guard.reason, guard.what, exc_type=ValueError
         )
-        guard = DeferredRankFailure("Publishing the offline GRPO reference cache")
-        if fs_aware_save_rank():
-            for kind in ("lengths", "values"):
-                guard.run(lambda kind=kind: os.replace(self._path("partial", kind), self._path("complete", kind)))
-            for shard in range(self.dp_size):
-                for kind in ("lengths", "values"):
-                    path = self._path(shard, kind)
-                    if os.path.exists(path):
-                        guard.run(lambda path=path: os.unlink(path))
-            guard.run(lambda: fsync_directory(self.directory))
-        guard.reject()
         guard = DeferredRankFailure("Mapping the offline GRPO reference cache", exc_type=ValueError)
-        mapped = guard.run(lambda: self._map("complete"))
+        mapped = guard.run(lambda: self._map("merged"))
         guard.reject()
         # Every reader must map first; on Linux the tensors retain the unlinked backing storage.
         guard = DeferredRankFailure("Removing the offline GRPO reference scratch files")

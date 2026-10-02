@@ -1,4 +1,4 @@
-"""Reference storage remains bounded, mapped, durable and filesystem-aware."""
+"""Reference storage remains bounded, mapped and filesystem-aware."""
 
 import datetime
 import errno
@@ -17,17 +17,11 @@ from tests.common.distributed import shared_output_dir
 from tests.common.gloo import run_gloo_ranks
 from tests.common.offline_grpo_reference import (
     SETTINGS,
+    ReferenceStorageTrainer,
     attach_reference,
     mapped_scores,
-)
-from tests.common.offline_grpo_reference import (
-    ReferenceStorageTrainer as _Trainer,
-)
-from tests.common.offline_grpo_reference import (
-    reference_dataset as _dataset,
-)
-from tests.common.offline_grpo_reference import (
-    reference_rows as _scores,
+    reference_dataset,
+    reference_rows,
 )
 
 
@@ -71,7 +65,7 @@ def test_shared_reference_cache_maps_from_distinct_rank_local_scratch_directorie
 
 
 def test_rank_local_output_negative_control_cannot_map_the_shared_reference_cache(tmp_path):
-    with pytest.raises(torch.multiprocessing.ProcessRaisedException, match="No such file or directory.*complete"):
+    with pytest.raises(torch.multiprocessing.ProcessRaisedException, match="No such file or directory.*merged"):
         run_gloo_ranks(
             _map_shared_cache_from_rank_local_scratch,
             2,
@@ -82,8 +76,76 @@ def test_rank_local_output_negative_control_cannot_map_the_shared_reference_cach
         )
 
 
+def _failed_reader_mapping(rank: int, root: str, shared_output: bool) -> None:
+    if not shared_output:
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+    output = root if shared_output else os.path.join(root, f"node-{rank}")
+    dataset = Dataset.from_dict({"completion_input_ids": [[1], [2, 3]]})
+    rows = [torch.tensor([-0.25]), torch.tensor([-0.75, -1.5])]
+    cache = ReferenceScoreCache(output, dp_size=2)
+    cache.collect_batch([rows[rank]], {0: 0, 1: 1})
+    patch = pytest.MonkeyPatch()
+    original_map = cache._map
+    map_calls = 0
+
+    def fail_reader(shard):
+        nonlocal map_calls
+        map_calls += 1
+        # A filesystem writer first maps to validate its merge, then maps as a reader.
+        if rank == 1 and map_calls == (1 if shared_output else 2):
+            raise OSError("rank-1 reference mapping denied")
+        return original_map(shard)
+
+    patch.setattr(cache, "_map", fail_reader)
+    try:
+        cache.finish(dataset)
+        outcome = "NO RAISE"
+    except Exception as exc:
+        outcome = f"{type(exc).__name__}: {exc}"
+    finally:
+        patch.undo()
+    with open(os.path.join(root, f"mapping-outcome-{rank}.txt"), "w") as result:
+        result.write(outcome)
+
+
+@pytest.mark.parametrize("shared_output", [True, False])
+def test_one_reader_mapping_failure_is_joined_before_scratch_is_removed(tmp_path, shared_output):
+    run_gloo_ranks(
+        _failed_reader_mapping,
+        2,
+        str(tmp_path),
+        shared_output,
+        env={"DIST_OUTPUT_SHARED_FILESYSTEM": "1" if shared_output else "0"},
+        pg_timeout=datetime.timedelta(seconds=10),
+    )
+    outcomes = [(tmp_path / f"mapping-outcome-{rank}.txt").read_text() for rank in range(2)]
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0] == (
+        "ValueError: Mapping the offline GRPO reference cache failed on 1 of 2 rank(s). "
+        "First (rank 1): OSError: rank-1 reference mapping denied"
+    )
+    assert not list(tmp_path.rglob("*.lengths"))
+    assert not list(tmp_path.rglob("*.values"))
+
+
+def test_ephemeral_cache_needs_no_durable_publication(tmp_path, monkeypatch):
+    dataset = Dataset.from_dict({"completion_input_ids": [[1], [2, 3]]})
+    cache = ReferenceScoreCache(tmp_path, dp_size=1)
+    cache.append_rows(0, [torch.tensor([-0.25]), torch.tensor([-0.75, -1.5])])
+
+    def unavailable(*args):
+        raise OSError("durable publication unavailable on scratch storage")
+
+    monkeypatch.setattr(os, "fsync", unavailable)
+    monkeypatch.setattr(os, "replace", unavailable)
+    mapped = cache.finish(dataset)
+    assert mapped.column().to_pylist() == [[-0.25], [-0.75, -1.5]]
+    assert not list((tmp_path / "_reference_cache").iterdir())
+
+
 def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_repacking(tmp_path, monkeypatch):
-    trainer = _Trainer(tmp_path)
+    trainer = ReferenceStorageTrainer(tmp_path)
     allocated = []
     original_empty = torch.empty
 
@@ -92,9 +154,9 @@ def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_r
             allocated.append(args)
         return original_empty(*args, **kwargs)
 
-    scores = mapped_scores(tmp_path, _dataset(), _scores())
+    scores = mapped_scores(tmp_path, reference_dataset(), reference_rows())
     monkeypatch.setattr(torch, "empty", record_empty)
-    attached = trainer._attach_scored_reference_logps(_dataset(), "train", scores, settings=SETTINGS)
+    attached = trainer._attach_scored_reference_logps(reference_dataset(), "train", scores, settings=SETTINGS)
     owner = trainer._reference_storage_by_split["train"]
     arrow = attached.data.column(REF_PER_TOKEN_LOGPS_COLUMN).chunk(0)
     assert arrow.values.buffers()[1].address == owner.values.data_ptr()
@@ -110,7 +172,7 @@ def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_r
 
 
 @pytest.mark.parametrize("damage", ["missing_rows", "wrong_lengths", "nan", "truncated"])
-def test_incomplete_or_corrupt_cache_is_not_published(tmp_path, damage):
+def test_incomplete_or_corrupt_cache_is_rejected_and_removed(tmp_path, damage):
     dataset = Dataset.from_dict({"completion_input_ids": [[1, 2], [3]]})
     cache = ReferenceScoreCache(tmp_path, dp_size=1)
     if damage == "missing_rows":
@@ -123,7 +185,7 @@ def test_incomplete_or_corrupt_cache_is_not_published(tmp_path, damage):
             output.write(b"!" if damage == "truncated" else torch.tensor([float("nan")]).numpy().tobytes())
     with pytest.raises(ValueError, match="Incomplete|truncated"):
         cache.finish(dataset)
-    assert not any(path.name.startswith("complete.") for path in tmp_path.rglob("*"))
+    assert not list((tmp_path / "_reference_cache").iterdir())
 
 
 def test_buffered_validation_detects_corruption_after_the_first_chunk(tmp_path, monkeypatch):
@@ -140,23 +202,23 @@ def test_buffered_validation_detects_corruption_after_the_first_chunk(tmp_path, 
 
 
 def test_failed_cache_write_is_cleaned_up_before_checkpointing(tmp_path, monkeypatch):
-    trainer = _Trainer(tmp_path)
+    trainer = ReferenceStorageTrainer(tmp_path)
 
     def fail_write(*args):
         raise OSError("reference cache disk full")
 
     monkeypatch.setattr(ReferenceScoreCache, "_append", fail_write)
     with pytest.raises(ValueError, match="reference cache disk full"):
-        attach_reference(trainer, _dataset(), "train", _scores(), settings=SETTINGS)
+        attach_reference(trainer, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
     assert not list((tmp_path / "_reference_cache").iterdir())
     assert not trainer._reference_logps_by_split
 
 
 def test_resume_reads_mmap_and_reuses_the_mapped_checkpoint_storage(tmp_path, monkeypatch):
-    first = _Trainer(tmp_path)
-    attach_reference(first, _dataset(), "train", _scores(), settings=SETTINGS)
+    first = ReferenceStorageTrainer(tmp_path)
+    attach_reference(first, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
     first.save_checkpoint()
-    resumed = _Trainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"))
+    resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"))
     calls = []
     original_load = torch.load
 
@@ -165,7 +227,7 @@ def test_resume_reads_mmap_and_reuses_the_mapped_checkpoint_storage(tmp_path, mo
         return original_load(*args, **kwargs)
 
     monkeypatch.setattr(torch, "load", record_load)
-    attached = resumed._restore_reference_logps_or_none(_dataset(), "train", settings=SETTINGS)
+    attached = resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
     assert calls == [{"map_location": "cpu", "weights_only": True, "mmap": True}]
     owner = resumed._reference_storage_by_split["train"]
     assert (
@@ -198,12 +260,12 @@ def _node_local_cache(rank, root, damage):
     try:
         cache.collect_batch([torch.tensor(expected[rank])], {0: 0, 1: 1})
         mapped = cache.finish(dataset)
-        trainer = _Trainer(output)
+        trainer = ReferenceStorageTrainer(output)
         attached = trainer._attach_scored_reference_logps(dataset, "train", mapped, settings=SETTINGS)
         assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == expected
         assert not os.listdir(os.path.join(output, "_reference_cache"))
         trainer.save_checkpoint()
-        restored = _Trainer(output, checkpoint=os.path.join(output, "checkpoint-1"))
+        restored = ReferenceStorageTrainer(output, checkpoint=os.path.join(output, "checkpoint-1"))
         assert (
             restored._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS)[REF_PER_TOKEN_LOGPS_COLUMN]
             == expected
