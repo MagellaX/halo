@@ -208,7 +208,7 @@ src/
 |---|---|:--:|
 | `DistributedSFTTrainer` | Supervised fine-tuning | ✅ |
 | `SmoothMarginPOTrainer` | Reference-free preference (SMPO) | ✅ |
-| `OfflineGRPOTrainer` | Offline GRPO (full fine-tuning) | ✅ |
+| `OfflineGRPOTrainer` | Offline GRPO | ✅ (full fine-tuning) |
 | `DistributedGRPOTrainer` | Online GRPO | ❌ |
 | `DistributedAsyncEnvironmentalGRPOTrainer` | Async GRPO with environments: multi-turn RL (Ray + vLLM/SGLang) | ❌ |
 | `DistributedDPOTrainer` / `DistributedKTOTrainer` | DPO / KTO | ❌ |
