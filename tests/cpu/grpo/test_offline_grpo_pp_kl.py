@@ -19,6 +19,7 @@ import torch
 from accelerate import PartialState
 
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN, OfflineGRPODataCollatorWithPadding
+from src.data.spans import LABEL_IGNORE_INDEX
 from src.distributed.pipeline_parallel.losses import token_logprobs
 from src.trainers.grpo.objective.logratio import KL_LOGRATIO_CLAMP
 from src.trainers.grpo.offline import OfflineGRPOTrainer
@@ -216,6 +217,65 @@ def test_token_loss_stashes_raw_logps_during_the_sweep():
     assert loss.item() == 0.0 and not loss.requires_grad
     expected, _ = token_logprobs(policy, inputs["labels"])
     assert len(me._pp_ref_sweep) == 1 and torch.equal(me._pp_ref_sweep[0], expected)
+
+
+@pytest.mark.parametrize("last_stage", [True, False])
+def test_reference_batch_uses_the_shared_pp_pass_and_keeps_only_real_completion_tokens(last_stage):
+    full_batch = _collated_batch()
+    policy, reference = _logits_pair()
+    me = _stub(
+        beta=0.2, loss_type="grpo", pg="reinforce", min_log_prob=MIN_LOG_PROB, policy=policy, reference=reference
+    )
+    me.args.per_device_train_batch_size = BATCH
+    me.parallelism_config.is_last_pp_stage = last_stage
+    me.data_collator = types.SimpleNamespace(
+        pad_values={"input_ids": PAD, "attention_mask": 0, "labels": LABEL_IGNORE_INDEX}
+    )
+    me._pp_adapter = OfflineGRPOTrainer._pp_loss_adapter(me)
+    for name in ("_pp_frozen_row_pads", "_pp_pad_rows_to_frozen", "_pp_score_reference_batch"):
+        setattr(me, name, types.MethodType(getattr(OfflineGRPOTrainer, name), me))
+    batch = {key: values[:3] for key, values in full_batch.items()}
+    me._pp_ref_sweep = []
+    transformed = me._pp_batch_transform(batch)
+    padded = me._pp_pad_rows_to_frozen(transformed, BATCH, me._pp_frozen_row_pads())
+    expected_grid, _ = token_logprobs(reference, padded["labels"])
+    passes = []
+
+    def eval_loss(input_ids, labels, *, attention_mask, num_items_in_batch, extra_targets):
+        assert torch.equal(input_ids, padded["input_ids"])
+        assert torch.equal(labels, padded["labels"])
+        assert torch.equal(attention_mask, padded["attention_mask"])
+        assert num_items_in_batch == 1.0
+        assert set(extra_targets) == {"advantage", "group_size"}
+        if last_stage:
+            for start in range(0, BATCH, 2):
+                targets = {
+                    "labels": labels[start : start + 2],
+                    **{key: value[start : start + 2] for key, value in extra_targets.items()},
+                }
+                assert me._pp_token_loss(reference[start : start + 2], targets).item() == 0.0
+
+    def broadcast(stashed):
+        if last_stage:
+            torch.testing.assert_close(stashed, expected_grid, rtol=0, atol=0)
+        else:
+            assert stashed is None, "a non-last stage supplied reference scores to the chain broadcast"
+        return expected_grid
+
+    def observed_pass(inputs):
+        passes.append(1)
+        return OfflineGRPOTrainer._pp_reference_sweep_pass(me, inputs)
+
+    me._pp_runtime = types.SimpleNamespace(eval_loss=eval_loss)
+    me._pp_broadcast_output_from_last_stage = broadcast
+    me._pp_reference_sweep_pass = observed_pass
+    actual = me._pp_score_reference_batch(batch)
+    expected = _reference_column(reference, full_batch)
+    assert passes == [1], "reference scoring bypassed the shared pipeline sweep pass"
+    assert len(actual) == 3, "frozen filler rows entered the stored reference"
+    for row, scores in enumerate(actual):
+        torch.testing.assert_close(scores, expected[row, : COMPLETION_LENGTHS[row]], rtol=1e-6, atol=1e-6)
+    assert me._pp_ref_sweep is None
 
 
 def test_adapter_ships_the_reference_only_with_a_kl_term():

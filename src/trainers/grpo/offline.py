@@ -1005,33 +1005,29 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
 
         ref_per_token_logps = ref_per_token_logps_unclamped = None
         if self.beta != 0.0:
-            with torch.no_grad():
-                if self._precompute_reference:
+            if self._precompute_reference:
+                with torch.no_grad():
                     ref_per_token_logps_unclamped = inputs.get(REF_PER_TOKEN_LOGPS_COLUMN)
                     if ref_per_token_logps_unclamped is None:
                         raise RuntimeError("Offline GRPO needs the checkpointed run-start reference on every row")
                     ref_per_token_logps = clamp_negative_advantage_logps(
                         ref_per_token_logps_unclamped, advantages, current_min_log_prob
                     )
-                elif self.ref_model is not None:
+            else:
+                # A run that holds no reference model scores it as the PEFT policy with its adapters off.
+                if self.ref_model is not None:
+                    reference, adapters_off = self.ref_model, nullcontext()
+                else:
+                    reference, adapters_off = self.model, self.accelerator.unwrap_model(self.model).disable_adapter()
+                with torch.no_grad(), adapters_off:
                     ref_per_token_logps, ref_per_token_logps_unclamped = self._get_per_token_logps(
-                        self.ref_model,
+                        reference,
                         input_ids,
                         attention_mask,
                         logits_to_keep,
                         advantages=advantages,
                         min_log_prob=current_min_log_prob,
                     )
-                else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, ref_per_token_logps_unclamped = self._get_per_token_logps(
-                            self.model,
-                            input_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            advantages=advantages,
-                            min_log_prob=current_min_log_prob,
-                        )
         per_token_loss, sample_values = offline_token_objective(
             per_token_logps,
             per_token_logps_unclamped,
@@ -1063,11 +1059,11 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         """Restore original KL scores or sweep the untrained policy once before any update."""
         settings = self._reference_settings()
         identity = self._reference_split_identity(dataset, split, settings)
-        restored = self._restore_reference_logps_or_none(dataset, split, settings=settings, identity=identity)
+        restored = self._restore_reference_logps_or_none(dataset, split, identity=identity)
         if restored is not None:
             return restored
         rows = self._sweep_reference_logps(dataset, split)
-        return self._attach_scored_reference_logps(dataset, split, rows, settings=settings, identity=identity)
+        return self._attach_scored_reference_logps(dataset, split, rows, identity=identity)
 
     def _sweep_reference_logps(self, dataset, split: str) -> MappedReferenceScores:
         """Sweep contiguous DP shards in every mode and rebuild the original dataset order."""
@@ -1323,7 +1319,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         collator guarantees a non-empty prompt, so position 0 is never a completion token).
         """
         return offline_loss_normalizer(
-            loss_token_counts_per_row(inputs["labels"]).float() if self.loss_type == "bnpo" else None,
+            loss_token_counts_per_row(inputs["labels"]).float(),
             inputs["group_size"],
             loss_type=self.loss_type,
             max_completion_length=self.max_completion_length,
@@ -1380,15 +1376,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             guard = DeferredRankFailure("Preparing a pipeline KL reference batch")
             inputs = guard.run(lambda: self._pp_pad_rows_to_frozen(self._pp_batch_transform(batch), frozen_rows, pads))
             guard.reject()
-            self._pp_runtime.eval_loss(
-                inputs["input_ids"],
-                inputs["labels"],
-                attention_mask=inputs["attention_mask"],
-                num_items_in_batch=1.0,
-                extra_targets={key: inputs[key] for key in ("advantage", "group_size")},
-            )
-            stashed = torch.cat(self._pp_ref_sweep) if self.parallelism_config.is_last_pp_stage else None
-            logps = self._pp_broadcast_output_from_last_stage(stashed)
+            logps = self._pp_reference_sweep_pass(inputs)
             completion_logps = logps[:real_rows, prompt_width - 1 : prompt_width - 1 + completion_width].float().cpu()
             return [values[mask] for values, mask in zip(completion_logps, valid, strict=True)]
         finally:

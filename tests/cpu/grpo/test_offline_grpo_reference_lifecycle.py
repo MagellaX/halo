@@ -12,11 +12,11 @@ from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
 from src.trainers.grpo.reference_lifecycle import OfflineGRPOReferenceLifecycleMixin, _token_row_keys
 from tests.common.gloo import run_gloo_ranks
 from tests.common.offline_grpo_reference import (
-    SETTINGS,
     ReferenceStorageTrainer,
     attach_reference,
     reference_dataset,
     reference_rows,
+    restore_reference,
 )
 
 
@@ -46,7 +46,7 @@ def test_noncp_resume_preserves_run_start_scores_and_requires_its_declared_check
     trainer.save_checkpoint()
     checkpoint = str(tmp_path / "checkpoint-1")
     resumed = _Trainer(tmp_path, checkpoint=checkpoint)
-    restored = resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
+    restored = restore_reference(resumed, reference_dataset(), "train")
     assert restored[REF_PER_TOKEN_LOGPS_COLUMN] == attached[REF_PER_TOKEN_LOGPS_COLUMN]
     with pytest.raises(ValueError, match="same checkpoint"):
         resumed.train()

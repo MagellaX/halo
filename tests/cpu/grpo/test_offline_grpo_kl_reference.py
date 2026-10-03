@@ -330,6 +330,7 @@ def _loss_forwards(ref_model) -> tuple[list[dict], _PeftPolicy]:
         model=policy,
         min_log_prob=None,
         beta=0.1,
+        _precompute_reference=False,
         ref_model=ref_model,
         accelerator=types.SimpleNamespace(unwrap_model=lambda model: model),
         _get_per_token_logps=per_token_logps,
@@ -433,6 +434,8 @@ def test_explicit_reference_does_not_allow_a_resume_to_replace_its_missing_ancho
     with pytest.raises(RuntimeError, match="TRAINED checkpoint policy"):
         resumed._precompute_reference_logps(_anchor_dataset(), "training")
     assert resumed.sweep_count == 0
+
+
 
 
 if __name__ == "__main__":
