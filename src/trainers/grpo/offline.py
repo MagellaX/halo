@@ -356,7 +356,7 @@ class MultiGroupSampler(Sampler):
         self.rank = rank
         self.world_size = world_size
         self.shuffle = shuffle
-        # Rank-independent seed: the ranks sharing one DP slice (TP/ETP siblings, a pipeline chain) must
+        # Rank-independent seed: the ranks sharing one DP slice (TP/ETP/CP siblings, a pipeline chain) must
         # iterate it in identical order.
         self.seed = seed
         self._epoch = 0
@@ -870,7 +870,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     def _build_grouped_dataloader(self, dataset, group_ids, *, batch_size: int, shuffle: bool) -> DataLoader:
         """Build a DataLoader over a ``MultiGroupSampler`` sharded by DP rank/size.
 
-        Shards by DP (orthogonal to EP) so TP siblings see the same batch. Per-rank batch counts are
+        Shards by DP (orthogonal to EP) so TP/ETP/CP siblings see the same batch. Per-rank batch counts are
         equalized to the global minimum, else faster ranks exit and block the next all-reduce. The
         sampler already shards, so accelerate does device placement only.
 
