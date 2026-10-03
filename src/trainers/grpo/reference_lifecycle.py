@@ -22,8 +22,8 @@ from src.models.structure import base_transformers_model
 from src.trainers.grpo.reference_cache import REFERENCE_BATCH_ROWS, ReferenceScoreCache
 from src.trainers.grpo.reference_logps import (
     OfflineGRPOReferenceLogpsMixin,
-    _assert_replicated_scores,
-    _attach_reference_column,
+    assert_replicated_reference_scores,
+    attach_reference_column,
 )
 
 
@@ -266,9 +266,9 @@ class OfflineGRPOReferenceLifecycleMixin(OfflineGRPOReferenceLogpsMixin):
                 except Exception as cleanup_error:
                     exc.add_note(f"Evaluation reference cache cleanup also failed: {cleanup_error}")
                 raise
-        digest = _assert_replicated_scores("evaluation", scores.lengths, scores.values)
+        digest = assert_replicated_reference_scores("evaluation", scores.lengths, scores.values)
         guard = DeferredRankFailure("Attaching original evaluation reference scores", exc_type=ValueError)
-        attached = guard.run(lambda: _attach_reference_column(dataset, scores, digest))
+        attached = guard.run(lambda: attach_reference_column(dataset, scores, digest))
         guard.reject()
         attached._reference_settings = identity["settings"]
         self._reference_evaluation_datasets.append(attached)

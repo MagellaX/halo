@@ -43,7 +43,13 @@ def mapped_scores(output_dir, dataset, rows):
 
 def attach_reference(trainer, dataset, split, rows, *, settings=SETTINGS):
     scores = mapped_scores(trainer.output_dir, dataset, rows)
-    return trainer._attach_scored_reference_logps(dataset, split, scores, settings=settings)
+    identity = trainer._reference_split_identity(dataset, split, settings)
+    return trainer._attach_scored_reference_logps(dataset, split, scores, identity=identity)
+
+
+def restore_reference(trainer, dataset, split, *, settings=SETTINGS):
+    identity = trainer._reference_split_identity(dataset, split, settings)
+    return trainer._restore_reference_logps_or_none(dataset, split, identity=identity)
 
 
 class _CheckpointBase:

@@ -46,7 +46,10 @@ class _Trainer(OfflineGRPOReferenceLifecycleMixin, _Base):
         self._reference_settings = lambda: dict(_SETTINGS)
         dataset = _dataset()
         self.train_dataset = self._attach_scored_reference_logps(
-            dataset, "train", mapped_scores(output_dir, dataset, [[-0.25, -1.5], [-0.75], []]), settings=_SETTINGS
+            dataset,
+            "train",
+            mapped_scores(output_dir, dataset, [[-0.25, -1.5], [-0.75], []]),
+            identity=self._reference_split_identity(dataset, "train", _SETTINGS),
         )
 
 

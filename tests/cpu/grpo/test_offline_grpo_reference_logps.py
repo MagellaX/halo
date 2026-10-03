@@ -16,6 +16,7 @@ from tests.common.offline_grpo_reference import (
     SETTINGS,
     ReferenceStorageTrainer,
     attach_reference,
+    restore_reference,
     reference_dataset,
     reference_rows,
 )
@@ -24,7 +25,7 @@ from tests.common.offline_grpo_reference import (
 def _save_first_split(tmp_path):
     trainer = ReferenceStorageTrainer(tmp_path)
     dataset = reference_dataset()
-    assert trainer._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS) is None
+    assert restore_reference(trainer, dataset, "train") is None
     attached = attach_reference(trainer, dataset, "train", reference_rows(), settings=SETTINGS)
     trainer.save_checkpoint()
     return attached, tmp_path / "checkpoint-1"
@@ -45,7 +46,7 @@ def test_raw_ragged_reference_is_saved_and_restored_without_a_second_sweep(tmp_p
     resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint), step=2)
     unchanged = reference_dataset()
     unchanged._fingerprint = "a-new-process-local-fingerprint"
-    restored = resumed._restore_reference_logps_or_none(unchanged, "train", settings=SETTINGS)
+    restored = restore_reference(resumed, unchanged, "train")
     assert restored[REF_PER_TOKEN_LOGPS_COLUMN] == attached[REF_PER_TOKEN_LOGPS_COLUMN]
     resumed.save_checkpoint()
     next_saved = torch.load(tmp_path / "checkpoint-2" / REFERENCE_LOGPS_FILE, weights_only=True)["train"]
@@ -69,7 +70,7 @@ def test_train_and_eval_splits_survive_when_resume_uses_only_train(tmp_path):
     trainer.save_checkpoint()
 
     resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(tmp_path / "checkpoint-1"), step=2)
-    assert resumed._restore_reference_logps_or_none(train, "train", settings=SETTINGS) is not None
+    assert restore_reference(resumed, train, "train") is not None
     resumed.save_checkpoint()
     carried = torch.load(tmp_path / "checkpoint-2" / REFERENCE_LOGPS_FILE, weights_only=True)
     assert set(carried) == {"train", "eval"}
@@ -82,10 +83,10 @@ def test_trained_policy_cannot_rescore_when_sidecar_is_missing(tmp_path):
     resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises(RuntimeError, match="TRAINED checkpoint policy"):
-        resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
+        restore_reference(resumed, reference_dataset(), "train")
 
     fresh_weights = ReferenceStorageTrainer(tmp_path)
-    assert fresh_weights._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS) is None
+    assert restore_reference(fresh_weights, reference_dataset(), "train") is None
 
 
 @pytest.mark.parametrize("change", ["row_order", "prompt", "completion", "settings"])
@@ -108,7 +109,7 @@ def test_trained_policy_refuses_a_sidecar_for_other_tokens_or_settings(tmp_path,
     resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises(ValueError, match="does not belong"):
-        resumed._restore_reference_logps_or_none(dataset, "train", settings=settings)
+        restore_reference(resumed, dataset, "train", settings=settings)
 
 
 @pytest.mark.parametrize("damage", ["missing_split", "bad_lengths", "bad_values"])
@@ -126,7 +127,7 @@ def test_trained_policy_refuses_missing_or_malformed_scores(tmp_path, damage):
     resumed = ReferenceStorageTrainer(tmp_path, checkpoint=str(checkpoint))
 
     with pytest.raises((RuntimeError, ValueError), match="lacks 'train'|does not belong"):
-        resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
+        restore_reference(resumed, reference_dataset(), "train")
 
 
 def test_a_failed_sidecar_write_keeps_the_previous_checkpoint(tmp_path, monkeypatch):
@@ -150,7 +151,7 @@ def _ranked_restore(rank: int, root: str) -> None:
     checkpoint = os.path.join(root, f"rank-{rank}", "checkpoint-1")
     trainer = ReferenceStorageTrainer(root, checkpoint=checkpoint)
     try:
-        trainer._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
+        restore_reference(trainer, reference_dataset(), "train")
         outcome = "NO RAISE"
     except Exception as exc:
         outcome = f"{type(exc).__name__}: {exc}"

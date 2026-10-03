@@ -35,7 +35,8 @@ def _scores_digest(lengths: torch.Tensor, values: torch.Tensor) -> str:
     return digest.hexdigest()
 
 
-def _assert_replicated_scores(split: str, lengths: torch.Tensor, values: torch.Tensor) -> str:
+def assert_replicated_reference_scores(split: str, lengths: torch.Tensor, values: torch.Tensor) -> str:
+    """Require identical raw reference scores on every rank and return their content digest."""
     digest = _scores_digest(lengths, values)
     reject_divergent_settings(
         {"split": split, "reference_digest": digest},
@@ -45,7 +46,8 @@ def _assert_replicated_scores(split: str, lengths: torch.Tensor, values: torch.T
     return digest
 
 
-def _attach_reference_column(dataset: Dataset, scores: MappedReferenceScores, digest: str | None = None) -> Dataset:
+def attach_reference_column(dataset: Dataset, scores: MappedReferenceScores, digest: str | None = None) -> Dataset:
+    """Attach mapped scores without copying their immutable token buffer."""
     digest = _scores_digest(scores.lengths, scores.values) if digest is None else digest
     fingerprint = hashlib.sha256(f"{dataset._fingerprint}/{digest}".encode()).hexdigest()
     attached = dataset.add_column(REF_PER_TOKEN_LOGPS_COLUMN, scores.column(), new_fingerprint=fingerprint)
@@ -83,8 +85,7 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
         dataset: Dataset,
         split: str,
         *,
-        settings: Mapping[str, object],
-        identity: Mapping | None = None,
+        identity: Mapping,
     ) -> Dataset | None:
         reject_across_ranks(
             None if isinstance(dataset, Dataset) else f"'{split}' must be a finite datasets.Dataset",
@@ -92,7 +93,6 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
             exc_type=ValueError,
         )
         self._check_reference_resume_context()
-        identity = self._reference_split_identity(dataset, split, settings) if identity is None else identity
         reject_divergent_settings(
             {"split": split, **identity},
             "Offline GRPO reference inputs",
@@ -106,18 +106,16 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
         split: str,
         rows: MappedReferenceScores,
         *,
-        settings: Mapping[str, object],
-        identity: Mapping | None = None,
+        identity: Mapping,
     ) -> Dataset:
         reject_across_ranks(
             f"Reference split '{split}' was already attached" if split in self._reference_logps_by_split else None,
             f"Recording the '{split}' GRPO reference",
             exc_type=ValueError,
         )
-        identity = self._reference_split_identity(dataset, split, settings) if identity is None else identity
-        digest = _assert_replicated_scores(split, rows.lengths, rows.values)
+        digest = assert_replicated_reference_scores(split, rows.lengths, rows.values)
         guard = DeferredRankFailure(f"Attaching the '{split}' GRPO reference", exc_type=ValueError)
-        attached = guard.run(lambda: _attach_reference_column(dataset, rows, digest))
+        attached = guard.run(lambda: attach_reference_column(dataset, rows, digest))
         guard.reject()
         self._reference_storage_by_split[split] = rows
         self._remember_reference_split(split, identity, {}, attached)
@@ -130,10 +128,10 @@ class OfflineGRPOReferenceLogpsMixin(ReferenceLogpsCheckpointMixin):
     def _attach_reference_payload(self, dataset: Dataset, entry: Mapping, needed: Sequence[str]) -> Dataset:
         del needed
         scores = mapped_reference_scores(entry["lengths"], entry["values"])
-        return _attach_reference_column(dataset, scores)
+        return attach_reference_column(dataset, scores)
 
     def _validate_restored_reference_payload(self, name: str, entry: Mapping) -> None:
-        _assert_replicated_scores(name, entry["lengths"], entry["values"])
+        assert_replicated_reference_scores(name, entry["lengths"], entry["values"])
 
     def _remember_reference_split(self, name: str, identity: Mapping, payload: Mapping, dataset: Dataset) -> None:
         if payload:

@@ -22,6 +22,7 @@ from tests.common.offline_grpo_reference import (
     mapped_scores,
     reference_dataset,
     reference_rows,
+    restore_reference,
 )
 
 
@@ -156,7 +157,10 @@ def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_r
 
     scores = mapped_scores(tmp_path, reference_dataset(), reference_rows())
     monkeypatch.setattr(torch, "empty", record_empty)
-    attached = trainer._attach_scored_reference_logps(reference_dataset(), "train", scores, settings=SETTINGS)
+    dataset = reference_dataset()
+    attached = trainer._attach_scored_reference_logps(
+        dataset, "train", scores, identity=trainer._reference_split_identity(dataset, "train", SETTINGS)
+    )
     owner = trainer._reference_storage_by_split["train"]
     arrow = attached.data.column(REF_PER_TOKEN_LOGPS_COLUMN).chunk(0)
     assert arrow.values.buffers()[1].address == owner.values.data_ptr()
@@ -227,7 +231,7 @@ def test_resume_reads_mmap_and_reuses_the_mapped_checkpoint_storage(tmp_path, mo
         return original_load(*args, **kwargs)
 
     monkeypatch.setattr(torch, "load", record_load)
-    attached = resumed._restore_reference_logps_or_none(reference_dataset(), "train", settings=SETTINGS)
+    attached = restore_reference(resumed, reference_dataset(), "train")
     assert calls == [{"map_location": "cpu", "weights_only": True, "mmap": True}]
     owner = resumed._reference_storage_by_split["train"]
     assert (
@@ -261,13 +265,15 @@ def _node_local_cache(rank, root, damage):
         cache.collect_batch([torch.tensor(expected[rank])], {0: 0, 1: 1})
         mapped = cache.finish(dataset)
         trainer = ReferenceStorageTrainer(output)
-        attached = trainer._attach_scored_reference_logps(dataset, "train", mapped, settings=SETTINGS)
+        attached = trainer._attach_scored_reference_logps(
+            dataset, "train", mapped, identity=trainer._reference_split_identity(dataset, "train", SETTINGS)
+        )
         assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == expected
         assert not os.listdir(os.path.join(output, "_reference_cache"))
         trainer.save_checkpoint()
         restored = ReferenceStorageTrainer(output, checkpoint=os.path.join(output, "checkpoint-1"))
         assert (
-            restored._restore_reference_logps_or_none(dataset, "train", settings=SETTINGS)[REF_PER_TOKEN_LOGPS_COLUMN]
+            restore_reference(restored, dataset, "train")[REF_PER_TOKEN_LOGPS_COLUMN]
             == expected
         )
         outcome = "NO RAISE"
