@@ -1,4 +1,8 @@
-"""Checkpoint-master selection on the HF tree, before EP replaces its MoE blocks."""
+"""Configured FP32 parameter masters on the HF tree, before parallel wrappers adopt them.
+
+Persistent FP32 buffers are not parameter masters; their family-declared precision is handled by
+the buffer loader independently. Both eager and lazy construction use this one selection policy.
+"""
 
 from collections.abc import Iterable
 
@@ -8,16 +12,19 @@ import torch.nn as nn
 from src.distributed.expert_parallel.config import EPConfig
 from src.distributed.expert_parallel.patching import MOE_LAYER_MAP, ep_claimed_blocks
 from src.log import KEY_PREVIEW_COUNT
+from src.models.loading.dtype import is_packed_4bit_parameter
 
 
-def fp32_master_param_keys(model: nn.Module, ep_config: EPConfig, *, keep_non_ep: bool) -> frozenset[str]:
-    """HF parameter keys whose configured EP training storage is fp32.
+def fp32_master_param_keys(
+    model: nn.Module, ep_config: EPConfig | None = None, *, keep_non_ep: bool
+) -> frozenset[str]:
+    """HF parameter keys whose configured training storage is FP32.
 
     The family's own router/container accessors select the parameters its wrapper adopts. Shared
     experts remain run-dtype, and FSDP-managed ep1 experts ignore ``fp32_experts`` as at wrapper init.
     Object identity includes tied aliases without mistaking a persistent float buffer for a master.
     """
-    blocks = ep_claimed_blocks(model)
+    blocks = ep_claimed_blocks(model) if ep_config is not None else []
     ep_params = {id(param) for _path, block in blocks for param in block.parameters()}
     masters = {id(param) for param in model.parameters() if keep_non_ep and id(param) not in ep_params}
     for _path, block in blocks:
@@ -33,7 +40,10 @@ def fp32_master_param_keys(model: nn.Module, ep_config: EPConfig, *, keep_non_ep
     return frozenset(
         name
         for name, param in model.state_dict(keep_vars=True).items()
-        if isinstance(param, nn.Parameter) and param.is_floating_point() and id(param) in masters
+        if isinstance(param, nn.Parameter)
+        and param.is_floating_point()
+        and not is_packed_4bit_parameter(param)
+        and id(param) in masters
     )
 
 
