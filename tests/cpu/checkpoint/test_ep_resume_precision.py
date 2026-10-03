@@ -4,8 +4,8 @@
 The real gathered writer, safetensors readers, expert fusion and EP/CP wrappers run on CPU without
 any forward. Communication buffers and device placement are replaced, and CP's flash label is set
 after CPU materialization. Fractional masters are off the bf16 grid, so widening a rounded load
-cannot satisfy the exact-value oracle. Fresh construction keeps its run-dtype behavior even when
-the source carries fp32 tensors.
+cannot satisfy the exact-value oracle. Configured masters preserve checkpoint precision for both
+fresh stages and resumes; only resumes require strict coverage of every configured master.
 """
 
 from pathlib import Path
@@ -20,13 +20,14 @@ from transformers import AutoConfig, Qwen3MoeForSequenceClassification
 import src.distributed.context_parallel.loading as cp_loading
 import src.distributed.expert_parallel.lazy_loader as lazy_loading
 import src.distributed.expert_parallel.loading as eager_loading
+import src.distributed.loading.model_loading as model_loading
 from src.checkpoint.format import load_full_state_dict
 from src.distributed.checkpoint.write import chunked_saveable_tensors, stream_gathered_checkpoint
 from src.distributed.context_parallel.wrapper import UlyssesCPModelWrapper, patch_model_for_cp
 from src.distributed.expert_parallel.base_layer import EPMoELayerBase
 from src.distributed.expert_parallel.config import EPConfig
 from src.distributed.expert_parallel.patching import MOE_LAYER_MAP, ep_claimed_blocks
-from src.distributed.loading.model_loading import _load_ep_cp_model, _load_ep_model
+from src.distributed.loading.model_loading import _load_ep_cp_model, _load_ep_model, _load_undistributed_model
 from tests.common.tiny_models import TINY_MOE_FAMILIES
 
 PartialState()
@@ -116,6 +117,15 @@ def cpu_loading(monkeypatch):
     """No forward or distributed collective runs; the actual checkpoint materialization does."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(eager_loading, "move_model_to_local_device", lambda model: model)
+    monkeypatch.setattr(cp_loading, "move_model_to_local_device", lambda model: model)
+    monkeypatch.setattr(model_loading, "create_ep_buffers", lambda model: 0)
+    verified = model_loading.from_pretrained_verified
+
+    def cpu_pretrained(model_class, source, **kwargs):
+        kwargs["device_map"] = "cpu"
+        return verified(model_class, source, **kwargs)
+
+    monkeypatch.setattr(model_loading, "from_pretrained_verified", cpu_pretrained)
     for module in (eager_loading, lazy_loading):
         monkeypatch.setattr(module, "create_ep_buffers", lambda model: 0)
     monkeypatch.setattr(cp_loading, "patch_model_for_cp", _cpu_cp_wrap)
@@ -159,8 +169,9 @@ def _construct(
         create_ep_config=lambda: ep_config,
         create_cp_config=lambda: SimpleNamespace(cp_size=2, cp_rank=0, process_group=None),
     )
-    loader = _load_ep_cp_model if mode == "ep_cp" else _load_ep_model
+    loader = {"ep_cp": _load_ep_cp_model, "ep": _load_ep_model, "ep1": _load_undistributed_model}[mode]
     config = AutoConfig.from_pretrained(path)
+    extra = {"local_rank": 0, "ep_wrappers": True} if mode == "ep1" else {}
     model = loader(
         path,
         pc,
@@ -171,6 +182,7 @@ def _construct(
             "trust_remote_code": False,
             "preserve_checkpoint_precision": preserve,
         },
+        **extra,
     )
     assert isinstance(model, UlyssesCPModelWrapper) == (mode == "ep_cp")
     return model
@@ -195,20 +207,17 @@ def _assert_values(model, stored, ownership, *, router, experts, non_ep, preserv
     for name, tensor in stored.items():
         role = _role(name, ownership)
         keeps_master = enabled.get(role, False)
-        expected = tensor if preserve and keeps_master else tensor.to(torch.bfloat16)
-        if keeps_master and (preserve or role in {"router", "experts"}):
-            expected = expected.float()
+        expected = tensor.float() if keeps_master else tensor.to(torch.bfloat16)
         assert actual[name].dtype == expected.dtype, f"{name}: stored fp32 dtype was lost at construction"
         assert torch.equal(actual[name].detach(), expected), f"{name}: stored fp32 precision was lost at construction"
         if keeps_master and tensor.dtype == torch.float32:
             checked_masters.add(role)
-    if preserve:
-        expected_masters = {
-            _role(name, ownership)
-            for name, tensor in stored.items()
-            if tensor.dtype == torch.float32 and enabled.get(_role(name, ownership), False)
-        }
-        assert checked_masters == expected_masters
+    expected_masters = {
+        _role(name, ownership)
+        for name, tensor in stored.items()
+        if tensor.dtype == torch.float32 and enabled.get(_role(name, ownership), False)
+    }
+    assert checked_masters == expected_masters
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -249,14 +258,12 @@ def test_fp32_sources_still_load_at_run_dtype_without_master_preservation(
 
 @pytest.mark.parametrize("family", FAMILIES)
 @pytest.mark.parametrize("lazy", (False, True), ids=("eager", "lazy"))
-def test_fresh_fp32_master_load_retains_the_existing_bf16_round_trip(tmp_path, cpu_loading, family, lazy):
+def test_a_fresh_stage_preserves_configured_fp32_checkpoint_masters(tmp_path, cpu_loading, family, lazy):
     path, stored, ownership = _checkpoint(tmp_path, family)
     model = _construct(
         path, mode="ep", lazy=lazy, fp32_router=True, fp32_experts=True, fp32_non_ep=True, preserve=False
     )
     _assert_values(model, stored, ownership, router=True, experts=True, non_ep=True, preserve=False)
-    with pytest.raises(AssertionError, match="stored fp32 .* was lost at construction"):
-        _assert_values(model, stored, ownership, router=True, experts=True, non_ep=True, preserve=True)
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -271,21 +278,43 @@ def test_a_bf16_checkpoint_keeps_exact_values_when_promoted_for_resume(tmp_path,
 
 
 @pytest.mark.parametrize("family", FAMILIES)
-@pytest.mark.parametrize("lazy", (False, True), ids=("eager", "lazy"))
-def test_ep1_fsdp_managed_experts_do_not_gain_fp32_masters(tmp_path, cpu_loading, family, lazy):
+@pytest.mark.parametrize("preserve", (False, True), ids=("fresh_stage", "strict_resume"))
+@pytest.mark.parametrize("fp32_router,fp32_experts,fp32_non_ep", PRECISION_CASES)
+def test_undistributed_ep1_actual_route_keeps_configured_masters(
+    tmp_path, cpu_loading, family, preserve, fp32_router, fp32_experts, fp32_non_ep
+):
     path, stored, ownership = _checkpoint(tmp_path, family)
     model = _construct(
         path,
-        mode="ep",
-        lazy=lazy,
-        fp32_router=False,
+        mode="ep1",
+        lazy=False,
+        fp32_router=fp32_router,
+        fp32_experts=fp32_experts,
+        fp32_non_ep=fp32_non_ep,
+        preserve=preserve,
+    )
+    _assert_values(
+        model, stored, ownership, router=fp32_router, experts=fp32_experts, non_ep=fp32_non_ep, preserve=preserve
+    )
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("preserve", (False, True), ids=("fresh_stage", "strict_resume"))
+@pytest.mark.parametrize("router", (False, True))
+def test_ep1_fsdp_managed_experts_do_not_gain_fp32_masters(tmp_path, cpu_loading, family, preserve, router):
+    path, stored, ownership = _checkpoint(tmp_path, family)
+    model = _construct(
+        path,
+        mode="ep1",
+        lazy=False,
+        fp32_router=router,
         fp32_experts=True,
         fp32_non_ep=False,
-        preserve=True,
+        preserve=preserve,
         managed_experts=True,
     )
     _assert_values(
-        model, stored, ownership, router=False, experts=True, non_ep=False, preserve=True, managed_experts=True
+        model, stored, ownership, router=router, experts=True, non_ep=False, preserve=preserve, managed_experts=True
     )
 
 

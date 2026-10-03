@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Resume identity reaches model construction, and preservation stays scoped to EP/EP+CP."""
+"""Resume provenance makes checkpoint master coverage strict across every supported Path-B loader."""
 
 import ast
 from types import SimpleNamespace
@@ -29,20 +29,20 @@ class _Dispatched(Exception):
 @pytest.mark.parametrize(
     "axes,expected",
     [
-        pytest.param({}, False, id="dp"),
-        pytest.param({"cp": True}, False, id="cp_only"),
+        pytest.param({}, True, id="dp"),
+        pytest.param({"cp": True}, True, id="cp_only"),
         pytest.param({"ep": True}, True, id="ep"),
         pytest.param({"ep": True, "cp": True}, True, id="ep_cp"),
-        pytest.param({"tp": True}, False, id="tp"),
-        pytest.param({"ep": True, "tp": True}, False, id="ep_tp"),
-        pytest.param({"etp": True}, False, id="pure_etp"),
-        pytest.param({"ep": True, "etp": True}, False, id="ep_etp"),
+        pytest.param({"tp": True}, True, id="tp"),
+        pytest.param({"ep": True, "tp": True}, True, id="ep_tp"),
+        pytest.param({"etp": True}, True, id="pure_etp"),
+        pytest.param({"ep": True, "etp": True}, True, id="ep_etp"),
         pytest.param({"pp": True}, False, id="pp"),
         pytest.param({"ep": True, "pp": True}, False, id="pp_ep"),
     ],
 )
 @pytest.mark.parametrize("preserve", (False, True))
-def test_public_loader_preservation_is_ep_or_ep_cp_only(monkeypatch, axes, expected, preserve):
+def test_public_loader_forwards_strict_master_coverage_to_supported_loaders(monkeypatch, axes, expected, preserve):
     pc = Mock(spec=ParallelismConfig)
     pc.ep_size = 8 if axes.get("ep") else 1
     pc.is_cp_mode = axes.get("cp", False)

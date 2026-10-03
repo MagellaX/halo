@@ -21,7 +21,6 @@ from src.distributed.expert_parallel.config import EPConfig, get_num_experts
 from src.distributed.expert_parallel.lazy_loader import (
     lazy_loader_supports_checkpoint,
     load_ep_model_lazy,
-    restore_fp32_master_parameters,
 )
 from src.distributed.expert_parallel.patching import (
     create_ep_buffers,
@@ -29,6 +28,7 @@ from src.distributed.expert_parallel.patching import (
     patch_moe_model_for_ep,
 )
 from src.distributed.filesystem import sequential_load_within_node
+from src.distributed.loading.master_weights import restore_fp32_master_parameters
 from src.distributed.runtime import (
     DeferredRankFailure,
     broadcast_from_rank0,
@@ -190,8 +190,9 @@ def load_ep_model(
     Hub id (resolved to the cached snapshot dir), local path, or EP checkpoint dir. ``config`` is the
     caller's already-loaded model config, required so that no loader re-reads it per rank.
     ``keep_fp32_params`` is :func:`cast_loaded_parameters`' ``keep_fp32`` on either path.
-    ``preserve_checkpoint_precision`` additionally reads configured masters at fp32 when the caller
-    identifies this source as the full-finetune resume checkpoint; false keeps fresh-load casting.
+    Configured masters retain stored FP32 values for every checkpoint start.
+    ``preserve_checkpoint_precision`` identifies a full-finetune resume and makes master coverage
+    strict; it does not decide whether a fresh stage preserves the source's precision.
     """
     rank = get_global_rank()
 
@@ -347,20 +348,23 @@ def _load_ep_model_huggingface(
             **model_kwargs,
         )
         cast_loaded_parameters(model, dtype, keep_fp32=keep_fp32_params, ep_wrapped=True)
-        if preserve_checkpoint_precision:
-            precision_guard.run(
-                lambda: restore_fp32_master_parameters(
-                    model, model_name_or_path, ep_config, keep_non_ep=keep_fp32_params
-                )
+        precision_guard.run(
+            lambda: restore_fp32_master_parameters(
+                model,
+                model_name_or_path,
+                ep_config,
+                keep_non_ep=keep_fp32_params,
+                strict=preserve_checkpoint_precision,
+                revision=revision,
             )
+        )
         if precision_guard.reason is None:
             logger.info(f"[Rank {rank}] Applying EP patching...")
             model = patch_moe_model_for_ep(model, ep_config)
             model = move_model_to_local_device(model)
 
     # Outside the node-serialized region: a world collective inside it would wait on queued ranks.
-    if preserve_checkpoint_precision:
-        precision_guard.reject()
+    precision_guard.reject()
 
     # Collective — every EP rank must participate, and only once all ranks are loaded and on GPU.
     create_ep_buffers(model)

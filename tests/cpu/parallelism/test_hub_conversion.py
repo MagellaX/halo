@@ -17,8 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from bitsandbytes.nn import Linear4bit, Params4bit
 from safetensors.torch import save_file
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, BitsAndBytesConfig
 from transformers.core_model_loading import (
     Chunk,
     Concatenate,
@@ -29,6 +30,7 @@ from transformers.core_model_loading import (
     WeightConverter,
     WeightRenaming,
 )
+from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
 
 import src.distributed.expert_parallel.hub_conversion as hub_conversion
 from src.distributed.expert_parallel.config import EPConfig
@@ -38,8 +40,8 @@ from src.distributed.expert_parallel.lazy_loader import (
     EPWeightPlanner,
     WeightAction,
     build_family_key_mapping,
-    restore_fp32_master_parameters,
 )
+from src.distributed.loading.master_weights import restore_fp32_master_parameters
 from src.models.loading.lazy_safetensors.conversion import (
     Concat,
     Deinterleave,
@@ -629,6 +631,64 @@ def test_eager_replay_refuses_renames_it_cannot_reproduce_without_silent_loss(en
     model._weight_conversions = [entry]
     with pytest.raises(ValueError, match="rename|renaming|Renaming"):
         resolve_loaded_conversion_steps(model)
+
+
+@pytest.mark.parametrize("deserialize_first", (False, True))
+def test_prequantized_float_storage_keeps_codes_and_restores_plain_masters(tmp_path, deserialize_first):
+    """The real HF broad deserializer also matches plain weights, which it leaves unchanged.
+
+    Packed floating-storage Params4bit and their quantization statistics come from a real bnb
+    serialization. The streamed master replay must leave them intact without dropping a separate
+    recorded vendor rename or rounding the ordinary master's checkpoint value.
+    """
+    model = _model_with_keys(["norm.weight"]).to(torch.bfloat16)
+    model.config = SimpleNamespace(model_type="qwen3")
+    model.quantized = Linear4bit(64, 64, bias=False, quant_storage=torch.bfloat16, quant_type="nf4")
+    model.quantized.weight = Params4bit(
+        torch.randn(64, 64, dtype=torch.bfloat16),
+        requires_grad=False,
+        quant_storage=torch.bfloat16,
+        quant_type="nf4",
+    )
+    model.quantized.to("cpu")
+    packed = model.quantized.weight
+    codes = packed.data.view(torch.uint8).clone()
+    assert packed.bnb_quantized and packed.dtype == torch.bfloat16
+    original = torch.tensor([1.00001])
+    stored = {key: value.clone().contiguous() for key, value in model.quantized.state_dict().items()}
+    assert any("quant_state" in key for key in stored), "the checkpoint must carry prequantized statistics"
+    stored = {f"quantized.{key}": value for key, value in stored.items()}
+    stored["vendor_norm.weight"] = original
+    save_file(stored, str(tmp_path / "model.safetensors"))
+    quantizer = Bnb4BitHfQuantizer(BitsAndBytesConfig(load_in_4bit=True), pre_quantized=True)
+    (deserialize,) = quantizer.get_weight_conversions()
+    rename = WeightRenaming(source_patterns=r"^vendor_norm\.", target_patterns="norm.")
+    model._weight_conversions = [deserialize, rename] if deserialize_first else [rename, deserialize]
+    model.norm.weight.data.copy_(original)
+    assert not torch.equal(model.norm.weight.float(), original)
+    # The actual op's identity branch is the premise for skipping only this storage conversion.
+    assert deserialize.operations[0].convert({"weight": original})["weight"] is original
+
+    restore_fp32_master_parameters(model, str(tmp_path), keep_non_ep=True, strict=True)
+
+    assert model.quantized.weight is packed and torch.equal(packed.data.view(torch.uint8), codes)
+    assert model.norm.weight.dtype == torch.float32 and torch.equal(model.norm.weight, original)
+    model._weight_conversions.append(
+        WeightConverter(source_patterns=["a", "b"], target_patterns="c", operations=[Chunk(dim=0)])
+    )
+    with pytest.raises(ValueError, match="multi-source.*qwen3"):
+        resolve_loaded_conversion_steps(model)
+
+
+def test_unsupported_declared_conversion_names_its_original_mapping_key(monkeypatch):
+    model = _model_with_keys(["norm.weight"])
+    model.config = SimpleNamespace(model_type="step3p7")
+    layer = ep_layer_class_by_model_type()["step3p7"]
+    monkeypatch.setattr(layer, "_HUB_CONVERSION_KEYS", ("vendor_bad_entry",))
+    bad = WeightConverter(source_patterns=["a", "b"], target_patterns="c", operations=[Chunk(dim=0)])
+    monkeypatch.setattr(hub_conversion, "get_checkpoint_conversion_mapping", lambda _key: [bad])
+    with pytest.raises(ValueError, match="multi-source.*vendor_bad_entry"):
+        resolve_conversion_steps("step3p7", model)
 
 
 if __name__ == "__main__":
