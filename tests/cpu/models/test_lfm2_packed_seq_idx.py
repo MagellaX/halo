@@ -85,8 +85,10 @@ def _doc_b_drift(
     token_shift: int = 17,
     perturb_doc_b: bool = False,
 ) -> float:
-    """Doc B's max activation drift when doc A's content changes (doc A precedes doc B, so causality
-    alone never explains a drift — only conv/attention state crossing the boundary does)."""
+    """Doc B's max activation drift when doc A changes, or doc B with ``perturb_doc_b``.
+
+    Doc-A changes expose state crossing the boundary; doc-B changes are the positive control.
+    """
     lens = (6, 6)
     g = torch.Generator().manual_seed(7)
     input_ids = torch.randint(4, 128, (1, sum(lens)), generator=g)
