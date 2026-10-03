@@ -3,9 +3,10 @@
 
 The oracle runs full rows through an EP8/CP1 trainer model and independently reduces its logits.
 Run: torchrun --nproc_per_node=8 tests/gpu/trainers/grpo/test_offline_grpo_ep_cp.py
-Set HALO_TEST_OFFLINE_GRPO_EP_LAZY=0 to exercise eager checkpoint loading.
+Use --ep-loading lazy or --ep-loading eager to select checkpoint loading.
 """
 
+import argparse
 import functools
 import hashlib
 import math
@@ -63,12 +64,14 @@ def _dataset(groups, offset=0):
     return Dataset.from_list(rows)
 
 
-def _build_trainer(source, output, cp_size, train, evaluation=None, checkpoint=None, *, kl_beta=BETA):
+def _build_trainer(
+    source, output, cp_size, train, evaluation=None, checkpoint=None, *, ep_lazy_loading, kl_beta=BETA
+):
     parallelism = ParallelismConfig(
         ep_size=8,
         cp_size=cp_size,
         ep_fp32_router=True,
-        ep_lazy_loading=env_flag("HALO_TEST_OFFLINE_GRPO_EP_LAZY", True),
+        ep_lazy_loading=ep_lazy_loading,
     )
     model, _ = load_distributed_model(
         model_name_or_path=source,
@@ -293,7 +296,19 @@ def _export_check(continuous, resumed, checkpoint, device):
     return exact, finite, stepped
 
 
+def ep_cp_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--ep-loading",
+        choices=("lazy", "eager"),
+        default="lazy" if env_flag("HALO_TEST_OFFLINE_GRPO_EP_LAZY", True) else "eager",
+    )
+    return parser
+
+
 def run(ctx):
+    args = ep_cp_parser().parse_args()
+    build_trainer = functools.partial(_build_trainer, ep_lazy_loading=args.ep_loading == "lazy")
     buffer_cls = deep_ep().ElasticBuffer
     buffer_cls.__init__ = functools.partialmethod(buffer_cls.__init__, deterministic=True)
     log("Exact EP resume premise: DeepEP ElasticBuffer deterministic=True")
@@ -309,7 +324,7 @@ def run(ctx):
     train, evaluation = _dataset(16), _dataset(8, 3)
     checks = {}
 
-    oracle = _build_trainer(base, os.path.join(shared, "oracle"), 1, train, kl_beta=0.0)
+    oracle = build_trainer(base, os.path.join(shared, "oracle"), 1, train, kl_beta=0.0)
     rows = list(oracle.train_dataset)
     collator = OfflineGRPOCPDataCollatorWithPadding(pad_token_id=OFFLINE_VOCAB["<pad>"], cp_size=4)
     all_rows = {name: tensor.to(ctx.device) for name, tensor in collator(rows).items()}
@@ -345,7 +360,7 @@ def run(ctx):
     for cp_size in (1, 2, 4):
         prefix = f"ep8_cp{cp_size}"
         output = os.path.join(shared, prefix)
-        trainer = _build_trainer(base, output, cp_size, train, evaluation)
+        trainer = build_trainer(base, output, cp_size, train, evaluation)
         swept = trainer.train_dataset[REF_PER_TOKEN_LOGPS_COLUMN]
         reference_error = max(
             (torch.as_tensor(actual, dtype=torch.float32) - expected).abs().max().item()
@@ -465,7 +480,7 @@ def run(ctx):
         with patch.object(
             OfflineGRPOTrainer, "_sweep_reference_logps", side_effect=AssertionError("reswept reference")
         ):
-            resumed = _build_trainer(checkpoint, output, cp_size, train, evaluation, checkpoint)
+            resumed = build_trainer(checkpoint, output, cp_size, train, evaluation, checkpoint)
         expected_masters = continuous_probe.steps[1]["masters"]
         reshard_fsdp2_modules(resumed.model)
         restored_masters = {

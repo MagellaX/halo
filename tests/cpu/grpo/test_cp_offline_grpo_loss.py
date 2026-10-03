@@ -59,11 +59,11 @@ def _trainer(logps, *, beta: float, loss_type: str):
 
 @pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo"])
 @pytest.mark.parametrize("beta", [0.0, 0.2])
-def test_cp_trainer_loss_and_gradient_use_only_completion_targets(loss_type, beta):
+def test_cp_dispatch_loss_and_gradient_use_only_completion_targets(loss_type, beta):
     batch = _inputs(with_reference=beta != 0.0)
     logps = torch.tensor([[-0.3, -0.4, -9.0], [-0.5, -8.0, -8.0]], requires_grad=True)
     trainer = _trainer(logps, beta=beta, loss_type=loss_type)
-    loss = trainer._compute_cp_loss_inner(trainer.model, batch)
+    loss = trainer._compute_loss_inner(trainer.model, batch)
 
     valid = batch["labels"][:, 1:] != -100
     token_loss = -logps * batch["advantage"].unsqueeze(1)
@@ -153,7 +153,7 @@ def _ranked_kl_oracle(rank: int, cp_size: int) -> None:
                 policy[:, start:end],
                 labels[:, start + 1 : end + 1],
             )
-            loss = trainer._compute_cp_loss_inner(trainer.model, batch)
+            loss = trainer._compute_loss_inner(trainer.model, batch)
             oracle_policy = scores.clone().requires_grad_()
             expected = _kl_oracle(batch, oracle_policy, loss_type, formulation)
             torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-6)
