@@ -162,7 +162,7 @@ torchrun --nproc_per_node=8 scripts/training/offline_grpo.py \
 
 Run a short config on a slice of the data first: `max_steps: 10` with `save_strategy: "no"` exercises tokenization, advantage normalization and the loss in minutes. A bad `loss_type`, `advantage_method` or `policy_gradient_formulation` is caught at construction.
 
-CPU: `pytest tests/cpu/grpo -m cpu`. GPU: `tests/gpu/trainers/grpo/test_offline_grpo.py` and its `_bnpo` / `_bs4` / `_chunked` / `_tp_resume` siblings, plus the LoRA suites. The CP suites compare CP1 with CP2/CP4 on dense Qwen3 and Qwen3-MoE with EP+CP: token log-probs, loss, per-parameter gradient direction and global norm, and an AdamWBF16 step. Boundary-only supervision makes the missing-boundary negative control fail numerically. The trainer suite covers train → resume → export and KL/reference metric equivalence.
+CPU: `pytest tests/cpu/grpo -m cpu`, including CP1/CP2/CP4 equivalence of logged KL/reference metrics. GPU: `tests/gpu/trainers/grpo/test_offline_grpo.py` and its `_bnpo` / `_bs4` / `_chunked` / `_tp_resume` siblings, plus the LoRA suites. The CP suites compare CP1 with CP2/CP4 on dense Qwen3 and Qwen3-MoE with EP+CP: token log-probs, loss, per-parameter gradient direction and global norm, and an AdamWBF16 step. Boundary-only supervision makes the missing-boundary negative control fail numerically. The GPU trainer suite covers train → resume → export.
 
 ## What to watch
 

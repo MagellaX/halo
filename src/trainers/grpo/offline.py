@@ -1298,7 +1298,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         all-ignore labels and a zero advantage, and would otherwise count as zero-valued
         positive-advantage samples. The mode keys the buffer ``log`` drains.
         """
-        # Count and every diagnostic travel in one non-autograd collective. Each CP shard owns
+        # Count and every detached diagnostic travel in one CP sum. Each CP shard owns
         # tokens of the same logical rows; off CP this is the same local row reduction.
         keys = tuple(sample_values)
         totals = torch.stack(
