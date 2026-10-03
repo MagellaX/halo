@@ -64,9 +64,7 @@ def _dataset(groups, offset=0):
     return Dataset.from_list(rows)
 
 
-def _build_trainer(
-    source, output, cp_size, train, evaluation=None, checkpoint=None, *, ep_lazy_loading, kl_beta=BETA
-):
+def _build_trainer(source, output, cp_size, train, evaluation=None, checkpoint=None, *, ep_lazy_loading, kl_beta=BETA):
     parallelism = ParallelismConfig(
         ep_size=8,
         cp_size=cp_size,

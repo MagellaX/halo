@@ -331,6 +331,7 @@ def _loss_forwards(ref_model) -> tuple[list[dict], _PeftPolicy]:
         min_log_prob=None,
         beta=0.1,
         _precompute_reference=False,
+        parallelism_config=ParallelismConfig(),
         ref_model=ref_model,
         accelerator=types.SimpleNamespace(unwrap_model=lambda model: model),
         _get_per_token_logps=per_token_logps,
