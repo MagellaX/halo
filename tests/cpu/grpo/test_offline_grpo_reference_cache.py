@@ -272,10 +272,7 @@ def _node_local_cache(rank, root, damage):
         assert not os.listdir(os.path.join(output, "_reference_cache"))
         trainer.save_checkpoint()
         restored = ReferenceStorageTrainer(output, checkpoint=os.path.join(output, "checkpoint-1"))
-        assert (
-            restore_reference(restored, dataset, "train")[REF_PER_TOKEN_LOGPS_COLUMN]
-            == expected
-        )
+        assert restore_reference(restored, dataset, "train")[REF_PER_TOKEN_LOGPS_COLUMN] == expected
         outcome = "NO RAISE"
     except Exception as exc:
         outcome = f"{type(exc).__name__}: {exc}"
