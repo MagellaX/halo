@@ -463,8 +463,9 @@ Around it the mixin keeps the non-weight parts of a checkpoint: `_save_checkpoin
 `_restore_trainer_sidecars` its read-back, called on every rank of a resume (never a best-model
 load). The shared reference mixin overrides the write for DPO/KTO and offline GRPO's `reference_logps.pt`.
 DPO/KTO read it back during TRL's `__init__`, and offline GRPO restores it during construction,
-not through the resume hook. The async GRPO rollout mixin overrides both for its pending prefetch rounds. Each trainer lists the overriding mixin ahead of
-`DistributedTrainerMixin` in its bases, so the empty defaults do not shadow it.
+not through the resume hook. The async GRPO rollout mixin overrides both for its pending prefetch
+rounds. Each trainer lists the overriding mixin ahead of `DistributedTrainerMixin` in its bases,
+so the empty defaults do not shadow it.
 
 `load_best_model_at_end` is refused at construction for every shape whose end-of-run reload is
 guaranteed to be refused: `cp_size > 1`, a MoE carrying EP or grouped-GEMM wrappers (`ep_size: 1`

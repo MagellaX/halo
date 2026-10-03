@@ -436,7 +436,5 @@ def test_explicit_reference_does_not_allow_a_resume_to_replace_its_missing_ancho
     assert resumed.sweep_count == 0
 
 
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

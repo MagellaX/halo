@@ -16,9 +16,9 @@ from tests.common.offline_grpo_reference import (
     SETTINGS,
     ReferenceStorageTrainer,
     attach_reference,
-    restore_reference,
     reference_dataset,
     reference_rows,
+    restore_reference,
 )
 
 

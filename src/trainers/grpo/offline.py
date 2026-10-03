@@ -271,6 +271,7 @@ def tokenize_offline_grpo_rows(
     all_group_ids = []
     all_group_sizes = []
     all_advantages = []
+
     for prompt, completions_list, rewards_list, idx in zip(
         batch["prompt"], batch["completions"], batch["rewards"], indices, strict=True
     ):
@@ -550,7 +551,9 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model_id, padding_side="right")
 
-        data_collator = OfflineGRPODataCollatorWithPadding(pad_token_id=self.padding_value)
+        data_collator = OfflineGRPODataCollatorWithPadding(
+            pad_token_id=self.padding_value,
+        )
 
         if args.remove_unused_columns:
             args.remove_unused_columns = False
@@ -563,6 +566,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             )
 
         original_columns = train_dataset.column_names
+
         tokenize_num_proc = self._dataset_map_num_proc(args.dataset_num_proc)
         # In fn_kwargs, not read off self: the map fn must stay picklable, and the cache key
         # fingerprints fn_kwargs.
@@ -1045,6 +1049,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             loss_type=self.loss_type,
             max_completion_length=self.max_completion_length,
         )
+
         self._buffer_sign_metrics(sample_values, advantages, completion_mask)
         return loss
 
@@ -1343,6 +1348,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             return token_logps.new_zeros(())
 
         advantages = target["advantage"].float()
+
         token_logps_unclamped = token_logps
         token_logps = clamp_negative_advantage_logps(token_logps, advantages, self._pp_min_log_prob)
 
