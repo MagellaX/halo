@@ -358,7 +358,7 @@ def _probe(checkpoint, dataset, settings):
     probe = _ReferenceProbe()
     probe.beta = 0.05
     probe._init_reference_logps(resume_checkpoint=checkpoint)
-    return probe._restore_reference_logps_or_none(dataset, "training", settings=settings)
+    return probe._restore_reference_logps_or_none(dataset, "training", identity=settings)
 
 
 def _negative_sidecar_checks(ctx, checkpoint, tokenized_dataset, settings):
