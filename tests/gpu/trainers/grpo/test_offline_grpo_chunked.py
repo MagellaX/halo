@@ -62,7 +62,19 @@ class _SavedWeights(RestorePointSnapshot):
         ids, labels = fixed_text_batch(
             self.trainer.processing_class, torch.cuda.current_device(), TP_RESUME_PROBE_TEXT
         )
-        return {"loss": fixed_batch_loss(self.trainer.model, ids, labels)}
+        live_loss = fixed_batch_loss(self.trainer.model, ids, labels)
+        checkpoint = os.path.join(self.trainer.args.output_dir, f"checkpoint-{self.trainer.state.global_step}")
+        # The checkpoint oracle separates a stale live forward from an incorrect resume without
+        # replacing the live loss that the resume comparison must still match.
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            oracle = AutoModelForCausalLM.from_pretrained(
+                checkpoint, dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="flash_attention_4"
+            ).to(ids.device)
+            try:
+                checkpoint_loss = fixed_batch_loss(oracle, ids, labels)
+            finally:
+                del oracle
+        return {"loss": live_loss, "checkpoint_loss": checkpoint_loss}
 
 
 def _batch_parity_check(trainer) -> tuple[float, float]:
@@ -166,6 +178,10 @@ def run(ctx) -> dict:
     checks = {"logprob_parity": parity_ok, "losses_finite": losses_finite}
     checkpoint = os.path.join(output_dir, f"checkpoint-{SAVE_STEP}")
     checkpoint_loss = saved.captured["loss"]
+    checks["save_probe_matches_plain_checkpoint"] = (
+        math.isfinite(checkpoint_loss)
+        and abs(checkpoint_loss - saved.captured["checkpoint_loss"]) < TOL.resume_fixed_batch_loss_abs
+    )
     del trainer, model, saved
     cleanup_memory()
     dist.barrier()
