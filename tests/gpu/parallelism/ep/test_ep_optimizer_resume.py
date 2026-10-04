@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Optimizer-state continuity and checkpoint master precision under EP, CP and FSDP2 (2 GPUs).
+"""Optimizer-state continuity and checkpoint master precision under EP, CP, TP and FSDP2 (2 GPUs).
 
 The checkpoint loader restores per-rank optimizer shards for EP/CP whenever the topology
 fingerprint in ``optimizer_meta.pt`` matches; a mismatch warm-restarts loudly. This test pins
@@ -28,7 +28,8 @@ Different shard layout and a different save gather (``full_tensor()``, not an EP
 contract. No mismatch phase: save and resume run the same topology by construction.
 
 ``--mode ep_cp`` overlays EP and CP on the same two ranks. ``--mode cp`` uses dense Qwen3 with
-cp_size=2, and ``--mode fsdp`` uses dense Qwen3 with FSDP2 alone. Each runs phases 1-3.
+cp_size=2, ``--mode tp`` uses dense Qwen3 with native TP2, and ``--mode fsdp`` uses FSDP2 alone.
+Each runs phases 1-3.
 
 ``--fp32-masters`` enables router, expert and non-expert masters together. The ``ep1`` row needs
 ``--unsharded-ep1-experts``: managed EP1 experts cannot combine with ``fp32_non_ep_params``.
@@ -103,7 +104,7 @@ _TINY_COMMON = {
 
 def optimizer_resume_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["ep", "ep1", "ep_cp", "cp", "fsdp"], default="ep")
+    parser.add_argument("--mode", choices=["ep", "ep1", "ep_cp", "cp", "tp", "fsdp"], default="ep")
     parser.add_argument("--fp32-masters", action="store_true", help="enable all three configured master flags")
     parser.add_argument("--eager-loading", action="store_true", help="load EP weights through from_pretrained")
     parser.add_argument(
@@ -147,6 +148,7 @@ def _parallelism_config(
     return ParallelismConfig(
         ep_size=world_size if mode in ("ep", "ep_cp") else 1,
         cp_size=world_size if mode in ("cp", "ep_cp") else 1,
+        tp_size=world_size if mode == "tp" else 1,
         ep_fp32_router=fp32_masters,
         ep_fp32_experts=fp32_masters,
         fp32_non_ep_params=fp32_masters,

@@ -21,7 +21,7 @@ import src.distributed.context_parallel.loading as cp_loading
 import src.distributed.expert_parallel.lazy_loader as lazy_loading
 import src.distributed.expert_parallel.loading as eager_loading
 import src.distributed.loading.model_loading as model_loading
-from src.checkpoint.format import load_full_state_dict
+from src.checkpoint.format import StreamingCheckpointReader, load_full_state_dict
 from src.distributed.checkpoint.write import chunked_saveable_tensors, stream_gathered_checkpoint
 from src.distributed.context_parallel.wrapper import UlyssesCPModelWrapper, patch_model_for_cp
 from src.distributed.expert_parallel.base_layer import EPMoELayerBase
@@ -275,6 +275,22 @@ def test_a_bf16_checkpoint_keeps_exact_values_when_promoted_for_resume(tmp_path,
             path, mode="ep", lazy=lazy, fp32_router=True, fp32_experts=True, fp32_non_ep=True, preserve=preserve
         )
         _assert_values(model, stored, ownership, router=True, experts=True, non_ep=True, preserve=preserve)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_eager_bf16_master_promotion_does_not_reread_expert_or_dense_payloads(
+    tmp_path, cpu_loading, monkeypatch, family
+):
+    path, stored, ownership = _checkpoint(tmp_path, family, stored_fp32=False)
+
+    def reject_second_read(reader, key):
+        raise AssertionError(f"BF16 master payload reread: {key}")
+
+    monkeypatch.setattr(StreamingCheckpointReader, "get", reject_second_read)
+    model = _construct(
+        path, mode="ep", lazy=False, fp32_router=True, fp32_experts=True, fp32_non_ep=True, preserve=True
+    )
+    _assert_values(model, stored, ownership, router=True, experts=True, non_ep=True, preserve=True)
 
 
 @pytest.mark.parametrize("family", FAMILIES)

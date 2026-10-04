@@ -27,6 +27,7 @@ from src.distributed.expert_parallel.lazy_loader import (
     build_family_key_mapping,
 )
 from src.distributed.loading.precision import fp32_master_param_keys, verify_fp32_master_coverage
+from src.distributed.mesh import MeshDim
 from src.models.loading.dtype import reject_fp8_tensor
 from src.models.loading.lazy_safetensors.weights import (
     assign_tensor_to_model,
@@ -35,27 +36,15 @@ from src.models.loading.lazy_safetensors.weights import (
 )
 
 
-def _install_tp_master(model: nn.Module, aliases: list[str], target: DTensor, tensor: torch.Tensor) -> None:
+def _replace_tp_master(model: nn.Module, aliases: list[str], target: DTensor, local: torch.Tensor) -> None:
     """Replace TP storage and every tied owner, without rebinding a DTensor's stale local storage."""
     mesh = target.device_mesh
-    if mesh.ndim != 1 or mesh.mesh_dim_names != ("tp",):
+    if mesh.ndim != 1 or mesh.mesh_dim_names != (MeshDim.TP,):
         raise TypeError(
             f"FP32-master load of {aliases[0]!r} requires the named 1-D TP mesh before DP/FSDP2 "
             f"wrapping, got {mesh.mesh_dim_names!r}. Restoring an already DP-sharded master would "
             "not invert FSDP2's packed shard layout."
         )
-    # Every rank reads the same full tensor. No src-rank broadcast or full_tensor() collective:
-    # this replay is rank-local so a read failure can join before later wrapping collectives.
-    placement = target.placements[0]
-    if isinstance(placement, (Shard, _StridedShard)):
-        # PyTorch's placement implements its own split, including packed _StridedShard ordering.
-        # _StridedShard deliberately does not satisfy Placement.is_shard() on the pinned torch.
-        # Split on CPU first: uploading the full FP32 vocab/expert tensor would defeat TP's peak.
-        local = placement._shard_tensor(tensor, mesh, 0, src_data_rank=None)
-    elif placement.is_replicate():
-        local = tensor
-    else:
-        raise TypeError(f"FP32-master load of {aliases[0]!r} cannot restore TP placement {placement!r}.")
     master = nn.Parameter(
         DTensor.from_local(
             local.to(device=target.device, dtype=torch.float32),
@@ -70,6 +59,39 @@ def _install_tp_master(model: nn.Module, aliases: list[str], target: DTensor, te
     for name in aliases:
         parent_path, _, attr = name.rpartition(".")
         setattr(model.get_submodule(parent_path) if parent_path else model, attr, master)
+
+
+def _install_tp_master(model: nn.Module, aliases: list[str], target: DTensor, tensor: torch.Tensor) -> None:
+    # Every rank reads the same full tensor. Split on CPU before uploading only the local shard.
+    placement = target.placements[0]
+    if isinstance(placement, (Shard, _StridedShard)):
+        local = placement._shard_tensor(tensor, target.device_mesh, 0, src_data_rank=None)
+    elif placement.is_replicate():
+        local = tensor
+    else:
+        raise TypeError(f"FP32-master load of {aliases[0]!r} cannot restore TP placement {placement!r}.")
+    _replace_tp_master(model, aliases, target, local)
+
+
+def _promote_exact_bf16_master(
+    model: nn.Module,
+    aliases: list[str],
+    target: nn.Parameter,
+    disk_keys: list[str] | tuple[str, ...],
+    reader: StreamingCheckpointReader,
+) -> bool:
+    """BF16 disk values survive BF16/FP32 construction exactly, so promote existing storage only."""
+    if (
+        target.is_meta
+        or target.dtype not in (torch.bfloat16, torch.float32, torch.float64)
+        or not all(reader.safetensors_dtype(key) == "BF16" for key in disk_keys)
+    ):
+        return False
+    if isinstance(target, DTensor):
+        _replace_tp_master(model, aliases, target, target.to_local())
+    else:
+        target.data = target.data.float()
+    return True
 
 
 def restore_fp32_master_parameters(
@@ -121,25 +143,37 @@ def restore_fp32_master_parameters(
     restored_ids = set()
     with StreamingCheckpointReader(model_path, requested) as reader:
         if tasks:
+            replay_tasks = []
+            for task in tasks:
+                key, kind, experts = task
+                fuser.validate_task(key, kind, experts)
+                disk_keys = [disk_key for slots in experts.values() for disk_key, _shard in slots.values()]
+                if _promote_exact_bf16_master(model, aliases[id(state[key])], state[key], disk_keys, reader):
+                    restored.add(key)
+                else:
+                    replay_tasks.append(task)
             restored.update(
-                fuser.execute(tasks, model, model_path, torch.float32, "cpu", reader=reader, preserve_parameters=True)
+                fuser.execute(
+                    replay_tasks, model, model_path, torch.float32, "cpu", reader=reader, preserve_parameters=True
+                )
             )
             restored_ids.update(id(state[key]) for key in restored)
         for plan in plans:
             target = state[plan.model_key]
             if id(target) not in restored_ids:
-                tensor = materialize_weight_plan(plan, lambda key, _plan: reader.get(key))
-                verify_loaded_shape(model, plan.model_key, f"checkpoint key(s) {plan.disk_keys}", tensor)
-                reject_fp8_tensor(plan.model_key, tensor, torch.float32)
-                if isinstance(target, DTensor):
-                    _install_tp_master(model, aliases[id(target)], target, tensor)
-                else:
-                    assign_tensor_to_model(
-                        model,
-                        plan.model_key,
-                        tensor.to(device=target.device, dtype=torch.float32),
-                        preserve_parameter=True,
-                    )
+                if not _promote_exact_bf16_master(model, aliases[id(target)], target, plan.disk_keys, reader):
+                    tensor = materialize_weight_plan(plan, lambda key, _plan: reader.get(key))
+                    verify_loaded_shape(model, plan.model_key, f"checkpoint key(s) {plan.disk_keys}", tensor)
+                    reject_fp8_tensor(plan.model_key, tensor, torch.float32)
+                    if isinstance(target, DTensor):
+                        _install_tp_master(model, aliases[id(target)], target, tensor)
+                    else:
+                        assign_tensor_to_model(
+                            model,
+                            plan.model_key,
+                            tensor.to(device=target.device, dtype=torch.float32),
+                            preserve_parameter=True,
+                        )
                 restored_ids.add(id(target))
             restored.add(plan.model_key)
     if strict:

@@ -388,10 +388,12 @@ loads it. Configured parameter masters instead stream/fuse directly at FP32, ind
 shell's dtype or whether this is the first stage or a resume.
 
 The eager fallback replays only selected masters after HF construction, using the same checkpoint
-mapping and expert layout. That is a **second read** of the selected weights. Under `fp32_experts`,
-it materializes the **full** FP32 expert bank on each admitted CPU rank before the EP slice: twice
-the expert bytes of BF16, plus conversion temporaries. `max_concurrent_loading` bounds those ranks
-per node; the lazy path reads only each rank's expert slice and avoids this full-bank staging cost.
+mapping and expert layout. FP32-stored masters need a **second read**; BF16 safetensors masters
+promote the already-loaded values without rereading their payload. Under `fp32_experts`, FP32 replay
+materializes the **full** expert bank before the EP slice: twice the expert bytes of BF16, plus
+conversion temporaries. Pure EP stages this bank on each admitted CPU rank; eager EP+TP and ETP
+stage it on each GPU before slicing. `max_concurrent_loading` bounds admitted ranks per node;
+the lazy path reads only each rank's expert slice and avoids full-bank staging.
 
 Buffers must be real: a config-less rotary derives `inv_freq` from ctor args it never stores, which a
 meta build loses irrecoverably. The `from_pretrained(device_map="meta")` route strands the

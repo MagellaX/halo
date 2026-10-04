@@ -26,6 +26,7 @@ import src.distributed.filesystem as filesystem
 import src.distributed.loading.master_weights as master_loading
 import src.distributed.loading.model_loading as loading
 from src.distributed.context_parallel.wrapper import patch_model_for_cp
+from src.distributed.expert_parallel.lazy_loader import ExpertFuser
 from src.distributed.loading.precision import fp32_master_param_keys
 from tests.common.gloo import run_gloo_ranks
 
@@ -152,10 +153,10 @@ def test_native_tp_load_preserves_checkpoint_masters_and_local_storage(tmp_path,
     run_gloo_ranks(_native_tp_rank, 2, str(source), strict, keep, pg_timeout=datetime.timedelta(seconds=30))
 
 
-def _placement_rank(rank, path):
+def _placement_rank(rank, path, stored_fp32):
     mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
     # Packed row order must differ from an ordinary contiguous Shard(0) oracle.
-    expected = torch.arange(64).reshape(8, 8).float() / 16 + 1e-5
+    expected = torch.arange(64).reshape(8, 8).float() / 16 + (1e-5 if stored_fp32 else 0)
     for placement in (Shard(0), Shard(1), Replicate(), _StridedShard(0, split_factor=2)):
         model = nn.Module()
         model.config = Qwen3Config(tie_word_embeddings=False)
@@ -188,10 +189,13 @@ def _placement_rank(rank, path):
         assert torch.equal(full, expected)
 
 
-def test_tp_replay_preserves_each_placement_and_all_tied_owners(tmp_path):
-    expected = torch.arange(64).reshape(8, 8).float() / 16 + 1e-5
+@pytest.mark.parametrize("stored_fp32", (False, True), ids=("bf16_promotion", "fp32_replay"))
+def test_tp_replay_preserves_each_placement_and_all_tied_owners(tmp_path, stored_fp32):
+    expected = torch.arange(64).reshape(8, 8).float() / 16 + (1e-5 if stored_fp32 else 0)
+    if not stored_fp32:
+        expected = expected.bfloat16()
     save_file({"weight": expected}, str(tmp_path / "model.safetensors"))
-    run_gloo_ranks(_placement_rank, 2, str(tmp_path), pg_timeout=datetime.timedelta(seconds=30))
+    run_gloo_ranks(_placement_rank, 2, str(tmp_path), stored_fp32, pg_timeout=datetime.timedelta(seconds=30))
 
 
 def _read_failure_rank(rank, source, outcomes):
@@ -247,6 +251,68 @@ def test_packed_float_4bit_storage_is_not_selected_as_a_parameter_master():
     model = nn.Linear(4, 4)
     model.weight.quant_state = None
     assert fp32_master_param_keys(model, keep_non_ep=True) == frozenset({"bias"})
+
+
+def test_bf16_stored_masters_skip_payload_reads_but_fp32_masters_are_replayed(tmp_path, monkeypatch):
+    expected = {"bf16": torch.arange(8).bfloat16() / 16, "fp32": torch.arange(8).float() / 16 + 1e-5}
+    save_file(expected, str(tmp_path / "model.safetensors"))
+    model = nn.Module()
+    model.config = Qwen3Config(tie_word_embeddings=False)
+    for key, value in expected.items():
+        model.register_parameter(key, nn.Parameter(value.bfloat16()))
+    reads = []
+    original_get = master_loading.StreamingCheckpointReader.get
+
+    def get(reader, key):
+        reads.append(key)
+        return original_get(reader, key)
+
+    monkeypatch.setattr(master_loading.StreamingCheckpointReader, "get", get)
+    master_loading.restore_fp32_master_parameters(model, str(tmp_path), keep_non_ep=True, strict=True)
+    assert reads == ["fp32"], "BF16 checkpoint values must not incur a second payload read"
+    for key, value in expected.items():
+        assert getattr(model, key).dtype == torch.float32
+        assert torch.equal(getattr(model, key).detach(), value.float())
+
+
+def test_bf16_replay_elision_cannot_exempt_a_missing_master_from_strict_coverage(tmp_path):
+    model = nn.Module()
+    model.config = Qwen3Config(tie_word_embeddings=False)
+    model.present = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    model.missing = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    save_file({"present": model.present.detach()}, str(tmp_path / "model.safetensors"))
+    with pytest.raises(RuntimeError, match="missing"):
+        master_loading.restore_fp32_master_parameters(model, str(tmp_path), keep_non_ep=True, strict=True)
+
+
+def test_fused_master_replay_preserves_live_device_instead_of_staging_device(tmp_path):
+    model = nn.Module()
+    model.experts = nn.Module()
+    model.experts.down_proj = nn.Parameter(torch.zeros(2, 4, 3, dtype=torch.bfloat16))
+    original = model.experts.down_proj
+    expected = torch.arange(24).reshape(2, 4, 3).float() / 16 + 1e-5
+    state = {f"experts.{rank}.down_proj.weight": expected[rank] for rank in range(2)}
+    save_file(state, str(tmp_path / "model.safetensors"))
+    tasks = [
+        (
+            "experts.down_proj",
+            "down",
+            {
+                rank: {"down_proj.weight": (f"experts.{rank}.down_proj.weight", "model.safetensors")}
+                for rank in range(2)
+            },
+        )
+    ]
+    with master_loading.StreamingCheckpointReader(str(tmp_path), state) as reader:
+        # A distinct requested device catches relocation even on a CPU-only test runner.
+        restored = ExpertFuser(0, 2).execute(
+            tasks, model, str(tmp_path), torch.float32, "meta", reader=reader, preserve_parameters=True
+        )
+    assert restored == {"experts.down_proj"}
+    assert model.experts.down_proj is original
+    assert model.experts.down_proj.device.type == "cpu"
+    assert model.experts.down_proj.dtype == torch.float32
+    assert torch.equal(model.experts.down_proj.detach(), expected)
 
 
 if __name__ == "__main__":

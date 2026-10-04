@@ -470,7 +470,7 @@ class ExpertFuser:
         fused_keys: set[str] = set()
         try:
             for model_key, fusion_type, expert_dict in tasks:
-                self._check_local_range(expert_dict, model_key)
+                self.validate_task(model_key, fusion_type, expert_dict)
                 if fusion_type == "gate_up":
                     tensor = self._fuse_gate_up(expert_dict, handles)
                 else:
@@ -486,7 +486,8 @@ class ExpertFuser:
                 )
                 reject_fp8_tensor(model_key, tensor, dtype)
                 if dtype is not None and tensor.is_floating_point():
-                    tensor = tensor.to(device=device, dtype=torch.float32 if model_key in keep_fp32 else dtype)
+                    target_device = model.get_parameter(model_key).device if preserve_parameters else device
+                    tensor = tensor.to(device=target_device, dtype=torch.float32 if model_key in keep_fp32 else dtype)
 
                 assign_tensor_to_model(model, model_key, tensor, preserve_parameter=preserve_parameters)
                 fused_keys.add(model_key)
@@ -495,6 +496,18 @@ class ExpertFuser:
                 handles.clear()
 
         return fused_keys
+
+    def validate_task(self, model_key: str, fusion_type: str, expert_dict: dict) -> None:
+        """Validate complete expert coverage and GLU halves before any read or replay elision."""
+        self._check_local_range(expert_dict, model_key)
+        if fusion_type == "gate_up":
+            for expert_idx, suffixes in expert_dict.items():
+                if {per_expert_fusion_map()[suffix][1] for suffix in suffixes} != {0, 1}:
+                    raise RuntimeError(
+                        f"EP lazy load: expert {expert_idx} carries only {sorted(suffixes)} "
+                        "of its two GLU halves in the checkpoint — fusing a half-present expert would "
+                        "install garbage for the missing half."
+                    )
 
     def _check_local_range(self, expert_dict: dict[int, dict[str, tuple[str, str]]], model_key: str) -> None:
         """Raise when a fusion did not collect this rank's full contiguous expert range.
@@ -521,12 +534,6 @@ class ExpertFuser:
         slices = []
         for expert_idx in sorted(expert_dict.keys()):
             by_pos = {per_expert_fusion_map()[s][1]: dk_sf for s, dk_sf in expert_dict[expert_idx].items()}
-            if set(by_pos) != {0, 1}:
-                raise RuntimeError(
-                    f"EP lazy load: expert {expert_idx} carries only {sorted(expert_dict[expert_idx])} "
-                    f"of its two GLU halves in the checkpoint — fusing a half-present expert would "
-                    f"install garbage for the missing half."
-                )
             gate_dk, gate_sf = by_pos[0]
             up_dk, up_sf = by_pos[1]
             gate = self._read_tensor(handles, gate_dk, gate_sf)

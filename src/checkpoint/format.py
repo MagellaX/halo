@@ -796,6 +796,12 @@ class StreamingCheckpointReader:
             return self._legacy[key]
         return self._handles[self._key_to_shard[key]].get_tensor(key)
 
+    def safetensors_dtype(self, key: str) -> str | None:
+        """Stored dtype from the header, without reading the payload; None for legacy pickle files."""
+        if self._legacy is not None:
+            return None
+        return self._handles[self._key_to_shard[key]].get_slice(key).get_dtype()
+
     def close(self) -> None:
         """Release every open shard handle. Idempotent."""
         self._open_shards.close()
