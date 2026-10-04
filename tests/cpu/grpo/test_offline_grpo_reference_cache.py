@@ -11,8 +11,10 @@ import torch.distributed as dist
 from datasets import Dataset
 
 import src.trainers.grpo.reference_cache as cache_module
+from src.checkpoint.format import REFERENCE_CACHE_DIR_NAME
 from src.data.collators.offline_grpo import REF_PER_TOKEN_LOGPS_COLUMN
 from src.trainers.grpo.reference_cache import ReferenceScoreCache, reference_cache_writers
+from src.training.environment import _validate_output_dir
 from tests.common.distributed import shared_output_dir
 from tests.common.gloo import run_gloo_ranks
 from tests.common.offline_grpo_reference import (
@@ -141,7 +143,8 @@ def test_ephemeral_cache_needs_no_durable_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "replace", unavailable)
     mapped = cache.finish(dataset)
     assert mapped.column().to_pylist() == [[-0.25], [-0.75, -1.5]]
-    assert not list((tmp_path / "_reference_cache").iterdir())
+    assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir())
+    _validate_output_dir(str(tmp_path))
 
 
 def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_repacking(tmp_path, monkeypatch):
@@ -163,7 +166,7 @@ def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_r
     payload = trainer._reference_checkpoint_payload()["train"]
     assert payload["values"].data_ptr() == owner.values.data_ptr()
     assert not allocated, "attachment or save repacked the whole completion-token table"
-    assert not list((tmp_path / "_reference_cache").iterdir()), "mapped scratch files were retained"
+    assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir()), "mapped scratch files were retained"
     owner.values[0] = -9.25
     assert attached[REF_PER_TOKEN_LOGPS_COLUMN][0][0] == -9.25
     trainer.save_checkpoint()
@@ -185,7 +188,7 @@ def test_incomplete_or_corrupt_cache_is_rejected_and_removed(tmp_path, damage):
             output.write(b"!" if damage == "truncated" else torch.tensor([float("nan")]).numpy().tobytes())
     with pytest.raises(ValueError, match="Incomplete|truncated"):
         cache.finish(dataset)
-    assert not list((tmp_path / "_reference_cache").iterdir())
+    assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir())
 
 
 def test_buffered_validation_detects_corruption_after_the_first_chunk(tmp_path, monkeypatch):
@@ -210,7 +213,7 @@ def test_failed_cache_write_is_cleaned_up_before_checkpointing(tmp_path, monkeyp
     monkeypatch.setattr(ReferenceScoreCache, "_append", fail_write)
     with pytest.raises(ValueError, match="reference cache disk full"):
         attach_reference(trainer, reference_dataset(), "train", reference_rows(), settings=SETTINGS)
-    assert not list((tmp_path / "_reference_cache").iterdir())
+    assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir())
     assert not trainer._reference_logps_by_split
 
 
@@ -263,7 +266,7 @@ def _node_local_cache(rank, root, damage):
         trainer = ReferenceStorageTrainer(output)
         attached = trainer._attach_scored_reference_logps(dataset, "train", mapped, settings=SETTINGS)
         assert attached[REF_PER_TOKEN_LOGPS_COLUMN] == expected
-        assert not os.listdir(os.path.join(output, "_reference_cache"))
+        assert not os.listdir(os.path.join(output, REFERENCE_CACHE_DIR_NAME))
         trainer.save_checkpoint()
         restored = ReferenceStorageTrainer(output, checkpoint=os.path.join(output, "checkpoint-1"))
         assert (
@@ -406,6 +409,7 @@ def test_nfs_live_mapping_remnants_are_not_hub_upload_candidates(tmp_path, monke
     cache.discard()
     assert os.path.isfile(remnant)
     assert os.path.relpath(cache.directory, tmp_path).startswith("_")
+    _validate_output_dir(str(tmp_path))
     with open(os.path.join(cache.directory, "unexpected"), "wb") as output:
         output.write(b"unexpected")
     original_rmdir = os.rmdir

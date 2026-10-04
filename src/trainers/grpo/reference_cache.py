@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 
+from src.checkpoint.format import REFERENCE_CACHE_DIR_NAME
 from src.distributed.filesystem import store_reject_across_ranks
 from src.distributed.runtime import (
     DeferredRankFailure,
@@ -93,7 +94,7 @@ class ReferenceScoreCache:
     def __init__(self, output_dir: str, *, dp_size: int):
         identifier = broadcast_from_rank0(uuid.uuid4().hex if get_global_rank() == 0 else None)
         # Trainer.push_to_hub excludes underscore-prefixed scratch, including NFS's live-map remnants.
-        self.directory = os.path.join(os.fspath(output_dir), "_reference_cache", identifier)
+        self.directory = os.path.join(os.fspath(output_dir), REFERENCE_CACHE_DIR_NAME, identifier)
         self.dp_size = dp_size
         self.writers = reference_cache_writers()
         self._transfer_buffers = {
