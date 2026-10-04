@@ -21,10 +21,11 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from src.configs.offline_grpo_config import OfflineGRPOConfig
 from src.distributed.parallelism_config import ParallelismConfig
+from src.kernels.liger.orchestrator import apply_liger_kernel
 from src.trainers.grpo.offline import OfflineGRPOTrainer
 from tests.common.checkpoint_io import (
     TP_RESUME_PROBE_TEXT,
@@ -57,6 +58,19 @@ PARITY_MEAN_TOL = 5e-2
 PARITY_MAX_TOL = 0.5
 
 
+def _load_model(model_path, *, attn_implementation="flash_attention_4"):
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # A late instance patch misses Qwen3's q/k norms, while later loads use the patched classes.
+    apply_liger_kernel(config, liger_kernel_config={"cross_entropy": False, "fused_linear_cross_entropy": False})
+    return AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn_implementation,
+    )
+
+
 class _SavedWeights(RestorePointSnapshot):
     def extra(self):
         ids, labels = fixed_text_batch(
@@ -67,9 +81,7 @@ class _SavedWeights(RestorePointSnapshot):
         # The checkpoint oracle separates a stale live forward from an incorrect resume without
         # replacing the live loss that the resume comparison must still match.
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-            oracle = AutoModelForCausalLM.from_pretrained(
-                checkpoint, dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="flash_attention_4"
-            ).to(ids.device)
+            oracle = _load_model(checkpoint).to(ids.device)
             try:
                 checkpoint_loss = fixed_batch_loss(oracle, ids, labels)
             finally:
@@ -115,12 +127,7 @@ def run(ctx) -> dict:
 
     train_dataset = create_offline_grpo_dataset(tokenizer, NUM_TRAIN_SAMPLES, seed=SEED)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation="flash_attention_4",
-    )
+    model = _load_model(MODEL_NAME)
 
     config = OfflineGRPOConfig(
         output_dir=output_dir,
@@ -185,9 +192,7 @@ def run(ctx) -> dict:
     del trainer, model, saved
     cleanup_memory()
     dist.barrier()
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint, dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="flash_attention_4"
-    )
+    model = _load_model(checkpoint)
     with patch.object(OfflineGRPOTrainer, "_sweep_reference_logps", side_effect=AssertionError("resume re-swept")):
         resumed = OfflineGRPOTrainer(
             model=model,
@@ -219,9 +224,7 @@ def run(ctx) -> dict:
     del resumed, model
     cleanup_memory()
     dist.barrier()
-    reloaded = AutoModelForCausalLM.from_pretrained(
-        export, dtype=torch.bfloat16, attn_implementation="flash_attention_4"
-    ).to(ctx.device)
+    reloaded = _load_model(export).to(ctx.device)
     checks["export_reload_matches"] = (
         abs(fixed_batch_loss(reloaded, ids, labels) - trained_loss) < TOL.resume_fixed_batch_loss_abs
     )
