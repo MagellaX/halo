@@ -191,9 +191,14 @@ class ReferenceScoreCache:
         for kind, dtype in (("lengths", torch.int64), ("values", torch.float32)):
             path = self._path(shard, kind)
             itemsize = torch.tensor([], dtype=dtype).element_size()
-            if os.path.getsize(path) % itemsize:
+            file_size = os.path.getsize(path)
+            if file_size % itemsize:
                 raise ValueError(f"Malformed reference cache '{path}': truncated {kind}")
-            tensors.append(torch.from_file(path, shared=False, size=os.path.getsize(path) // itemsize, dtype=dtype))
+            tensors.append(
+                torch.from_file(path, shared=False, size=file_size // itemsize, dtype=dtype)
+                if file_size
+                else torch.empty(0, dtype=dtype)
+            )
         return mapped_reference_scores(*tensors)
 
     def finish(self, dataset: Dataset) -> MappedReferenceScores:
