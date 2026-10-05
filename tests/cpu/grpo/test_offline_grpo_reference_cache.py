@@ -174,7 +174,36 @@ def test_reference_cache_maps_one_arrow_token_buffer_and_serializes_it_without_r
     assert saved["train"]["values"][0] == -9.25
 
 
-@pytest.mark.parametrize("damage", ["missing_rows", "wrong_lengths", "nan", "truncated"])
+@pytest.mark.parametrize("completions", [[], [[], []], [[], [1, 2]]])
+def test_empty_reference_buffers_skip_file_mapping_and_preserve_ragged_rows(tmp_path, monkeypatch, completions):
+    dataset = Dataset.from_dict({"completion_input_ids": completions})
+    cache = ReferenceScoreCache(tmp_path, dp_size=1)
+    cache.append_rows(0, [torch.full((len(row),), -0.5, dtype=torch.float32) for row in completions])
+    mapped_files = []
+    original_from_file = torch.from_file
+
+    def map_nonempty(filename, **kwargs):
+        assert os.path.getsize(filename) > 0, "an empty reference buffer reached mmap"
+        assert kwargs["size"] > 0
+        mapped_files.append(os.path.basename(filename))
+        return original_from_file(filename, **kwargs)
+
+    monkeypatch.setattr(torch, "from_file", map_nonempty)
+    mapped = cache.finish(dataset)
+    lengths = [len(row) for row in completions]
+    assert mapped.lengths.dtype == torch.int64
+    assert mapped.values.dtype == torch.float32
+    assert mapped.lengths.tolist() == lengths
+    assert mapped.offsets.tolist() == [0, *torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist()]
+    assert mapped.column().to_pylist() == [[-0.5] * length for length in lengths]
+    expected_files = (["merged.lengths"] if lengths else []) + (["merged.values"] if any(lengths) else [])
+    assert mapped_files == expected_files * 2
+    assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir())
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_rows", "missing_lengths", "missing_values", "wrong_lengths", "nan", "truncated"]
+)
 def test_incomplete_or_corrupt_cache_is_rejected_and_removed(tmp_path, damage):
     dataset = Dataset.from_dict({"completion_input_ids": [[1, 2], [3]]})
     cache = ReferenceScoreCache(tmp_path, dp_size=1)
@@ -184,8 +213,11 @@ def test_incomplete_or_corrupt_cache_is_rejected_and_removed(tmp_path, damage):
         cache.append_rows(0, [torch.tensor([-1.0]), torch.tensor([-2.0, -3.0])])
     else:
         cache.append_rows(0, [torch.tensor([-1.0, -2.0]), torch.tensor([-3.0])])
-        with open(cache._path(0, "values"), "ab" if damage == "truncated" else "r+b") as output:
-            output.write(b"!" if damage == "truncated" else torch.tensor([float("nan")]).numpy().tobytes())
+        if damage.startswith("missing_"):
+            os.unlink(cache._path(0, damage.removeprefix("missing_")))
+        else:
+            with open(cache._path(0, "values"), "ab" if damage == "truncated" else "r+b") as output:
+                output.write(b"!" if damage == "truncated" else torch.tensor([float("nan")]).numpy().tobytes())
     with pytest.raises(ValueError, match="Incomplete|truncated"):
         cache.finish(dataset)
     assert not list((tmp_path / REFERENCE_CACHE_DIR_NAME).iterdir())
