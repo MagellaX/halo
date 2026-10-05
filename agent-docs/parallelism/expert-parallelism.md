@@ -341,9 +341,8 @@ and a layer that entered backward without a scope raises rather than silently co
 
 Expert compute uses [Grouped GEMM](../optimization/grouped-gemm.md)
 (`torch.nn.functional.grouped_mm`) on SM90+ by default; otherwise a per-expert loop accumulates with
-`index_add_`. The win scales with local experts per rank (`num_experts / ep_size`): large with many
-(Qwen3-30B EP=2, 64 experts/rank: +243% at batch 1), while gpt-oss-20b EP=8 (4 experts/rank) is
-faster on the loop from batch 2. Keep the default unless profiling says otherwise; full grid on the
+`index_add_`. The win scales with local experts per rank (`num_experts / ep_size`), largest with many
+(Qwen3-30B EP=2, 64 experts/rank: +243% at batch 1). Keep the default unless profiling says otherwise; full grid on the
 [Grouped GEMM guide](../optimization/grouped-gemm.md).
 
 GptOss's clamped-SwiGLU runs as a single fused Triton kernel on the grouped path
@@ -354,7 +353,7 @@ on EP MoE — the DeepEP all-to-all breaks the graph at every MoE boundary eithe
 Whichever kernel a family resolves, a layer with a real dispatch group (`ep_size > 1`) traces it on
 its **first forward, before that forward's dispatch** (`_warm_activation_graphs`): one grad-enabled
 pass with a backward and one under `no_grad`, outside inference mode, so a first forward under
-`torch.inference_mode()` still warms the backward kernels a later training forward runs. Where the fused permute runs (the grouped-GEMM path with `top_k >= ep_size`), the
+`torch.inference_mode()` still warms the backward kernels a later training forward runs. Where the fused permute runs (every grouped-GEMM path), the
 same pass runs the permute's backward and the weighted unpermute's forward and backward. One token count
 covers every dispatch size: the kernels take their row count with `do_not_specialize`, so Triton
 compiles no separate binary per class of it (1, a multiple of 16, neither). The weighted unpermute's
