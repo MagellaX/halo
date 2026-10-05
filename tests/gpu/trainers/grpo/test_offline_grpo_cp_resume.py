@@ -48,6 +48,7 @@ from src.training.environment import resolve_resume_weights_source
 from tests.common.checkpoint_io import loading_problems
 from tests.common.harness import gpu_test_main
 from tests.common.offline_grpo import make_offline_tokenizer, offline_grpo_dataset
+from tests.common.offline_grpo_reference import restore_reference
 from tests.common.tiny_models import TINY_MOE_FAMILIES, tiny_family_model
 from tests.common.tolerances import TOL
 from tests.common.utils import cleanup_memory, log
@@ -358,7 +359,7 @@ def _probe(checkpoint, dataset, settings):
     probe = _ReferenceProbe()
     probe.beta = 0.05
     probe._init_reference_logps(resume_checkpoint=checkpoint)
-    return probe._restore_reference_logps_or_none(dataset, "training", identity=settings)
+    return restore_reference(probe, dataset, "training", settings=settings)
 
 
 def _negative_sidecar_checks(ctx, checkpoint, tokenized_dataset, settings):
