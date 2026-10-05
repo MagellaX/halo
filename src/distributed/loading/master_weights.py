@@ -154,7 +154,13 @@ def restore_fp32_master_parameters(
                     replay_tasks.append(task)
             restored.update(
                 fuser.execute(
-                    replay_tasks, model, model_path, torch.float32, "cpu", reader=reader, preserve_parameters=True
+                    replay_tasks,
+                    model,
+                    model_path,
+                    torch.float32,
+                    state[tasks[0][0]].device,
+                    reader=reader,
+                    preserve_parameters=True,
                 )
             )
             restored_ids.update(id(state[key]) for key in restored)

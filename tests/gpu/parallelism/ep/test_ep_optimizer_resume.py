@@ -64,6 +64,7 @@ from tests.common.datasets import create_sft_dataset
 from tests.common.distributed import pin_deterministic_ep_dispatch, world_all
 from tests.common.harness import gpu_test_main
 from tests.common.models import QWEN3_0_6B
+from tests.common.tiny_models import VOCAB_PAD_MULTIPLE
 from tests.common.tolerances import TOL
 from tests.common.utils import (
     cleanup_memory,
@@ -116,11 +117,12 @@ def optimizer_resume_parser() -> argparse.ArgumentParser:
 def _build_tiny_checkpoint(mode: str, target_dir: str) -> None:
     """Rank 0: random-init tiny model + Qwen tokenizer saved as a loadable HF checkpoint."""
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_0_6B, trust_remote_code=True)
+    vocab_size = -(-len(tokenizer) // VOCAB_PAD_MULTIPLE) * VOCAB_PAD_MULTIPLE
     torch.manual_seed(SEED)
     if mode in MOE_MODES:
         config = Qwen3MoeConfig(
             **_TINY_COMMON,
-            vocab_size=len(tokenizer),
+            vocab_size=vocab_size,
             moe_intermediate_size=128,
             num_experts=8,
             num_experts_per_tok=2,
@@ -129,7 +131,7 @@ def _build_tiny_checkpoint(mode: str, target_dir: str) -> None:
         )
         model = Qwen3MoeForCausalLM(config)
     else:
-        config = Qwen3Config(**_TINY_COMMON, vocab_size=len(tokenizer))
+        config = Qwen3Config(**_TINY_COMMON, vocab_size=vocab_size)
         model = Qwen3ForCausalLM(config)
     model.to(torch.bfloat16).save_pretrained(target_dir)
     tokenizer.save_pretrained(target_dir)
